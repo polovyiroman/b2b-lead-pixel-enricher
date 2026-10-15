@@ -1,0 +1,51 @@
+{
+    "title": "B2B Lead & Ad Pixel Enricher Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "domains": {
+            "title": "Domains or URLs",
+            "type": "array",
+            "description": "Paste company domains (e.g., example.com) or URLs. Duplicates and subpaths are automatically normalized to unique root domains.",
+            "editor": "stringList",
+            "prefill": ["apify.com", "shopify.com"]
+        },
+        "scanContactPages": {
+            "title": "Scan Contact & About Pages",
+            "type": "boolean",
+            "description": "Automatically visit /contact, /impressum, or /about pages to find additional emails and phone numbers.",
+            "default": true
+        },
+        "unpackGtmContainers": {
+            "title": "Unpack Google Tag Manager (GTM) Containers",
+            "type": "boolean",
+            "description": "Downloads raw GTM container scripts to detect Meta, TikTok, LinkedIn, and Google Ads pixels injected via GTM without needing a headless browser.",
+            "default": true
+        },
+        "defaultPhoneRegion": {
+            "title": "Default Country Code for Local Phones",
+            "type": "string",
+            "description": "2-letter ISO country code (e.g., US, GB, DE, UA, PL) used to validate local phone numbers written without a '+' country prefix.",
+            "editor": "textfield",
+            "default": "US"
+        },
+        "maxConcurrency": {
+            "title": "Max Concurrency",
+            "type": "integer",
+            "description": "Number of websites processed simultaneously.",
+            "default": 15,
+            "minimum": 1,
+            "maximum": 50
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Optional proxy settings to bypass rate limits or Cloudflare blocks on large lists.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": false
+            }
+        }
+    },
+    "required": ["domains"]
+}
