@@ -1,0 +1,66 @@
+{
+    "actorSpecification": 1,
+    "name": "b2b-lead-tech-pixel-enricher",
+    "title": "B2B Lead, Email, Socials & Ad Pixel Enricher",
+    "description": "CRM-ready B2B enricher: extracts prioritized sales emails, E.164 phone numbers, LinkedIn/socials, company metadata, CMS, and ad pixels (including GTM & Shopify hidden pixels).",
+    "version": "1.0",
+    "meta": {
+        "templateId": "python-start"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "fields": {},
+            "views": {
+                "overview": {
+                    "title": "CRM-Ready Leads & Ad Pixels",
+                    "transformation": {
+                        "fields": [
+                            "input_domain",
+                            "page_title",
+                            "best_email",
+                            "primary_phone",
+                            "linkedin_url",
+                            "instagram_url",
+                            "has_meta_pixel",
+                            "has_tiktok_pixel",
+                            "has_google_ads",
+                            "has_ga4",
+                            "has_gtm",
+                            "detected_technologies",
+                            "emails",
+                            "phones",
+                            "meta_description",
+                            "status",
+                            "website_url"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {
+                            "input_domain": { "label": "Domain", "format": "text" },
+                            "page_title": { "label": "Company / Page Title", "format": "text" },
+                            "best_email": { "label": "Best Email", "format": "text" },
+                            "primary_phone": { "label": "Primary Phone", "format": "text" },
+                            "linkedin_url": { "label": "LinkedIn", "format": "link" },
+                            "instagram_url": { "label": "Instagram", "format": "link" },
+                            "has_meta_pixel": { "label": "Meta Pixel", "format": "boolean" },
+                            "has_tiktok_pixel": { "label": "TikTok Pixel", "format": "boolean" },
+                            "has_google_ads": { "label": "Google Ads", "format": "boolean" },
+                            "has_ga4": { "label": "GA4", "format": "boolean" },
+                            "has_gtm": { "label": "GTM", "format": "boolean" },
+                            "detected_technologies": { "label": "All Tech & Pixels", "format": "array" },
+                            "emails": { "label": "All Emails (Ranked)", "format": "array" },
+                            "phones": { "label": "All Phones (E.164)", "format": "array" },
+                            "meta_description": { "label": "Meta Description", "format": "text" },
+                            "status": { "label": "Status", "format": "text" },
+                            "website_url": { "label": "Final URL", "format": "link" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
