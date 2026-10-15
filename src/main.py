@@ -1,16 +1,17 @@
 import asyncio
 import re
 from urllib.parse import urljoin, urlparse
-import httpx
+from curl_cffi.requests import AsyncSession
 import phonenumbers
 from bs4 import BeautifulSoup
 from apify import Actor
 
-# Максимальний розмір HTML для читання в пам'ять (1.5 МБ), щоб уникнути OOM
+# Максимальний розмір сторінки для читання в пам'ять (1.5 МБ), щоб уникнути OOM
 MAX_HTML_BYTES = 1_500_000
 
-# Регулярні вирази для імейлів та рекламних ідентифікаторів
+# Регулярні вирази для імейлів, телефонів у JSON-LD та рекламних ідентифікаторів
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{4,10}\b', re.IGNORECASE)
 GA4_ID_REGEX = re.compile(r'\bG-[A-Z0-9]{6,12}\b')
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
@@ -20,7 +21,7 @@ JUNK_EMAIL_DOMAINS = {
     'sentry.io', 'wixpress.com', 'example.com', 'domain.com',
     'email.com', 'yoursite.com', 'sentry.wixpress.com', 'godaddy.com',
     'sentry-next.wixpress.com', 'wordpress.org', 'w3.org', 'schema.org',
-    'googleusercontent.com', 'cloudflare.com'
+    'googleusercontent.com', 'cloudflare.com', 'shopify.com'
 }
 JUNK_EMAIL_PREFIXES = (
     'noreply@', 'no-reply@', 'donotreply@', 'mailer-daemon@',
@@ -36,7 +37,7 @@ JUNK_EXTENSIONS = (
 HIGH_PRIORITY_PREFIXES = (
     'sales', 'hello', 'hi', 'contact', 'info', 'office', 'team',
     'inquiries', 'enquiry', 'enquiries', 'founder', 'ceo', 'owner',
-    'partner', 'partnerships', 'marketing', 'kontakt', 'hallo'
+    'partner', 'partnerships', 'marketing', 'kontakt', 'hallo', 'support', 'help'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'legal', 'datenschutz', 'dpo', 'compliance', 'gdpr',
@@ -46,8 +47,13 @@ LOW_PRIORITY_PREFIXES = (
 )
 
 # Ключові слова для пошуку контактних сторінок (за пріоритетом)
-PRIMARY_CONTACT_KEYWORDS = ('contact', 'kontakt', 'impressum', 'contatti', 'contacto', 'get-in-touch')
-SECONDARY_CONTACT_KEYWORDS = ('about', 'uber-uns', 'ueber-uns', 'team', 'company', 'support')
+PRIMARY_CONTACT_KEYWORDS = (
+    'contact', 'kontakt', 'impressum', 'contatti', 'contacto',
+    'get-in-touch', 'contact-information'
+)
+SECONDARY_CONTACT_KEYWORDS = (
+    'about', 'uber-uns', 'ueber-uns', 'team', 'company', 'support', 'help', 'faq'
+)
 
 # Сигнатури технологій та пікселів (включно з внутрішніми конфігами Shopify Trekkie/WPM)
 TECH_SIGNATURES = {
@@ -67,8 +73,8 @@ TECH_SIGNATURES = {
     'Hotjar': ['static.hotjar.com', 'hjsettings'],
     'HubSpot': ['js.hs-scripts.com', 'hs-analytics', 'hbspt.forms'],
     'Intercom': ['widget.intercom.io', 'intercomsettings'],
-    'Klaviyo': ['static.klaviyo.com', 'klaviyo.push'],
-    'Shopify': ['cdn.shopify.com', 'shopify.theme', 'trekkie.integrations'],
+    'Klaviyo': ['static.klaviyo.com', 'klaviyo.push', 'klaviyo'],
+    'Shopify': ['cdn.shopify.com', 'shopify.theme', 'trekkie.integrations', 'shopify-pixel'],
     'WordPress': ['wp-content/', 'wp-includes/'],
     'WooCommerce': ['woocommerce', 'wc-blocks'],
     'Webflow': ['webflow.com', 'data-wf-site'],
@@ -135,7 +141,7 @@ def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
     valid = set()
     for email in raw_emails:
         email = email.lower().strip('.,;:()[]"\'<> \t\r\n')
-        email = re.sub(r'^(?:%20|u003[ce])+', '', email)
+        email = re.sub(r'^(?:%20|u003[ce]|3a)+', '', email)
 
         if any(email.endswith(ext) for ext in JUNK_EXTENSIONS):
             continue
@@ -145,7 +151,7 @@ def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
             continue
 
         local_part, domain_part = email.split('@', 1)
-        if not local_part or domain_part in JUNK_EMAIL_DOMAINS:
+        if not local_part or domain_part in JUNK_EMAIL_DOMAINS and base_domain != domain_part:
             continue
         if 6 <= len(email) <= 60:
             valid.add(email)
@@ -164,7 +170,6 @@ def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
         elif local.startswith(LOW_PRIORITY_PREFIXES):
             score -= 30
         else:
-            # Іменні корпоративні пошти (наприклад, john@company.com)
             score += 10
 
         return (-score, addr)
@@ -177,7 +182,7 @@ def extract_valid_phones(text: str, raw_tel_links: set[str], default_region: str
     valid_phones = []
     seen = set()
 
-    # 1. Пріоритет номерам із прямих посилань tel:
+    # 1. Пріоритет номерам із прямих посилань tel: та мікророзмітки Schema.org
     for raw_tel in raw_tel_links:
         try:
             parsed = phonenumbers.parse(raw_tel, default_region)
@@ -251,7 +256,7 @@ def parse_html_sync(
 ) -> tuple[str, str, set[str], list[str], dict[str, str], list[str]]:
     """Синхронна функція парсингу HTML (виконується в окремому потоці через asyncio.to_thread)."""
     emails = set(EMAIL_REGEX.findall(html))
-    raw_tel_links = set()
+    raw_tel_links = set(SCHEMA_PHONE_REGEX.findall(html))
     socials = {}
     primary_links = set()
     secondary_links = set()
@@ -331,14 +336,14 @@ def parse_html_sync(
 
 
 async def fetch_html_safely(
-    client: httpx.AsyncClient,
+    client: AsyncSession,
     url: str,
     timeout: float = 15.0,
     retries: int = 2
 ) -> tuple[int, str, str, str]:
     """
-    Безпечно завантажує лише текстові HTML-сторінки (до 1.5 МБ) з повторними спробами.
-    Захищає контейнер від падіння при натраплянні на великі PDF або бінарні файли.
+    Безпечно завантажує текстові HTML/JS сторінки (до 1.5 МБ) з TLS-відбитком Chrome.
+    Захищає від блокувань Cloudflare (403) та падіння контейнера на великих PDF/архівах.
     """
     last_error = ''
     for attempt in range(retries):
@@ -356,21 +361,26 @@ async def fetch_html_safely(
 
                 content_type = resp.headers.get('content-type', '').lower()
                 if content_type and not any(
-                    t in content_type for t in ('text/html', 'application/xhtml+xml', 'text/plain')
+                    t in content_type for t in (
+                        'text/html', 'application/xhtml+xml', 'text/plain', 'javascript'
+                    )
                 ):
                     return status, '', final_url, f'Skipped non-HTML content: {content_type}'
 
                 chunks = []
                 bytes_read = 0
-                async for chunk in resp.aiter_bytes():
+                async for chunk in resp.aiter_content():
                     chunks.append(chunk)
                     bytes_read += len(chunk)
                     if bytes_read >= MAX_HTML_BYTES:
                         break
 
                 raw_bytes = b''.join(chunks)
-                encoding = resp.encoding or 'utf-8'
-                html = raw_bytes.decode(encoding, errors='replace')
+                encoding = getattr(resp, 'encoding', None) or 'utf-8'
+                try:
+                    html = raw_bytes.decode(encoding, errors='replace')
+                except LookupError:
+                    html = raw_bytes.decode('utf-8', errors='replace')
                 return status, html, final_url, ''
         except Exception as e:
             last_error = str(e)
@@ -380,7 +390,7 @@ async def fetch_html_safely(
     return 0, '', url, last_error or 'Connection failed'
 
 
-async def fetch_gtm_scripts(client: httpx.AsyncClient, html: str) -> tuple[list[str], str]:
+async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str], str]:
     """Завантажує JS-код контейнерів GTM для пошуку пікселів, схованих усередині."""
     gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html)})
     if not gtm_ids:
@@ -397,7 +407,7 @@ async def fetch_gtm_scripts(client: httpx.AsyncClient, html: str) -> tuple[list[
 
 
 async def process_domain(
-    client: httpx.AsyncClient,
+    client: AsyncSession,
     domain_key: str,
     root_url: str,
     scan_contacts: bool,
@@ -453,9 +463,9 @@ async def process_domain(
 
         tech_info = detect_tech_and_pixels(f'{html}\n{gtm_js}', gtm_ids)
 
-        # Обхід до 2 внутрішніх контактних сторінок (/contact, /impressum, /about)
+        # Обхід до 3 внутрішніх контактних сторінок (/contact, /impressum, /about, /faq)
         if scan_contacts and contact_links:
-            for sub_url in contact_links[:2]:
+            for sub_url in contact_links[:3]:
                 sub_status, sub_html, _, _ = await fetch_html_safely(
                     client, sub_url, timeout=10.0, retries=1
                 )
@@ -522,16 +532,8 @@ async def main() -> None:
         )
         semaphore = asyncio.Semaphore(max_concurrency)
 
+        # curl_cffi з impersonate='chrome' автоматично виставляє нативні заголовки Chrome
         headers = {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/131.0.0.0 Safari/537.36'
-            ),
-            'Accept': (
-                'text/html,application/xhtml+xml,application/xml;q=0.9,'
-                'image/avif,image/webp,*/*;q=0.8'
-            ),
             'Accept-Language': 'en-US,en;q=0.9',
             'Upgrade-Insecure-Requests': '1'
         }
@@ -539,9 +541,10 @@ async def main() -> None:
         batch = []
         batch_size = 25
 
-        async with httpx.AsyncClient(
+        async with AsyncSession(
+            impersonate='chrome',
             headers=headers,
-            follow_redirects=True,
+            allow_redirects=True,
             verify=False,
             proxy=proxy_url
         ) as client:
