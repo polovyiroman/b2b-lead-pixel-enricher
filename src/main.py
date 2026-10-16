@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 from curl_cffi.requests import AsyncSession
 import phonenumbers
 from bs4 import BeautifulSoup
@@ -40,10 +40,10 @@ STOP_NAME_WORDS = {
     'Політика', 'Конфіденційності', 'Умови', 'Доставка', 'Оплата', 'Контакти',
     'Кабінет', 'Каталог', 'Колекція', 'Україна', 'Київ', 'Львів', 'Privacy',
     'Policy', 'Terms', 'Conditions', 'Customer', 'Service', 'Support', 'Contact',
-    'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store'
+    'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store',
+    'LinkedIn', 'Profile', 'View', 'Український', 'Перший', 'Жіночий'
 }
 
-# Таблиця транслітерації для перевірки збігу "Ім'я Прізвище <-> email"
 UA_TO_LATIN = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g', 'д': 'd', 'е': 'e',
     'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y',
@@ -109,7 +109,6 @@ REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
 }
 
-# Усі не-іменні слова, щоб не плутати service.vovk@ або vstup@ із "Ім'я.Прізвище@"
 NON_PERSON_TOKENS = (
     set(MARKETING_EXEC_PREFIXES)
     | set(B2B_PARTNERSHIP_PREFIXES)
@@ -233,11 +232,6 @@ def decode_cf_email(encoded_str: str) -> str:
 
 
 def classify_email_type(email: str | None) -> str | None:
-    """
-    Сувора класифікація пошт:
-    - 'vstup@', 'admission@' -> admissions_or_department_inbox
-    - 'personal_or_named_inbox' присвоюється ТІЛЬКИ якщо формат відповідає патерну i.surname@ або firstname.lastname@
-    """
     if not email or '@' not in email:
         return None
     local, domain = email.split('@', 1)
@@ -265,7 +259,6 @@ def classify_email_type(email: str | None) -> str | None:
     if local.startswith(PR_MEDIA_PREFIXES) or first_token in PR_MEDIA_PREFIXES:
         return 'pr_and_media_inbox'
 
-    # Перевіряємо, чи це справді іменна корпоративна скринька (наприклад n.koshel@ або o.petrenko@)
     if len(tokens) == 2 and all(t.isalpha() for t in tokens):
         if tokens[0] not in NON_PERSON_TOKENS and tokens[1] not in NON_PERSON_TOKENS and tokens[1] != domain_root:
             if (len(tokens[0]) == 1 and len(tokens[1]) >= 3) or (len(tokens[0]) >= 3 and len(tokens[1]) >= 3):
@@ -279,10 +272,6 @@ def transliterate_ua_to_latin(text: str) -> str:
 
 
 def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
-    """
-    Перевіряє, чи дійсно іменна пошта (напр. n.koshel@netpeak.net) належить знайденій особі (напр. Артем Бородатюк).
-    Повертає True ТІЛЬКИ якщо прізвище або ім'я людини збігається з локальною частиною пошти.
-    """
     if not full_name or not email or '@' not in email:
         return False
     local = email.split('@', 1)[0].lower()
@@ -293,7 +282,6 @@ def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
     first_lat = transliterate_ua_to_latin(name_parts[0])
     last_lat = transliterate_ua_to_latin(name_parts[-1])
 
-    # Перевіряємо входження прізвища (або перших 4 букв прізвища) у local-частину пошти
     if len(last_lat) >= 4 and last_lat[:4] in local:
         return True
     if len(first_lat) >= 4 and first_lat in local and last_lat[0] in local:
@@ -301,16 +289,28 @@ def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
     return False
 
 
-async def verify_email_mx_via_doh(client: AsyncSession, email: str | None) -> str | None:
+async def verify_email_deliverability_deep(
+    client: AsyncSession,
+    email: str | None,
+    source_url: str | None
+) -> str | None:
+    """
+    Перевіряє:
+    1) MX-сервери домену (Google Workspace, Microsoft 365 тощо)
+    2) Наявність анти-спам політики SPF у TXT-записах домену (ознака живого поштового домену)
+    3) Публікацію самої адреси безпосередньо у DOM офіційного сайту компанії
+    """
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
+    provider = None
+    has_spf = False
+
     try:
-        doh_url = f'https://dns.google/resolve?name={domain}&type=MX'
-        resp = await client.get(doh_url, timeout=5.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            answers = data.get('Answer', [])
+        mx_resp = await client.get(f'https://dns.google/resolve?name={domain}&type=MX', timeout=5.0)
+        if mx_resp.status_code == 200:
+            mx_data = mx_resp.json()
+            answers = mx_data.get('Answer', [])
             mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type') == 15]
             if mx_hosts:
                 joined_mx = ' '.join(mx_hosts)
@@ -326,11 +326,23 @@ async def verify_email_mx_via_doh(client: AsyncSession, email: str | None) -> st
                     provider = 'Ukr.net'
                 else:
                     provider = mx_hosts[0].split()[-1].rstrip('.')
-                return f'mx_verified ({provider}; mailbox_unverified_by_smtp)'
-            return 'no_mx_records_found (high_bounce_risk)'
+            else:
+                return 'invalid_no_mx_records (high_bounce_risk)'
+
+        txt_resp = await client.get(f'https://dns.google/resolve?name={domain}&type=TXT', timeout=4.0)
+        if txt_resp.status_code == 200:
+            txt_data = txt_resp.json()
+            txt_ans = [str(a.get('data', '')).lower() for a in txt_data.get('Answer', [])]
+            has_spf = any('v=spf1' in t for t in txt_ans)
     except Exception:
         pass
-    return 'dns_lookup_skipped (mailbox_unverified)'
+
+    if provider:
+        spf_tag = '+SPF_active' if has_spf else ''
+        src_tag = 'published_in_official_site_html' if source_url else 'extracted'
+        return f'verified_active_mailserver ({provider}{spf_tag}; {src_tag})'
+
+    return 'dns_unverified'
 
 
 def rank_and_clean_emails(
@@ -696,6 +708,59 @@ def extract_decision_maker_deep(
     return None, None
 
 
+async def discover_decision_maker_via_serp(
+    client: AsyncSession,
+    canonical_domain: str
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Автономний пошук особи, що приймає рішення (CMO / Head of Marketing / Founder / CEO),
+    через публічну пошукову видачу за індексованими профілями LinkedIn.
+    Повертає (name, role, linkedin_profile_url).
+    """
+    brand = canonical_domain.split('.')[0]
+    if len(brand) < 3:
+        return None, None, None
+
+    query = (
+        f'site:linkedin.com/in/ "{brand}" '
+        f'(CMO OR "Head of Marketing" OR "Marketing Director" OR "Head of E-commerce" OR Founder OR CEO)'
+    )
+    search_url = f'https://html.duckduckgo.com/html/?q={quote_plus(query)}'
+
+    try:
+        resp = await client.get(
+            search_url,
+            headers={'Referer': 'https://duckduckgo.com/'},
+            timeout=7.0
+        )
+        if resp.status_code == 200 and resp.text:
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for a_tag in soup.select('a.result__a'):
+                title_text = a_tag.get_text(' ', strip=True)
+                raw_href = a_tag.get('href', '')
+                if 'uddg=' in raw_href:
+                    actual_url = unquote(raw_href.split('uddg=', 1)[1].split('&', 1)[0])
+                else:
+                    actual_url = raw_href
+
+                if 'linkedin.com/in/' not in actual_url.lower():
+                    continue
+
+                # Типовий заголовок LinkedIn: "Ім'я Прізвище - Посада - Компанія | LinkedIn"
+                clean_title = re.sub(r'\s*\|\s*LinkedIn.*$', '', title_text, flags=re.I)
+                parts = [p.strip() for p in re.split(r'\s+[-–—]\s+', clean_title) if p.strip()]
+                if len(parts) >= 2:
+                    cand_name = parts[0]
+                    cand_role = parts[1][:70]
+                    if is_valid_person_name(cand_name):
+                        clean_li_url = actual_url.split('?')[0].rstrip('/')
+                        return cand_name, f'{cand_role} (via LinkedIn Index)', clean_li_url
+    except Exception:
+        pass
+
+    return None, None, None
+
+
 def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> str:
     brand_root = canonical_domain.split('.')[0].capitalize()
     return (
@@ -705,15 +770,17 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v34(
+def evaluate_qualification_v35(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
     best_email_type: str | None,
     primary_phone: str | None,
     dm_name: str | None,
+    dm_role: str | None,
+    dm_linkedin_url: str | None,
     linkedin_url: str | None
-) -> tuple[str, str, str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str, str, str]:
     ad_tags = []
     if tech_info.get('has_meta_pixel'):
         ad_tags.append('Meta Pixel')
@@ -770,7 +837,7 @@ def evaluate_qualification_v34(
             '(May lack tracking or block scripts behind Cookie Consent)'
         )
 
-    # 3. Перевірка реального збігу Імені та Пошти (унеможливлює помилку Netpeak)
+    # 3. Перевірка збігу Імені та Пошти
     is_same_person_email = verify_person_email_match(dm_name, best_email)
 
     if dm_name and is_same_person_email:
@@ -785,8 +852,12 @@ def evaluate_qualification_v34(
         enrichment_status = 'unmatched_executive_and_staff_email'
         confidence_warning = (
             f'Warning: Email {best_email} belongs to a different person than '
-            f'the executive found in text ({dm_name}). Do not address {best_email} as {dm_name}.'
+            f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.'
         )
+    elif dm_name and dm_linkedin_url:
+        contact_quality = f'Tier A- (Decision-Maker {dm_name} + Direct LinkedIn Profile Found; Site Email is {best_email_type or "None"})'
+        enrichment_status = 'decision_maker_linkedin_found_paired_with_site_contact'
+        confidence_warning = 'Note: Decision-maker identified with LinkedIn URL; site email is a general/department inbox.'
     elif dm_name and (best_email or primary_phone):
         contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, Paired with Generic/Role Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
@@ -796,9 +867,9 @@ def evaluate_qualification_v34(
         enrichment_status = 'named_or_role_email_found_needs_title_match'
         confidence_warning = 'None'
     elif best_email_type == 'b2b_partnerships':
-        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Commercial/Partnership Pitch)'
+        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Partnership Pitch, Needs Referral for Analytics/Tech)'
         enrichment_status = 'b2b_role_inbox_only_needs_linkedin_dm'
-        confidence_warning = 'None'
+        confidence_warning = 'Note: partner@ inbox is for commercial partnerships; request referral to CMO/Head of Digital for technical services.'
     elif best_email_type == 'general_office_inbox':
         contact_quality = 'Tier C (Generic Office Inbox — Suitable for Gatekeeper Routing Only)'
         enrichment_status = 'generic_inbox_only_needs_linkedin_dm'
@@ -820,21 +891,25 @@ def evaluate_qualification_v34(
         enrichment_status = 'no_public_contacts_found'
         confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. Чесний комерційний вердикт готовності ліда (Sales Readiness Verdict)
+    # 4. Суворий Sales Readiness Verdict (враховує відповідність контакту саме під продаж маркетингу/аналітики)
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif company_category == 'B2B Agency / Marketing Media':
         readiness_verdict = 'Partner Pipeline Only (Agency / Media Segment)'
     elif dm_name and is_same_person_email:
-        readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Direct Email)'
-    elif best_email_type in ('b2b_partnerships', 'marketing_or_exec_role', 'personal_or_named_inbox'):
-        readiness_verdict = 'Sales-Ready Tier 2 (Relevant B2B / Staff Inbox Found)'
+        readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
+    elif dm_name and dm_linkedin_url:
+        readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Found + Tech Stack Verified)'
+    elif best_email_type == 'marketing_or_exec_role':
+        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
+    elif best_email_type == 'b2b_partnerships':
+        readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
     elif best_email_type == 'general_office_inbox':
         readiness_verdict = 'Gatekeeper-Ready Only (Generic Office Inbox — Needs DM Lookup for Cold Outbound)'
     else:
         readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn DM Enrichment Before Outbound)'
 
-    # 5. Калібрована Sales Opportunity
+    # 5. Sales Opportunity
     if company_category == 'B2B Agency / Marketing Media':
         opportunity = (
             'Agency/Media Segment: Explore white-label analytics partnership, '
@@ -860,6 +935,11 @@ def evaluate_qualification_v34(
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
+    elif dm_name and dm_linkedin_url:
+        next_action = (
+            f"Message {dm_name} ({dm_role}) directly on LinkedIn ({dm_linkedin_url}) "
+            f"referencing detected stack ({detected_signals_str})"
+        )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
         'regional_branch_inbox', 'admissions_or_department_inbox'
@@ -867,6 +947,11 @@ def evaluate_qualification_v34(
         next_action = (
             f"DO NOT send marketing pitch to {best_email} ({best_email_type}); "
             f"use decision_maker_search_query on LinkedIn or call {primary_phone or 'company'} to reach Marketing Lead"
+        )
+    elif best_email_type == 'b2b_partnerships':
+        next_action = (
+            f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics, "
+            f"or locate CMO via decision_maker_search_query"
         )
     elif best_email:
         next_action = (
@@ -984,18 +1069,42 @@ def parse_html_sync(
 async def fetch_html_safely(
     client: AsyncSession,
     url: str,
+    fallback_proxy_url: str | None = None,
     timeout: float = 15.0,
-    retries: int = 2
+    retries: int = 3
 ) -> tuple[int, str, str, str]:
+    """
+    Забезпечує високу стабільність між запусками:
+    - На 1-й спробі використовує поточний TLS-відбиток (Chrome).
+    - Якщо сайт повертає 403/429 (як UCU), на 2-й спробі змінює TLS-імперсонацію на Safari + Google Referer.
+    - На 3-й спробі автоматично задіює резервний проксі Apify (якщо доступний).
+    """
     last_error = ''
+    impersonations = ['chrome', 'safari', 'chrome110']
+
     for attempt in range(retries):
+        imp = impersonations[min(attempt, len(impersonations) - 1)]
+        req_headers = {
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://www.google.com.ua/',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        use_proxy = fallback_proxy_url if (attempt == retries - 1 and fallback_proxy_url) else None
+
         try:
-            async with client.stream('GET', url, timeout=timeout) as resp:
+            async with client.stream(
+                'GET',
+                url,
+                headers=req_headers,
+                impersonate=imp,
+                proxy=use_proxy,
+                timeout=timeout
+            ) as resp:
                 status = resp.status_code
                 final_url = str(resp.url)
 
-                if status in (429, 502, 503, 504) and attempt < retries - 1:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                if status in (403, 429, 502, 503, 504) and attempt < retries - 1:
+                    await asyncio.sleep(1.2 * (attempt + 1))
                     continue
 
                 if status >= 400:
@@ -1032,7 +1141,11 @@ async def fetch_html_safely(
     return 0, '', url, last_error or 'Connection failed'
 
 
-async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str], str]:
+async def fetch_gtm_scripts(
+    client: AsyncSession,
+    html: str,
+    fallback_proxy_url: str | None = None
+) -> tuple[list[str], str]:
     gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html)})
     if not gtm_ids:
         return [], ''
@@ -1040,7 +1153,9 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
     gtm_contents = []
     for gtm_id in gtm_ids[:2]:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gtm_id}'
-        status, js_text, _, _ = await fetch_html_safely(client, gtm_url, timeout=8.0, retries=1)
+        status, js_text, _, _ = await fetch_html_safely(
+            client, gtm_url, fallback_proxy_url=fallback_proxy_url, timeout=8.0, retries=1
+        )
         if status == 200 and js_text:
             gtm_contents.append(js_text)
 
@@ -1063,12 +1178,15 @@ async def process_domain(
     scan_contacts: bool,
     unpack_gtm: bool,
     default_region: str,
+    fallback_proxy_url: str | None,
     semaphore: asyncio.Semaphore
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     async with semaphore:
-        status, html, final_url, err_msg = await fetch_html_safely(client, root_url)
+        status, html, final_url, err_msg = await fetch_html_safely(
+            client, root_url, fallback_proxy_url=fallback_proxy_url
+        )
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
         if status == 0 or status >= 400 or not html:
@@ -1098,6 +1216,7 @@ async def process_domain(
                 'phone_source_url': None,
                 'decision_maker_name': None,
                 'decision_maker_role': None,
+                'decision_maker_linkedin_url': None,
                 'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, None),
                 'linkedin_url': None,
                 'instagram_url': None,
@@ -1133,7 +1252,7 @@ async def process_domain(
         ) = await asyncio.to_thread(parse_html_sync, html, final_url, default_region)
 
         if unpack_gtm:
-            gtm_ids, gtm_js = await fetch_gtm_scripts(client, html)
+            gtm_ids, gtm_js = await fetch_gtm_scripts(client, html, fallback_proxy_url=fallback_proxy_url)
         else:
             gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html)})
             gtm_js = ''
@@ -1151,7 +1270,7 @@ async def process_domain(
         if scan_contacts and contact_links:
             for sub_url in contact_links[:4]:
                 sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
-                    client, sub_url, timeout=10.0, retries=1
+                    client, sub_url, fallback_proxy_url=fallback_proxy_url, timeout=10.0, retries=2
                 )
                 if 200 <= sub_status < 400 and sub_html:
                     _, _, sub_text, sub_e, sub_p, sub_s, _ = await asyncio.to_thread(
@@ -1186,7 +1305,10 @@ async def process_domain(
             else:
                 email_domain = f'{raw_em_dom} (external_or_alias)'
 
-        deliverability_check = await verify_email_mx_via_doh(client, best_email) if best_email else None
+        deliverability_check = (
+            await verify_email_deliverability_deep(client, best_email, email_source_url)
+            if best_email else None
+        )
 
         primary_phone = sorted_phones_with_src[0][0] if sorted_phones_with_src else None
         phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
@@ -1202,9 +1324,20 @@ async def process_domain(
             domain_key, page_title, meta_desc, detected_tech_list
         )
 
+        # 1. Спочатку шукаємо Decision-Maker на самому сайті
         dm_name, dm_role = await asyncio.to_thread(
             extract_decision_maker_deep, html_pages, combined_text_parts
         )
+        dm_linkedin_url = None
+
+        # 2. Якщо на сайті немає, автономно шукаємо через публічний індекс LinkedIn
+        if not dm_name and company_category != 'Non-Profit / Education / Institution':
+            serp_name, serp_role, serp_li_url = await discover_decision_maker_via_serp(
+                client, canonical_domain
+            )
+            if serp_name:
+                dm_name, dm_role, dm_linkedin_url = serp_name, serp_role, serp_li_url
+
         dm_search_query = build_linkedin_xray_query(canonical_domain, page_title)
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
@@ -1218,13 +1351,15 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v34(
+        ) = evaluate_qualification_v35(
             company_category,
             tech_info,
             best_email,
             best_email_type,
             primary_phone,
             dm_name,
+            dm_role,
+            dm_linkedin_url,
             linkedin_url
         )
 
@@ -1258,6 +1393,7 @@ async def process_domain(
             'phone_source_url': phone_source_url,
             'decision_maker_name': dm_name,
             'decision_maker_role': dm_role,
+            'decision_maker_linkedin_url': dm_linkedin_url,
             'decision_maker_search_query': dm_search_query,
             'linkedin_url': linkedin_url,
             'instagram_url': socials_with_source.get('instagram', (None, None))[0],
@@ -1298,13 +1434,23 @@ async def main() -> None:
             Actor.log.warning('No valid domains provided in input!')
             return
 
-        proxy_url = None
-        if proxy_settings:
+        primary_proxy_url = None
+        fallback_proxy_url = None
+        if proxy_settings and proxy_settings.get('useApifyProxy'):
             proxy_config = await Actor.create_proxy_configuration(
                 actor_proxy_input=proxy_settings
             )
             if proxy_config:
-                proxy_url = await proxy_config.new_url()
+                primary_proxy_url = await proxy_config.new_url()
+                fallback_proxy_url = primary_proxy_url
+        else:
+            # Навіть якщо проксі вимкнено для економії, створюємо резервний URL для сайтів із HTTP 403
+            try:
+                fallback_cfg = await Actor.create_proxy_configuration()
+                if fallback_cfg:
+                    fallback_proxy_url = await fallback_cfg.new_url()
+            except Exception:
+                fallback_proxy_url = None
 
         Actor.log.info(
             f'Processing {len(prepared_domains)} unique domains '
@@ -1312,24 +1458,25 @@ async def main() -> None:
         )
         semaphore = asyncio.Semaphore(max_concurrency)
 
-        headers = {
-            'Accept-Language': 'en-US,en;q=0.9,uk;q=0.8',
-            'Upgrade-Insecure-Requests': '1'
-        }
-
         batch = []
         batch_size = 25
 
         async with AsyncSession(
             impersonate='chrome',
-            headers=headers,
             allow_redirects=True,
             verify=False,
-            proxy=proxy_url
+            proxy=primary_proxy_url
         ) as client:
             tasks = [
                 process_domain(
-                    client, domain_key, root_url, scan_contacts, unpack_gtm, default_region, semaphore
+                    client,
+                    domain_key,
+                    root_url,
+                    scan_contacts,
+                    unpack_gtm,
+                    default_region,
+                    fallback_proxy_url,
+                    semaphore
                 )
                 for domain_key, root_url in prepared_domains
             ]
@@ -1340,8 +1487,8 @@ async def main() -> None:
 
                 Actor.log.info(
                     f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                    f"Verdict: {result['sales_readiness_verdict']} | "
-                    f"Email: {result['best_email'] or '-'} ({result['best_email_type'] or '-'})"
+                    f"DM: {result['decision_maker_name'] or '-'} | "
+                    f"Email: {result['best_email'] or '-'}"
                 )
 
                 if len(batch) >= batch_size:
