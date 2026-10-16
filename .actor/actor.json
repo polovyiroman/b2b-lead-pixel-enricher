@@ -2,8 +2,8 @@
     "actorSpecification": 1,
     "name": "b2b-lead-tech-pixel-enricher",
     "title": "B2B Website Tech Signal & Account Intelligence Enricher",
-    "description": "Account intelligence & tech signal enricher: extracts GTM/ad pixel evidence, MX-verified emails, B2B phones, canonical domain cleaning, and data confidence warnings.",
-    "version": "3.3",
+    "description": "Account intelligence & tech signal enricher: extracts GTM/ad pixel evidence, MX-verified emails, B2B phones, verified person-email matching, and sales readiness verdicts.",
+    "version": "3.4",
     "meta": {
         "templateId": "python-start"
     },
@@ -21,6 +21,7 @@
                             "input_domain",
                             "canonical_domain",
                             "status",
+                            "sales_readiness_verdict",
                             "company_category",
                             "icp_fit_tier",
                             "technical_signal_strength",
@@ -68,6 +69,7 @@
                             "input_domain": { "label": "Input Domain", "format": "text" },
                             "canonical_domain": { "label": "Canonical Domain", "format": "text" },
                             "status": { "label": "Scan Status", "format": "text" },
+                            "sales_readiness_verdict": { "label": "Sales Readiness Verdict", "format": "text" },
                             "company_category": { "label": "Company Category", "format": "text" },
                             "icp_fit_tier": { "label": "1. ICP Fit Tier", "format": "text" },
                             "technical_signal_strength": { "label": "2. Technical Signal Strength", "format": "text" },
