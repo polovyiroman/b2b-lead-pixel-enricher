@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import re
 from urllib.parse import urljoin, urlparse
 from curl_cffi.requests import AsyncSession
@@ -14,7 +15,6 @@ GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{4,10}\b', re.IGNORECASE)
 GA4_ID_REGEX = re.compile(r'\bG-[A-Z0-9]{6,12}\b')
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
 
-# Розширений список сміттєвих і тестових доменів
 JUNK_EMAIL_DOMAINS = {
     'sentry.io', 'wixpress.com', 'example.com', 'domain.com', 'test.com',
     'email.com', 'yoursite.com', 'yourdomain.com', 'company.com', 'website.com',
@@ -23,7 +23,6 @@ JUNK_EMAIL_DOMAINS = {
     'cloudflare.com', 'shopify.com', 'mysite.com', 'sample.com', 'mail.ru'
 }
 
-# Точні локальні частини тестових/фейкових пошт (відсікає test@..., example@... тощо)
 JUNK_EMAIL_LOCALS = {
     'test', 'testing', 'example', 'user', 'username', 'name', 'firstname',
     'lastname', 'yourname', 'youremail', 'email', 'mail', 'sample', 'demo',
@@ -38,18 +37,23 @@ JUNK_EXTENSIONS = (
     '.pdf', '.zip', '.rar', '.xml', '.json', '.docx', '.xlsx'
 )
 
-# Категорії поштових префіксів для класифікації та пріоритизації
-SALES_PREFIXES = (
-    'sales', 'sale', 'b2b', 'wholesale', 'opt', 'commercial', 'business',
-    'partner', 'partners', 'partnerships', 'deals', 'enterprise', 'corporate',
-    'hello', 'hi', 'contact', 'info', 'office', 'team', 'inquiries',
-    'enquiry', 'enquiries', 'founder', 'ceo', 'owner', 'kontakt', 'hallo'
+# Деталізована ієрархія префіксів: sales -> partnerships -> general -> support -> pr_and_media -> legal_or_hr
+SALES_ONLY_PREFIXES = (
+    'sales', 'sale', 'b2b', 'wholesale', 'opt', 'commercial', 'deals',
+    'enterprise', 'corporate', 'orders', 'quote', 'quotes', 'inquiries', 'enquiry', 'enquiries'
+)
+PARTNERSHIPS_PREFIXES = (
+    'partner', 'partners', 'partnerships', 'affiliate', 'affiliates', 'alliances', 'bizdev', 'bd'
+)
+GENERAL_PREFIXES = (
+    'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
+    'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'ceo', 'founder', 'owner'
+)
+SUPPORT_PREFIXES = (
+    'support', 'help', 'service', 'care', 'customerservice', 'client', 'clients', 'shop', 'store'
 )
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'marketing', 'ads', 'collab', 'brand'
-)
-SUPPORT_PREFIXES = (
-    'support', 'help', 'service', 'care', 'customerservice', 'client', 'clients', 'orders', 'shop'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'legal', 'datenschutz', 'dpo', 'compliance', 'gdpr',
@@ -57,14 +61,13 @@ LOW_PRIORITY_PREFIXES = (
     'jobs', 'careers', 'hr', 'recruiting', 'security', 'copyright', 'dmca'
 )
 
-# Контекстні маркери для B2B vs Роздрібних телефонів (UA, EN, DE, PL)
 B2B_PHONE_KEYWORDS = (
     'опт', 'гурт', 'гуртов', 'співпрац', 'партнер', 'корпоратив', 'b2b',
     'wholesale', 'commercial', 'corporate', 'sales', 'business', 'office',
     'офіс', 'відділ продажу', 'закупів', 'дилер', 'hurt', 'buro'
 )
 RETAIL_PHONE_KEYWORDS = (
-    'роздріб', 'роздрібн', ' інтернет-магазин', 'шоурум', 'retail', 'store', 'shop', 'showroom'
+    'роздріб', 'роздрібн', 'інтернет-магазин', 'шоурум', 'retail', 'store', 'shop', 'showroom'
 )
 
 PRIMARY_CONTACT_KEYWORDS = (
@@ -76,7 +79,7 @@ SECONDARY_CONTACT_KEYWORDS = (
 )
 
 TECH_SIGNATURES = {
-    'Meta Pixel (Facebook)': [
+    'Meta Pixel': [
         'connect.facebook.net', 'fbq(', 'facebook.com/tr?',
         '"facebook pixel"', 'facebook_pixel', 'fb_pixel_id'
     ],
@@ -102,7 +105,6 @@ TECH_SIGNATURES = {
     'Squarespace': ['squarespace.com', 'static1.squarespace.com']
 }
 
-# Заборонені сегменти URL соцмереж (каталоги партнерів, шаринг, службові сторінки)
 SOCIAL_BAD_SEGMENTS = {
     'sharer', 'sharer.php', 'share', 'intent', 'plugins', 'status', 'posts',
     'photos', 'videos', 'tr', 'dialog', 'p', 'reel', 'reels', 'stories',
@@ -147,7 +149,7 @@ def decode_cf_email(encoded_str: str) -> str:
 
 
 def classify_email_type(email: str | None) -> str | None:
-    """Визначає призначення контактної пошти для CRM та відділу продажу."""
+    """Класифікує пошту за 6 чіткими категоріями відповідно до ієрархії продажів."""
     if not email or '@' not in email:
         return None
     local = email.split('@', 1)[0].lower()
@@ -155,20 +157,27 @@ def classify_email_type(email: str | None) -> str | None:
 
     if local.startswith(LOW_PRIORITY_PREFIXES) or clean_local in LOW_PRIORITY_PREFIXES:
         return 'legal_or_hr'
+    if local.startswith(SALES_ONLY_PREFIXES) or clean_local in SALES_ONLY_PREFIXES:
+        return 'sales'
+    if local.startswith(PARTNERSHIPS_PREFIXES) or clean_local in PARTNERSHIPS_PREFIXES:
+        return 'partnerships'
+    if local.startswith(GENERAL_PREFIXES) or clean_local in GENERAL_PREFIXES:
+        return 'general'
+    if local.startswith(SUPPORT_PREFIXES) or clean_local in SUPPORT_PREFIXES:
+        return 'support'
     if local.startswith(PR_MEDIA_PREFIXES) or clean_local in PR_MEDIA_PREFIXES:
         return 'pr_and_media'
-    if local.startswith(SUPPORT_PREFIXES) or clean_local in SUPPORT_PREFIXES:
-        return 'customer_support'
-    if local.startswith(SALES_PREFIXES) or clean_local in SALES_PREFIXES:
-        return 'sales_or_general'
     return 'direct_or_corporate'
 
 
-def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
-    """Жорстко відсікає тестові/сміттєві пошти та ранжує реальні контакти за B2B-цінністю."""
-    valid = set()
-    for email in raw_emails:
-        email = email.lower().strip('.,;:()[]"\'<> \t\r\n')
+def rank_and_clean_emails(
+    email_sources: dict[str, str],
+    base_domain: str
+) -> list[tuple[str, str]]:
+    """Повертає відсортований список кортежів (email, source_url) за B2B-пріоритетом."""
+    valid: dict[str, str] = {}
+    for raw_email, source_url in email_sources.items():
+        email = raw_email.lower().strip('.,;:()[]"\'<> \t\r\n')
         email = re.sub(r'^(?:%20|u003[ce]|3a)+', '', email)
 
         if any(email.endswith(ext) for ext in JUNK_EXTENSIONS):
@@ -180,7 +189,6 @@ def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
         if not local_part or not domain_part or '.' not in domain_part:
             continue
 
-        # Відсікаємо сміттєві домени та тестові заглушки (наприклад, test@test.com)
         domain_root = domain_part.split('.')[0]
         clean_local = re.sub(r'[0-9._+-]+$', '', local_part)
 
@@ -191,35 +199,33 @@ def rank_and_clean_emails(raw_emails: set[str], base_domain: str) -> list[str]:
         if local_part == domain_root and domain_part != base_domain:
             continue
 
-        if 6 <= len(email) <= 60:
-            valid.add(email)
+        if 6 <= len(email) <= 60 and email not in valid:
+            valid[email] = source_url
+
+    type_weights = {
+        'sales': 30,
+        'partnerships': 26,
+        'general': 22,
+        'direct_or_corporate': 18,
+        'support': 10,
+        'pr_and_media': 6,
+        'legal_or_hr': -35
+    }
 
     def email_score(addr: str) -> tuple[int, str]:
-        local, domain = addr.split('@', 1)
+        _, domain = addr.split('@', 1)
         score = 0
-
         if base_domain and (domain == base_domain or domain.endswith(f'.{base_domain}')):
             score += 25
-
         email_type = classify_email_type(addr)
-        if email_type == 'sales_or_general':
-            score += 20
-        elif email_type == 'direct_or_corporate':
-            score += 15
-        elif email_type == 'customer_support':
-            score += 8
-        elif email_type == 'pr_and_media':
-            score += 5
-        elif email_type == 'legal_or_hr':
-            score -= 35
-
+        score += type_weights.get(email_type or '', 0)
         return (-score, addr)
 
-    return sorted(valid, key=email_score)
+    sorted_addrs = sorted(valid.keys(), key=email_score)
+    return [(addr, valid[addr]) for addr in sorted_addrs]
 
 
 def clean_and_validate_social_url(platform: str, href: str) -> str | None:
-    """Перевіряє, що посилання веде на реальний профіль компанії, а не каталог партнерів чи шаринг."""
     try:
         parsed = urlparse(href.strip())
     except Exception:
@@ -243,9 +249,7 @@ def clean_and_validate_social_url(platform: str, href: str) -> str | None:
         return None
 
     if platform == 'facebook':
-        if host not in ('facebook.com', 'fb.com'):
-            return None
-        if segments_lower[0] == 'profile.php':
+        if host not in ('facebook.com', 'fb.com') or segments_lower[0] == 'profile.php':
             return None
         return f'https://www.facebook.com/{segments[0]}'
 
@@ -289,7 +293,6 @@ def clean_and_validate_social_url(platform: str, href: str) -> str | None:
 
 
 def score_phone_context(context_text: str) -> int:
-    """Оцінює текст навколо номера: підвищує пріоритет B2B/гуртових номерів над роздрібними."""
     ctx = context_text.lower()
     score = 0
     if any(k in ctx for k in B2B_PHONE_KEYWORDS):
@@ -303,8 +306,8 @@ def extract_valid_phones(
     text: str,
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
-) -> list[str]:
-    """Валідує номери у форматі E.164 та сортує їх за B2B-релевантністю."""
+) -> list[tuple[str, int]]:
+    """Повертає список кортежів (formatted_e164_phone, context_score)."""
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
@@ -345,96 +348,169 @@ def extract_valid_phones(
         phone_scores.keys(),
         key=lambda p: (-phone_scores[p], phone_order[p])
     )
-    return sorted_phones[:10]
+    return [(p, phone_scores[p]) for p in sorted_phones[:10]]
 
 
-def detect_tech_and_pixels(combined_source: str, gtm_ids: list[str]) -> dict:
-    source_lower = combined_source.lower()
+def detect_tech_with_evidence(
+    html: str,
+    gtm_js: str,
+    gtm_ids: list[str],
+    page_url: str
+) -> dict:
+    """Визначає технології та зберігає точний доказ (evidence) для кожної з них."""
+    combined = f'{html}\n{gtm_js}'
+    html_lower = html.lower()
+    gtm_lower = gtm_js.lower()
+
     detected = []
+    evidence_items = []
 
-    has_gtm = bool(gtm_ids) or 'googletagmanager.com/gtm.js' in source_lower
+    has_gtm = bool(gtm_ids) or 'googletagmanager.com/gtm.js' in html_lower
     if has_gtm:
         detected.append('Google Tag Manager')
+        ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js script)'
+        evidence_items.append(f'{ev_str} on {page_url}')
 
+    ga4_matches = sorted({m.upper() for m in GA4_ID_REGEX.findall(combined)})
     has_ga4 = (
-        bool(GA4_ID_REGEX.search(combined_source))
-        or 'googletagmanager.com/gtag/js' in source_lower
-        or 'google-analytics.com/g/collect' in source_lower
+        bool(ga4_matches)
+        or 'googletagmanager.com/gtag/js' in html_lower
+        or 'googletagmanager.com/gtag/js' in gtm_lower
+        or 'google-analytics.com/g/collect' in html_lower
     )
     if has_ga4:
         detected.append('Google Analytics (GA4)')
+        src_where = 'HTML' if GA4_ID_REGEX.search(html) or 'gtag/js' in html_lower else 'GTM container'
+        ev_id = ga4_matches[0] if ga4_matches else 'gtag/js'
+        evidence_items.append(f'GA4 ({ev_id} in {src_where})')
 
+    aw_matches = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(combined)})
     has_google_ads = (
-        bool(GOOGLE_ADS_REGEX.search(combined_source))
-        or 'googleadservices.com/pagead/conversion' in source_lower
+        bool(aw_matches)
+        or 'googleadservices.com/pagead/conversion' in html_lower
+        or 'googleadservices.com/pagead/conversion' in gtm_lower
     )
     if has_google_ads:
         detected.append('Google Ads Conversion')
+        src_where = 'HTML' if GOOGLE_ADS_REGEX.search(html) else 'GTM container'
+        ev_id = aw_matches[0] if aw_matches else 'conversion_async.js'
+        evidence_items.append(f'Google Ads ({ev_id} in {src_where})')
 
     for name, markers in TECH_SIGNATURES.items():
-        if any(marker in source_lower for marker in markers):
+        matched_in_html = next((m for m in markers if m in html_lower), None)
+        matched_in_gtm = next((m for m in markers if m in gtm_lower), None)
+        if matched_in_html or matched_in_gtm:
             detected.append(name)
+            if matched_in_html:
+                evidence_items.append(f"{name} ('{matched_in_html}' in HTML)")
+            else:
+                evidence_items.append(f"{name} ('{matched_in_gtm}' in GTM)")
 
     return {
-        'has_meta_pixel': 'Meta Pixel (Facebook)' in detected,
+        'has_meta_pixel': 'Meta Pixel' in detected,
         'has_tiktok_pixel': 'TikTok Pixel' in detected,
         'has_google_ads': has_google_ads,
         'has_linkedin_pixel': 'LinkedIn Insight Tag' in detected,
         'has_ga4': has_ga4,
         'has_gtm': has_gtm,
-        'gtm_container_ids': gtm_ids,
-        'detected_technologies': detected
+        'detected_technologies_list': detected,
+        'technology_evidence': ' | '.join(evidence_items) if evidence_items else 'No tracking markers detected'
     }
 
 
-def generate_sales_signal(tech_info: dict, best_email: str | None, primary_phone: str | None) -> str:
-    """Формує готовий комерційний інсайт для відділу продажу на основі знайдених пікселів."""
-    ad_pixels = []
+def evaluate_sales_intelligence(
+    tech_info: dict,
+    best_email: str | None,
+    best_email_type: str | None,
+    primary_phone: str | None
+) -> tuple[str, str, str]:
+    """
+    Формує 3 обґрунтовані поля замість категоричних тверджень про бюджети:
+    (detected_signals, sales_opportunity, signal_confidence)
+    """
+    ad_tags = []
     if tech_info.get('has_meta_pixel'):
-        ad_pixels.append('Meta')
+        ad_tags.append('Meta Pixel')
     if tech_info.get('has_google_ads'):
-        ad_pixels.append('Google Ads')
+        ad_tags.append('Google Ads Conversion')
     if tech_info.get('has_tiktok_pixel'):
-        ad_pixels.append('TikTok')
+        ad_tags.append('TikTok Pixel')
     if tech_info.get('has_linkedin_pixel'):
-        ad_pixels.append('LinkedIn')
+        ad_tags.append('LinkedIn Insight Tag')
 
-    has_analytics = bool(tech_info.get('has_ga4') or tech_info.get('has_gtm'))
-    has_contacts = bool(best_email or primary_phone)
+    analytics_tags = []
+    if tech_info.get('has_ga4'):
+        analytics_tags.append('GA4')
+    if tech_info.get('has_gtm'):
+        analytics_tags.append('GTM')
 
-    if len(ad_pixels) >= 2:
-        signal = f"High Ad Spend ({' + '.join(ad_pixels)})"
-    elif len(ad_pixels) == 1:
-        if not has_analytics:
-            signal = f"Running {ad_pixels[0]} Ads without GA4/GTM (Analytics Setup Pitch)"
+    detected_list = tech_info.get('detected_technologies_list', [])
+    for ux_tool in ('Microsoft Clarity', 'Hotjar', 'HubSpot', 'Klaviyo'):
+        if ux_tool in detected_list:
+            analytics_tags.append(ux_tool)
+
+    all_signals = ad_tags + analytics_tags
+    detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
+
+    if len(ad_tags) >= 2:
+        opportunity = (
+            f"Multi-channel ad tracking installed ({', '.join(ad_tags)}) — "
+            "pitch conversion attribution audit, CRO, or performance marketing management"
+        )
+    elif len(ad_tags) == 1:
+        if not analytics_tags:
+            opportunity = (
+                f"{ad_tags[0]} installed without GA4/GTM — "
+                "pitch analytics implementation & server-side tracking setup"
+            )
         else:
-            signal = f"Active {ad_pixels[0]} Advertiser (Cross-Channel Upsell)"
-    elif has_analytics:
-        signal = 'Organic/Analytics Only — No Ad Pixels Detected (Paid Ads Pitch)'
+            opportunity = (
+                f"Single-channel ad tracking ({ad_tags[0]}) + analytics — "
+                "pitch cross-channel acquisition (Google Ads / TikTok / Meta expansion) or remarketing audit"
+            )
+    elif analytics_tags:
+        opportunity = (
+            f"Analytics active ({', '.join(analytics_tags)}) but no paid ad pixels detected — "
+            "pitch paid traffic launch or pixel retargeting setup"
+        )
     else:
-        signal = 'No Tracking Pixels Detected (Full Digital Marketing Pitch)'
+        opportunity = "No analytics or ad pixels detected — pitch foundational analytics (GA4/GTM) & digital strategy"
 
-    if not has_contacts:
-        signal += ' [No Direct Contacts Found]'
-    return signal
+    has_direct_b2b = best_email_type in ('sales', 'partnerships', 'general', 'direct_or_corporate')
+    if all_signals and (has_direct_b2b or primary_phone):
+        confidence = (
+            "High (Verified via HTML/GTM script markers & direct contact found; "
+            "note: pixel presence confirms tracking setup, not active ad spend)"
+        )
+    elif all_signals:
+        confidence = (
+            "Medium (Tracking tags verified in code, but only support/PR or secondary contact available)"
+        )
+    else:
+        confidence = "Low (No marketing tags detected on inspected pages)"
+
+    return detected_signals_str, opportunity, confidence
 
 
 def parse_html_sync(
     html: str,
-    base_url: str,
+    page_url: str,
     default_region: str
-) -> tuple[str, str, set[str], list[str], dict[str, str], list[str]]:
-    emails = set(EMAIL_REGEX.findall(html))
+) -> tuple[str, str, dict[str, str], list[tuple[str, int, str]], dict[str, tuple[str, str]], list[str]]:
+    email_sources: dict[str, str] = {}
+    for m in EMAIL_REGEX.findall(html):
+        email_sources[m] = page_url
+
     raw_tel_candidates: list[tuple[str, str]] = [
         (m, 'schema_json_ld') for m in SCHEMA_PHONE_REGEX.findall(html)
     ]
-    socials = {}
+    socials_with_source: dict[str, tuple[str, str]] = {}
     primary_links = set()
     secondary_links = set()
 
     soup = BeautifulSoup(html, 'lxml')
-    base_domain = urlparse(base_url).netloc.lower().replace('www.', '')
-    base_clean = base_url.rstrip('/')
+    base_domain = urlparse(page_url).netloc.lower().replace('www.', '')
+    base_clean = page_url.rstrip('/')
 
     page_title = ''
     if soup.title and soup.title.string:
@@ -451,7 +527,7 @@ def parse_html_sync(
     for cf_tag in soup.find_all(attrs={'data-cfemail': True}):
         decoded = decode_cf_email(cf_tag['data-cfemail'])
         if decoded and EMAIL_REGEX.match(decoded):
-            emails.add(decoded)
+            email_sources[decoded] = page_url
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href'].strip()
@@ -460,7 +536,7 @@ def parse_html_sync(
         if href_lower.startswith('mailto:'):
             mail = href.split(':', 1)[1].split('?')[0].strip()
             if EMAIL_REGEX.match(mail):
-                emails.add(mail)
+                email_sources[mail] = page_url
             continue
 
         if href_lower.startswith('tel:'):
@@ -471,12 +547,12 @@ def parse_html_sync(
             continue
 
         for platform in ('linkedin', 'instagram', 'facebook', 'tiktok', 'telegram', 'youtube', 'twitter'):
-            if platform not in socials:
+            if platform not in socials_with_source:
                 clean_soc = clean_and_validate_social_url(platform, href)
                 if clean_soc:
-                    socials[platform] = clean_soc
+                    socials_with_source[platform] = (clean_soc, page_url)
 
-        full_url = urljoin(base_url, href)
+        full_url = urljoin(page_url, href)
         parsed = urlparse(full_url)
         link_domain = parsed.netloc.lower().replace('www.', '')
         path_lower = parsed.path.lower()
@@ -495,12 +571,15 @@ def parse_html_sync(
                 secondary_links.add(normalized_link)
 
     text_content = soup.get_text(' ', strip=True)
-    emails.update(EMAIL_REGEX.findall(text_content))
-    phones = extract_valid_phones(text_content, raw_tel_candidates, default_region)
+    for m in EMAIL_REGEX.findall(text_content):
+        email_sources.setdefault(m, page_url)
+
+    scored_phones = extract_valid_phones(text_content, raw_tel_candidates, default_region)
+    phones_with_source = [(p, sc, page_url) for p, sc in scored_phones]
 
     ordered_contact_links = sorted(primary_links) + sorted(secondary_links - primary_links)
 
-    return page_title, meta_desc, emails, phones, socials, ordered_contact_links
+    return page_title, meta_desc, email_sources, phones_with_source, socials_with_source, ordered_contact_links
 
 
 async def fetch_html_safely(
@@ -569,6 +648,15 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
     return gtm_ids, '\n'.join(gtm_contents)
 
 
+def classify_failure_status(http_status: int, err_msg: str) -> str:
+    err_lower = err_msg.lower()
+    if http_status in (401, 403, 429):
+        return 'blocked'
+    if 'timeout' in err_lower or 'timed out' in err_lower:
+        return 'timeout'
+    return 'failed'
+
+
 async def process_domain(
     client: AsyncSession,
     domain_key: str,
@@ -578,46 +666,56 @@ async def process_domain(
     default_region: str,
     semaphore: asyncio.Semaphore
 ) -> dict:
-    # При помилці або HTTP 403 прапорці технологій повертають None (unknown), а не False
-    empty_result = {
-        'input_domain': domain_key,
-        'website_url': root_url,
-        'status': 'error',
-        'error_message': '',
-        'sales_signal': 'Blocked or Unreachable (Enable Proxy to Retry)',
-        'page_title': None,
-        'meta_description': None,
-        'best_email': None,
-        'best_email_type': None,
-        'primary_phone': None,
-        'linkedin_url': None,
-        'instagram_url': None,
-        'facebook_url': None,
-        'has_meta_pixel': None,
-        'has_tiktok_pixel': None,
-        'has_google_ads': None,
-        'has_linkedin_pixel': None,
-        'has_ga4': None,
-        'has_gtm': None,
-        'detected_technologies': [],
-        'gtm_container_ids': [],
-        'emails': [],
-        'phones': [],
-        'socials': {}
-    }
+    checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(client, root_url)
 
         if status == 0 or status >= 400 or not html:
-            empty_result['website_url'] = final_url
-            empty_result['status'] = f'http_{status}' if status >= 400 else 'error'
-            empty_result['error_message'] = err_msg
-            return empty_result
+            fail_status = classify_failure_status(status, err_msg)
+            return {
+                'input_domain': domain_key,
+                'website_url': final_url,
+                'status': fail_status,
+                'error_message': err_msg,
+                'page_title': None,
+                'meta_description': None,
+                'best_email': None,
+                'best_email_type': None,
+                'email_source_url': None,
+                'primary_phone': None,
+                'phone_source_url': None,
+                'linkedin_url': None,
+                'instagram_url': None,
+                'facebook_url': None,
+                'telegram_url': None,
+                'tiktok_url': None,
+                'youtube_url': None,
+                'social_source_url': None,
+                'detected_signals': None,
+                'sales_opportunity': f'Site {fail_status} ({err_msg}) — unable to inspect pages without access',
+                'signal_confidence': 'None (Site unreachable or access denied)',
+                'technology_evidence': None,
+                'has_meta_pixel': None,
+                'has_tiktok_pixel': None,
+                'has_google_ads': None,
+                'has_linkedin_pixel': None,
+                'has_ga4': None,
+                'has_gtm': None,
+                'detected_technologies': None,
+                'all_emails': None,
+                'all_phones': None,
+                'last_checked_at': checked_at
+            }
 
-        page_title, meta_desc, emails, phones_list, socials, contact_links = await asyncio.to_thread(
-            parse_html_sync, html, final_url, default_region
-        )
+        (
+            page_title,
+            meta_desc,
+            email_sources,
+            phones_with_source,
+            socials_with_source,
+            contact_links
+        ) = await asyncio.to_thread(parse_html_sync, html, final_url, default_region)
 
         if unpack_gtm:
             gtm_ids, gtm_js = await fetch_gtm_scripts(client, html)
@@ -625,52 +723,97 @@ async def process_domain(
             gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html)})
             gtm_js = ''
 
-        tech_info = detect_tech_and_pixels(f'{html}\n{gtm_js}', gtm_ids)
+        tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, final_url)
+
+        # Об'єднуємо телефони зі збереженням найвищого B2B-балу та сторінки-джерела
+        phone_map: dict[str, tuple[int, str]] = {}
+        for p, sc, src in phones_with_source:
+            if p not in phone_map or sc > phone_map[p][0]:
+                phone_map[p] = (sc, src)
 
         if scan_contacts and contact_links:
             for sub_url in contact_links[:3]:
-                sub_status, sub_html, _, _ = await fetch_html_safely(
+                sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
                     client, sub_url, timeout=10.0, retries=1
                 )
                 if 200 <= sub_status < 400 and sub_html:
                     _, _, sub_e, sub_p, sub_s, _ = await asyncio.to_thread(
-                        parse_html_sync, sub_html, final_url, default_region
+                        parse_html_sync, sub_html, sub_final_url, default_region
                     )
-                    emails.update(sub_e)
-                    # Контакти зі спеціалізованої сторінки /contact мають високу цінність
-                    for p in sub_p:
-                        if p not in phones_list:
-                            phones_list.append(p)
+                    for em, src in sub_e.items():
+                        email_sources.setdefault(em, src)
+                    for p, sc, src in sub_p:
+                        if p not in phone_map or sc > phone_map[p][0]:
+                            phone_map[p] = (sc, src)
                     for k, v in sub_s.items():
-                        socials.setdefault(k, v)
+                        socials_with_source.setdefault(k, v)
 
         base_domain = urlparse(final_url).netloc.lower().replace('www.', '')
-        ranked_emails = rank_and_clean_emails(emails, base_domain)
-        final_phones = phones_list[:10]
+        ranked_emails_with_src = rank_and_clean_emails(email_sources, base_domain)
 
-        best_email = ranked_emails[0] if ranked_emails else None
+        sorted_phones_with_src = sorted(
+            phone_map.items(),
+            key=lambda item: -item[1][0]
+        )[:10]
+
+        best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
+        email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email)
-        primary_phone = final_phones[0] if final_phones else None
-        sales_signal = generate_sales_signal(tech_info, best_email, primary_phone)
+
+        primary_phone = sorted_phones_with_src[0][0] if sorted_phones_with_src else None
+        phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
+
+        # Визначаємо основне джерело соцмереж
+        social_source_url = None
+        for platform in ('linkedin', 'instagram', 'facebook', 'telegram', 'tiktok', 'youtube'):
+            if platform in socials_with_source:
+                social_source_url = socials_with_source[platform][1]
+                break
+
+        detected_signals, sales_opportunity, signal_confidence = evaluate_sales_intelligence(
+            tech_info, best_email, best_email_type, primary_phone
+        )
+
+        has_any_contact = bool(best_email or primary_phone or socials_with_source)
+        final_status = 'success' if has_any_contact else 'no_contacts_found'
+
+        all_emails_list = [em for em, _ in ranked_emails_with_src]
+        all_phones_list = [p for p, _ in sorted_phones_with_src]
+        detected_tech_list = tech_info['detected_technologies_list']
 
         return {
             'input_domain': domain_key,
             'website_url': final_url,
-            'status': 'success',
+            'status': final_status,
             'error_message': '',
-            'sales_signal': sales_signal,
             'page_title': page_title,
             'meta_description': meta_desc,
             'best_email': best_email,
             'best_email_type': best_email_type,
+            'email_source_url': email_source_url,
             'primary_phone': primary_phone,
-            'linkedin_url': socials.get('linkedin'),
-            'instagram_url': socials.get('instagram'),
-            'facebook_url': socials.get('facebook'),
-            **tech_info,
-            'emails': ranked_emails,
-            'phones': final_phones,
-            'socials': socials
+            'phone_source_url': phone_source_url,
+            'linkedin_url': socials_with_source.get('linkedin', (None, None))[0],
+            'instagram_url': socials_with_source.get('instagram', (None, None))[0],
+            'facebook_url': socials_with_source.get('facebook', (None, None))[0],
+            'telegram_url': socials_with_source.get('telegram', (None, None))[0],
+            'tiktok_url': socials_with_source.get('tiktok', (None, None))[0],
+            'youtube_url': socials_with_source.get('youtube', (None, None))[0],
+            'social_source_url': social_source_url,
+            'detected_signals': detected_signals,
+            'sales_opportunity': sales_opportunity,
+            'signal_confidence': signal_confidence,
+            'technology_evidence': tech_info['technology_evidence'],
+            'has_meta_pixel': tech_info['has_meta_pixel'],
+            'has_tiktok_pixel': tech_info['has_tiktok_pixel'],
+            'has_google_ads': tech_info['has_google_ads'],
+            'has_linkedin_pixel': tech_info['has_linkedin_pixel'],
+            'has_ga4': tech_info['has_ga4'],
+            'has_gtm': tech_info['has_gtm'],
+            'detected_technologies': '; '.join(detected_tech_list) if detected_tech_list else None,
+            'all_emails': '; '.join(all_emails_list) if all_emails_list else None,
+            'all_phones': '; '.join(all_phones_list) if all_phones_list else None,
+            'last_checked_at': checked_at
         }
 
 
@@ -733,7 +876,7 @@ async def main() -> None:
                     f"[{result['status'].upper()}] {result['input_domain']} | "
                     f"Email: {result['best_email'] or '-'} ({result['best_email_type'] or '-'}) | "
                     f"Phone: {result['primary_phone'] or '-'} | "
-                    f"Signal: {result['sales_signal']}"
+                    f"Signals: {result['detected_signals'] or '-'}"
                 )
 
                 if len(batch) >= batch_size:
