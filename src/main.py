@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import re
-from urllib.parse import quote_plus, unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from curl_cffi.requests import AsyncSession
 import phonenumbers
 from bs4 import BeautifulSoup
@@ -21,7 +21,8 @@ GTM_FALSE_POSITIVES = {
     'GTM-PAGE', 'GTM-SUITE', 'GTM-SECTION', 'GTM-WRAPPER', 'GTM-HEADER',
     'GTM-FOOTER', 'GTM-BUTTON', 'GTM-CLICK', 'GTM-EVENT', 'GTM-LOADER',
     'GTM-SCRIPT', 'GTM-DATA', 'GTM-CONTAINER', 'GTM-BLOCK', 'GTM-FORM',
-    'GTM-MODAL', 'GTM-BANNER', 'GTM-SLIDER', 'GTM-MENU', 'GTM-NAV', 'GTM-TRACK'
+    'GTM-MODAL', 'GTM-BANNER', 'GTM-SLIDER', 'GTM-MENU', 'GTM-NAV',
+    'GTM-TRACK', 'GTM-NOSCRIPT', 'GTM-IFRAME', 'GTM-CUSTOM', 'GTM-CONFIG'
 }
 
 ROLES_REGEX_PART = (
@@ -42,7 +43,6 @@ ROLE_BEFORE_NAME_PATTERN = re.compile(
     rf'\b({ROLES_REGEX_PART})(?:\s+[a-zа-яіїєґA-ZА-ЯІЇЄҐ\’\'-]{{2,20}}){{0,3}}[\s,—–\-:|()•]{{1,20}}{NAME_REGEX_PART}\b',
     re.UNICODE
 )
-# Патерн для офіційних оферт та договорів: "ФОП Прізвище Ім'я" або "в особі Директора Прізвище Ім'я"
 FOP_OWNER_PATTERN = re.compile(
     r'(?:ФОП|Фізична особа[\s-]підприємець)\s+([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,25}\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,20})',
     re.UNICODE
@@ -72,7 +72,16 @@ JUNK_EMAIL_DOMAINS = {
     'email.com', 'yoursite.com', 'yourdomain.com', 'company.com', 'website.com',
     'sentry.wixpress.com', 'godaddy.com', 'sentry-next.wixpress.com',
     'wordpress.org', 'w3.org', 'schema.org', 'googleusercontent.com',
-    'cloudflare.com', 'shopify.com', 'mysite.com', 'sample.com', 'mail.ru'
+    'cloudflare.com', 'shopify.com', 'mysite.com', 'sample.com', 'mail.ru',
+    'atlassian.net', 'janesbakery.com', 'novaposhta.official'
+}
+
+PUBLIC_WEBMAIL_DOMAINS = {
+    'gmail.com', 'ukr.net', 'icloud.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'proton.me', 'protonmail.com'
+}
+
+INVALID_EMAIL_TLDS = {
+    'official', 'page', 'button', 'Wrapper', 'container', 'png', 'jpg', 'svg', 'webp', 'js', 'css', 'html', 'php'
 }
 
 JUNK_EMAIL_LOCALS = {
@@ -80,7 +89,7 @@ JUNK_EMAIL_LOCALS = {
     'lastname', 'yourname', 'youremail', 'email', 'mail', 'sample', 'demo',
     'foo', 'bar', 'admin', 'root', 'webmaster', 'postmaster', 'hostmaster',
     'abuse', 'noreply', 'no-reply', 'donotreply', 'do-not-reply', 'mailer-daemon',
-    'xxx', 'abc', '123', 'null', 'none', 'undefined'
+    'xxx', 'abc', '123', 'null', 'none', 'undefined', 'u002f', 'u003e', 'u003c', 'jira'
 }
 
 JUNK_EXTENSIONS = (
@@ -94,7 +103,8 @@ MARKETING_EXEC_PREFIXES = (
     'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner'
 )
 B2B_PARTNERSHIP_PREFIXES = (
-    'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial', 'corporate', 'deals'
+    'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
+    'corporate', 'corp', 'corp.com', 'deals', 'tender', 'tenders'
 )
 WHOLESALE_MERCH_PREFIXES = (
     'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer'
@@ -102,7 +112,7 @@ WHOLESALE_MERCH_PREFIXES = (
 GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
     'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'inquiries',
-    'enquiry', 'reception', 'secretariat', 'admin'
+    'enquiry', 'reception', 'secretariat', 'admin', 'kans', 'kanc'
 )
 DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
@@ -110,15 +120,17 @@ DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'booking', 'reservation', 'delivery', 'logistics', 'export', 'import'
 )
 SUPPORT_PREFIXES = (
-    'support', 'help', 'service', 'care', 'customerservice', 'client', 'clients', 'shop', 'store'
+    'support', 'support_ua', 'help', 'service', 'care', 'customerservice',
+    'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
 )
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand', 'events'
 )
 LOW_PRIORITY_PREFIXES = (
-    'privacy', 'legal', 'datenschutz', 'dpo', 'compliance', 'gdpr',
-    'billing', 'invoice', 'invoices', 'accounting', 'finance',
-    'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca'
+    'privacy', 'legal', 'notices', 'notice', 'legalnotices', 'datenschutz',
+    'dpo', 'compliance', 'gdpr', 'billing', 'invoice', 'invoices',
+    'accounting', 'finance', 'jobs', 'careers', 'job', 'hr', 'recruiting',
+    'security', 'copyright', 'dmca', 'jira'
 )
 REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
@@ -134,6 +146,7 @@ NON_PERSON_TOKENS = (
     | set(PR_MEDIA_PREFIXES)
     | set(LOW_PRIORITY_PREFIXES)
     | REGIONAL_BRANCH_LOCALS
+    | {'corp', 'com', 'comm', 'org', 'net', 'gov', 'edu', 'ua', 'eu', 'uk', 'us', 'dep', 'dept', 'official'}
 )
 
 B2B_PHONE_KEYWORDS = (
@@ -147,12 +160,12 @@ RETAIL_PHONE_KEYWORDS = (
 
 PRIMARY_CONTACT_KEYWORDS = (
     'contact', 'kontakt', 'impressum', 'contatti', 'contacto',
-    'get-in-touch', 'contact-information', 'kontakty'
+    'get-in-touch', 'contact-information', 'kontakty', 'contacts'
 )
 SECONDARY_CONTACT_KEYWORDS = (
     'about', 'uber-uns', 'ueber-uns', 'team', 'komanda', 'company', 'leadership',
     'management', 'founders', 'our-story', 'pro-nas', 'o-nas', 'history', 'brand',
-    'wholesale', 'b2b', 'oferta', 'offer', 'terms', 'privacy', 'ugoda'
+    'wholesale', 'b2b', 'oferta', 'offer', 'terms', 'privacy', 'ugoda', 'investors'
 )
 
 AD_AND_ANALYTICS_SIGNATURES = {
@@ -280,6 +293,7 @@ def classify_email_type(email: str | None) -> str | None:
     if local.startswith(PR_MEDIA_PREFIXES) or first_token in PR_MEDIA_PREFIXES:
         return 'pr_and_media_inbox'
 
+    # Перевіряємо, чи це справді іменна пошта людини (і жоден із токенів не є службовим словом типу corp.com)
     if len(tokens) == 2 and all(t.isalpha() for t in tokens):
         if tokens[0] not in NON_PERSON_TOKENS and tokens[1] not in NON_PERSON_TOKENS and tokens[1] != domain_root:
             if (len(tokens[0]) == 1 and len(tokens[1]) >= 3) or (len(tokens[0]) >= 3 and len(tokens[1]) >= 3):
@@ -380,10 +394,16 @@ def rank_and_clean_emails(
     email_sources: dict[str, str],
     base_domain: str
 ) -> list[tuple[str, str]]:
+    """
+    Очищує пошти від Unicode-екранувань (u002f@...), сміттєвих TLD (.official)
+    та сторонніх клієнтських/тендерних пошт, якщо знайдено пошти на власному домені компанії.
+    """
     valid: dict[str, str] = {}
+    base_brand = base_domain.split('.')[0].lower() if base_domain else ''
+
     for raw_email, source_url in email_sources.items():
         email = raw_email.lower().strip('.,;:()[]"\'<> \t\r\n')
-        email = re.sub(r'^(?:%20|u003[ce]|3a)+', '', email)
+        email = re.sub(r'^(?:%20|u002[0-9a-f]|u003[0-9a-f]|3a|2f)+', '', email)
 
         if any(email.endswith(ext) for ext in JUNK_EXTENSIONS):
             continue
@@ -392,6 +412,10 @@ def rank_and_clean_emails(
 
         local_part, domain_part = email.split('@', 1)
         if not local_part or not domain_part or '.' not in domain_part:
+            continue
+
+        tld = domain_part.rsplit('.', 1)[-1]
+        if tld in INVALID_EMAIL_TLDS or len(tld) < 2 or not tld.isalpha():
             continue
 
         domain_root = domain_part.split('.')[0]
@@ -406,6 +430,33 @@ def rank_and_clean_emails(
 
         if 6 <= len(email) <= 60 and email not in valid:
             valid[email] = source_url
+
+    # Перевіряємо, чи є серед знайдених адрес рідні корпоративні адреси бренду
+    has_native_brand_email = any(
+        base_brand and (
+            dom == base_domain
+            or dom.endswith(f'.{base_domain}')
+            or dom.split('.')[0] == base_brand
+        )
+        for addr in valid
+        for _, dom in [addr.split('@', 1)]
+    )
+
+    if has_native_brand_email:
+        # Якщо компанія має власні пошти на своєму домені, відсікаємо випадкові чужі корпоративні домени з прикладів/тендерів
+        filtered_valid = {}
+        for addr, src in valid.items():
+            _, dom = addr.split('@', 1)
+            is_native = (
+                dom == base_domain
+                or dom.endswith(f'.{base_domain}')
+                or dom.split('.')[0] == base_brand
+                or dom in PUBLIC_WEBMAIL_DOMAINS
+            )
+            if is_native:
+                filtered_valid[addr] = src
+        if filtered_valid:
+            valid = filtered_valid
 
     type_weights = {
         'marketing_or_exec_role': 35,
@@ -426,6 +477,8 @@ def rank_and_clean_emails(
         score = 0
         if base_domain and (domain == base_domain or domain.endswith(f'.{base_domain}')):
             score += 25
+        elif base_brand and domain.split('.')[0] == base_brand:
+            score += 20
         email_type = classify_email_type(addr)
         score += type_weights.get(email_type or '', 0)
         return (-score, addr)
@@ -678,9 +731,12 @@ def classify_company_category(
     if any(cms in detected_tech for cms in ('Shopify', 'WooCommerce')) or any(k in text for k in ecom_keywords):
         return 'E-commerce / Retail Brand'
 
-    saas_keywords = ('saas', 'cloud platform', 'crm', 'api', 'b2b software', 'automation platform')
+    saas_keywords = (
+        'saas', 'cloud platform', 'crm', 'api', 'b2b software', 'automation platform',
+        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app'
+    )
     if any(k in text for k in saas_keywords):
-        return 'SaaS / Tech Platform'
+        return 'SaaS / Marketplace / Tech Platform'
 
     return 'General Business / Corporate'
 
@@ -697,10 +753,6 @@ def is_valid_person_name(candidate: str) -> bool:
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None]:
-    """
-    Приймає список (page_url, html, text_content).
-    Повертає (decision_maker_name, decision_maker_role, decision_maker_linkedin_url, dm_source_url).
-    """
     candidate_li_urls = []
 
     for page_url, html, _ in pages_with_urls:
@@ -774,7 +826,7 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v38(
+def evaluate_qualification_v39(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -812,8 +864,8 @@ def evaluate_qualification_v38(
     # 1. ICP Fit Tier
     if company_category == 'E-commerce / Retail Brand':
         icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
-    elif company_category in ('SaaS / Tech Platform', 'General Business / Corporate'):
-        icp_fit_tier = 'Tier 2: Secondary ICP (Corporate / Digital Business)'
+    elif company_category in ('SaaS / Marketplace / Tech Platform', 'General Business / Corporate'):
+        icp_fit_tier = f'Tier 2: Secondary ICP ({company_category})'
     elif company_category == 'B2B Agency / Marketing Media':
         icp_fit_tier = 'Partner / Competitor Segment (Agency / Media — Exclude from Standard Client Outreach)'
     else:
@@ -866,18 +918,22 @@ def evaluate_qualification_v38(
         )
         enrichment_status = 'decision_maker_linkedin_verified_paired_with_site_contact'
         confidence_warning = 'Note: Decision-maker LinkedIn slug matches person name; site email is a company/department inbox.'
+    elif dm_name and best_email_type == 'marketing_or_exec_role':
+        contact_quality = f'Tier A- (Decision-Maker Found: {dm_name} + Direct Marketing Role Inbox: {best_email})'
+        enrichment_status = 'decision_maker_found_plus_marketing_role_inbox'
+        confidence_warning = 'Note: Executive identified on site and paired with dedicated marketing@ department inbox.'
     elif dm_name and (best_email or primary_phone):
         contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, Paired with Generic/Role Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
         confidence_warning = 'Warning: Person name verified on site; email is company role/generic inbox (not direct personal email).'
     elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
-        contact_quality = f'Tier B+ (Direct / Named Staff Inbox: {best_email_type}, Full Name Unlisted)'
+        contact_quality = f'Tier B+ (Direct / Named Role Inbox: {best_email_type}, Full Name Unlisted)'
         enrichment_status = 'named_or_role_email_found_needs_title_match'
         confidence_warning = 'None'
     elif best_email_type == 'b2b_partnerships':
-        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Partnership Pitch, Needs Referral for Analytics/Tech)'
+        contact_quality = 'Tier B (B2B / Corporate Partnership Inbox — Good for B2B Pitch, Needs Referral for Analytics/Tech)'
         enrichment_status = 'b2b_role_inbox_only_needs_linkedin_dm'
-        confidence_warning = 'Note: partner@ inbox is for commercial partnerships; request referral to CMO/Head of Digital for technical services.'
+        confidence_warning = 'Note: B2B/Corporate inbox is for commercial partnerships; request referral to CMO/Head of Digital.'
     elif best_email_type == 'general_office_inbox':
         contact_quality = 'Tier C (Generic Office Inbox — Suitable for Gatekeeper Routing Only)'
         enrichment_status = 'generic_inbox_only_needs_linkedin_dm'
@@ -950,7 +1006,7 @@ def evaluate_qualification_v38(
         )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
-        'regional_branch_inbox', 'admissions_or_department_inbox'
+        'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox'
     ):
         next_action = (
             f"DO NOT send marketing pitch to {best_email} ({best_email_type}); "
@@ -1082,8 +1138,8 @@ async def fetch_html_safely(
     retries: int = 4
 ) -> tuple[int, str, str, str]:
     """
-    Робить до 4 спроб: якщо прямий запит отримує 403/429, генерує СВІЖИЙ сесійний IP
-    через Apify Proxy Configuration на кожній наступній спробі.
+    Автоматично обходить як явні помилки 403/429, так і тихі JS-заглушки WAF
+    (коли сайт віддає 200 OK, але без <title> чи корисного контенту, як на ukrposhta.ua).
     """
     last_error = ''
     impersonations = ['chrome', 'safari', 'chrome110', 'chrome']
@@ -1145,6 +1201,12 @@ async def fetch_html_safely(
                     html = raw_bytes.decode(encoding, errors='replace')
                 except LookupError:
                     html = raw_bytes.decode('utf-8', errors='replace')
+
+                # Перевірка на тиху JS-заглушку (Cloudflare / Imperva challenge з кодом 200)
+                if ('<title>' not in html.lower() or len(html) < 800) and attempt < retries - 1:
+                    await asyncio.sleep(1.0)
+                    continue
+
                 return status, html, final_url, ''
         except Exception as e:
             last_error = str(e)
@@ -1209,7 +1271,6 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # ЯКЩО САЙТ ТИМЧАСОВО ЗАБЛОКУВАВ ЗАПИТ (HTTP 403) — ВІДНОВЛЮЄМО ДАНІ З ПОСТІЙНОГО КЕШУ!
             if cache_store is not None:
                 try:
                     cached_record = await cache_store.get_value(kv_key)
@@ -1305,15 +1366,29 @@ async def process_domain(
 
         pages_with_urls = [(final_url, html, main_text)]
 
+        # Якщо на головній сторінці не було посилань на /contact (наприклад, меню рендериться через JS),
+        # додаємо стандартні шляхи /contacts та /about для перевірки
+        if scan_contacts and not contact_links:
+            base_root = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+            contact_links = [
+                f"{base_root}/contacts",
+                f"{base_root}/ua/contacts",
+                f"{base_root}/about"
+            ]
+
         if scan_contacts and contact_links:
             for sub_url in contact_links[:6]:
                 sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
                     client, sub_url, proxy_config=proxy_config, timeout=10.0, retries=2
                 )
                 if 200 <= sub_status < 400 and sub_html:
-                    _, _, sub_text, sub_e, sub_p, sub_s, _ = await asyncio.to_thread(
+                    sub_title, sub_desc, sub_text, sub_e, sub_p, sub_s, _ = await asyncio.to_thread(
                         parse_html_sync, sub_html, sub_final_url, default_region
                     )
+                    if not page_title and sub_title:
+                        page_title = sub_title
+                    if not meta_desc and sub_desc:
+                        meta_desc = sub_desc
                     pages_with_urls.append((sub_final_url, sub_html, sub_text))
                     for em, src in sub_e.items():
                         email_sources.setdefault(em, src)
@@ -1378,7 +1453,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v38(
+        ) = evaluate_qualification_v39(
             company_category,
             tech_info,
             best_email,
@@ -1445,7 +1520,6 @@ async def process_domain(
             'last_checked_at': checked_at
         }
 
-        # Зберігаємо успішний результат у постійний іменований кеш Apify для захисту від майбутніх 403
         if cache_store is not None and final_status == 'success':
             try:
                 await cache_store.set_value(kv_key, result_record)
@@ -1470,7 +1544,6 @@ async def main() -> None:
             Actor.log.warning('No valid domains provided in input!')
             return
 
-        # Відкриваємо постійне сховище кешу (зберігається між усіма запусками актора)
         cache_store = None
         try:
             cache_store = await Actor.open_key_value_store(name='b2b-domain-cache-v1')
