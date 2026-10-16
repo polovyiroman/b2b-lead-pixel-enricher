@@ -25,7 +25,6 @@ GTAG_CONFIG_GA4_REGEX = re.compile(
 )
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
 
-# П.6: Точний регулярний вираз Soft-404 із якорем, щоб не чіпати статті типу "404 способи..."
 SOFT_404_TITLE_REGEX = re.compile(
     r'^\s*(?:404|error\s*404|page\s*not\s*found|not\s*found|'
     r'сторінк[уа]\s+не\s+знайдено|сторінка\s+не\s+знайдена|помилка\s*404)'
@@ -33,10 +32,13 @@ SOFT_404_TITLE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# П.5: Виключаємо договори оферти, політики та умови з джерел пошуку Decision Maker
+# П.1: Строго юридичні сторінки без бізнес-контенту; оферти та послуги тепер дозволені!
 DM_SOURCE_BLACKLIST = re.compile(
-    r'/(?:oferta|offer|publichna|publichnaja|terms|privacy|policy|legal|'
-    r'dogovir|ugoda|conditions|rules|our-services|rekvizyty)\b',
+    r'/(?:privacy|policy|datenschutz|gdpr|cookie|dmca)\b',
+    re.IGNORECASE
+)
+DM_LEGAL_SOURCE_FLAG = re.compile(
+    r'/(?:oferta|offer|publichna|publichnaja|terms|dogovir|ugoda|conditions)\b',
     re.IGNORECASE
 )
 
@@ -69,50 +71,11 @@ ROLE_BEFORE_NAME_PATTERN = re.compile(
     rf'\b({ROLES_REGEX_PART})\b(?:\s+[a-zа-яіїєґA-ZА-ЯІЇЄҐ\’\'-]{{2,20}}){{0,3}}[\s,—–\-:|()•]{{1,20}}{NAME_REGEX_PART}\b',
     re.UNICODE
 )
-
-# П.1: Чорний список рольових токенів, які не можуть бути частиною імені людини (фікс "Officer Valeriia Lavska")
-ROLE_TOKEN_BLACKLIST = {
-    'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
-    'partner', 'chairman', 'executive', 'founder', 'cofounder', 'co-founder',
-    'owner', 'vice', 'deputy', 'general', 'commercial', 'marketing', 'digital',
-    'ceo', 'cmo', 'cto', 'coo', 'cfo', 'vp', 'svp', 'avp', 'admin', 'editor',
-    'директор', 'директорка', 'керівник', 'керівниця', 'начальник', 'президент',
-    'засновник', 'засновниця', 'співзасновник', 'співзасновниця', 'власник',
-    'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан'
-}
-
-# П.10: Словник нормалізації посад для єдиного стандарту в CRM
-ROLE_NORMALIZATION_MAP = {
-    'cmo': 'Chief Marketing Officer (CMO)',
-    'chief marketing officer': 'Chief Marketing Officer (CMO)',
-    'директор з маркетингу': 'Chief Marketing Officer (CMO)',
-    'маркетинг-директор': 'Chief Marketing Officer (CMO)',
-    'керівник відділу маркетингу': 'Head of Marketing',
-    'head of marketing': 'Head of Marketing',
-    'marketing director': 'Marketing Director',
-    'head of e-commerce': 'Head of E-commerce',
-    'e-commerce director': 'E-commerce Director',
-    'head of growth': 'Head of Growth',
-    'head of digital': 'Head of Digital',
-    'ceo': 'Chief Executive Officer (CEO)',
-    'генеральний директор': 'Chief Executive Officer (CEO)',
-    'директор': 'Managing Director / CEO',
-    'директорка': 'Managing Director / CEO',
-    'general manager': 'General Manager',
-    'founder': 'Founder',
-    'засновник': 'Founder',
-    'засновниця': 'Founder',
-    'co-founder': 'Co-Founder',
-    'співзасновник': 'Co-Founder',
-    'співзасновниця': 'Co-Founder',
-    'співзасновники': 'Co-Founder',
-    'owner': 'Owner',
-    'власник': 'Owner',
-    'власниця': 'Owner',
-    'commercial director': 'Commercial Director',
-    'комерційний директор': 'Commercial Director',
-    'managing partner': 'Managing Partner'
-}
+FOP_OWNER_PATTERN = re.compile(
+    r'(?:ФОП|Фізична особа[\s-]підприємець)\s+'
+    r'([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,25}\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,20})',
+    re.UNICODE
+)
 
 STOP_NAME_WORDS = {
     'Інтернет', 'Магазин', 'Онлайн', 'Бренд', 'Компанія', 'Агентство', 'Агенція',
@@ -296,7 +259,6 @@ def sanitize_kv_key(domain: str) -> str:
 
 
 def clean_url_port(url: str | None) -> str | None:
-    """Прибирає технічні порти :443 та :80 з URL (виправляє https://brabrabra.ua:443/...)."""
     if not url:
         return None
     return re.sub(r':(?:443|80)(?=/|$)', '', url)
@@ -338,7 +300,6 @@ def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
 
 
 def is_soft_404_page(html: str, page_title: str) -> bool:
-    """П.6: Точний детект Soft-404 за заголовком з якорем."""
     t_clean = page_title.strip()
     if t_clean and SOFT_404_TITLE_REGEX.search(t_clean):
         return True
@@ -360,7 +321,6 @@ def decode_cf_email(encoded_str: str) -> str:
 
 
 def classify_email_type(email: str | None) -> str | None:
-    """П.11: Використовує нормалізацію re.sub(r'[._+-]', '', local) для надійного детекту corp.com / corp_com."""
     if not email or '@' not in email:
         return None
     local, domain = email.split('@', 1)
@@ -476,37 +436,12 @@ def verify_person_linkedin_match(full_name: str | None, linkedin_url: str | None
     return has_last and has_first
 
 
-async def query_doh_json(client: AsyncSession, domain: str, record_type: str) -> tuple[dict | None, str]:
-    endpoints = [
-        f'https://dns.google/resolve?name={domain}&type={record_type}',
-        f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}'
-    ]
-    last_status = 'dns_error'
-    for ep in endpoints:
-        try:
-            resp = await client.get(
-                ep,
-                headers={'accept': 'application/dns-json'},
-                timeout=4.5
-            )
-            if resp.status_code == 200:
-                return resp.json(), 'ok'
-        except Exception as e:
-            if 'timeout' in str(e).lower():
-                last_status = 'dns_timeout'
-            continue
-    return None, last_status
-
-
 async def verify_email_deliverability_deep(
     client: AsyncSession,
     email: str | None,
     source_url: str | None
 ) -> str | None:
-    """
-    П.2: Реальний DoH MX-lookup для ВСІХ доменів, включно з публічними webmail (gmail.com, ukr.net),
-    без неперевіреного твердження 'MX_active'.
-    """
+    """П.2: Реєструє реальний DoH MX-lookup для всіх доменів без мізлідінгу MX_active."""
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -520,7 +455,7 @@ async def verify_email_deliverability_deep(
         mx_data, err_code = await query_doh_json(client, domain, 'MX')
         if mx_data is not None:
             answers = mx_data.get('Answer', [])
-            mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type') == 15]
+            mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type'] == 15]
             if mx_hosts:
                 joined_mx = ' '.join(mx_hosts)
                 if 'google.com' in joined_mx or 'googlemail.com' in joined_mx:
@@ -738,6 +673,18 @@ def score_phone_context(context_text: str) -> int:
     return score
 
 
+def is_junk_phone(e164: str) -> bool:
+    """П.5: Відсікає номери-заглушки на кшталт +380441234567."""
+    digits = re.sub(r'\D', '', e164)
+    if not digits:
+        return True
+    if re.search(r'(?:1234567|123456|1111111|0000000|9999999)$', digits):
+        return True
+    if len(set(digits)) <= 2 and len(digits) >= 6:
+        return True
+    return False
+
+
 def extract_valid_phones(
     text: str,
     raw_tel_candidates: list[tuple[str, str]],
@@ -754,6 +701,8 @@ def extract_valid_phones(
                 formatted = phonenumbers.format_number(
                     parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL
                 )
+                if is_junk_phone(phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)):
+                    continue
                 ctx_score = 10 + score_phone_context(context)
                 if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
                     phone_scores[formatted] = ctx_score
@@ -768,6 +717,9 @@ def extract_valid_phones(
             formatted = phonenumbers.format_number(
                 match.number, phonenumbers.PhoneNumberFormat.INTERNATIONAL
             )
+            e164_chk = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
+            if is_junk_phone(e164_chk):
+                continue
             start_idx = max(0, match.start - 90)
             end_idx = min(len(text), match.end + 90)
             context = text[start_idx:end_idx]
@@ -792,10 +744,7 @@ def detect_tech_with_evidence(
     gtm_ids: list[str],
     page_url: str
 ) -> dict:
-    """
-    П.7: Консистентний вибір GA4 ID (спочатку точний gtag('config', 'G-...'),
-    потім перший за порядком появи в HTML головної сторінки, і лише потім GTM).
-    """
+    """П.3: Стабільний вибір GA4 ID через GTAG_CONFIG_GA4_REGEX у GTM JS та HTML."""
     clean_gtm = gtm_js.replace('\\/', '/')
     html_lower = html.lower().replace('\\/', '/')
     gtm_lower = clean_gtm.lower()
@@ -812,10 +761,10 @@ def detect_tech_with_evidence(
         ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js)'
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
 
-    # Пріоритет 1: явний gtag('config', 'G-...') в HTML; Пріоритет 2: перша поява G-... в HTML; Пріоритет 3: GTM
-    gtag_cfg_html = [m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html)]
-    ga4_in_html = gtag_cfg_html or [m.upper() for m in GA4_ID_REGEX.findall(html)]
-    ga4_in_gtm = [m.upper() for m in GA4_ID_REGEX.findall(clean_gtm)]
+    ga4_cfg_html = [m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html)]
+    ga4_cfg_gtm = [m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(clean_gtm)]
+    ga4_in_html = ga4_cfg_html or [m.upper() for m in GA4_ID_REGEX.findall(html)]
+    ga4_in_gtm = ga4_cfg_gtm or [m.upper() for m in GA4_ID_REGEX.findall(clean_gtm)]
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
@@ -871,6 +820,8 @@ def detect_tech_with_evidence(
     else:
         ev_summary = ' | '.join(evidence_items)
 
+    all_ga4_list = sorted(list(set(ga4_in_html + ga4_in_gtm)))
+
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
         'has_tiktok_pixel': 'TikTok Pixel' in detected,
@@ -881,6 +832,7 @@ def detect_tech_with_evidence(
         'has_klaviyo': 'Klaviyo' in detected,
         'has_ga4': has_ga4,
         'has_gtm': has_gtm,
+        'all_ga4_ids': '; '.join(all_ga4_list) if all_ga4_list else None,
         'detected_technologies_list': detected,
         'technology_evidence': ev_summary
     }
@@ -933,28 +885,8 @@ def classify_company_category(
     return 'General Business / Corporate'
 
 
-def strip_role_tokens_from_name(candidate: str) -> str:
-    """
-    П.1: Якщо в захоплений 3-слівний кандидат імені потрапило слово з посади
-    (напр. 'Officer Valeriia Lavska' від 'Chief Marketing Officer Valeriia Lavska'),
-    відрізає рольові токени з країв, залишаючи чисте 'Valeriia Lavska'!
-    """
-    words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
-    while words and (
-        words[0].lower() in ROLE_TOKEN_BLACKLIST
-        or re.fullmatch(ROLES_REGEX_PART, words[0], re.IGNORECASE)
-    ):
-        words.pop(0)
-    while words and (
-        words[-1].lower() in ROLE_TOKEN_BLACKLIST
-        or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
-    ):
-        words.pop(-1)
-    return ' '.join(words)
-
-
 def is_valid_person_name(candidate: str) -> bool:
-    """П.1: Жодне слово в імені не може бути посадою з ROLE_TOKEN_BLACKLIST або STOP_NAME_WORDS."""
+    """П.1: Перевіряє кандидатів на ім'я за допомогою ROLE_TOKEN_BLACKLIST та STOP_NAME_WORDS."""
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     if len(words) not in (2, 3):
         return False
@@ -964,13 +896,12 @@ def is_valid_person_name(candidate: str) -> bool:
         return False
     if any(w.lower() in ROLE_TOKEN_BLACKLIST for w in words):
         return False
-    if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
+    if any(re.fullmatch(ROLES_REGEX_PART, w, re.UNICODE) for w in words):
         return False
     return True
 
 
 def normalize_executive_role(raw_role: str | None) -> str | None:
-    """П.10: Нормалізує назву посади (напр. CMO -> Chief Marketing Officer (CMO))."""
     if not raw_role:
         return None
     clean = raw_role.strip(' .,;:|-–—')
@@ -981,17 +912,12 @@ def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """
-    П.1, П.5, П.10:
-    - Пропускає юридичні сторінки оферт/політик (DM_SOURCE_BLACKLIST).
-    - Очищує ім'я від випадкових токенів посади (strip_role_tokens_from_name).
-    - Нормалізує роль через normalize_executive_role.
+    П.1: Очищує ім'я від рольових префіксів через strip_role_tokens_from_name,
+    а також використовує DM_LEGAL_SOURCE_FLAG для маркування юридичних джерел.
     """
     candidate_li_urls = []
 
     for page_url, html, _ in pages_with_urls:
-        if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
-            continue
-
         soup = BeautifulSoup(html, 'lxml')
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href'].strip()
@@ -1019,7 +945,10 @@ def extract_decision_maker_deep(
                             role = normalize_executive_role(str(val.get('jobTitle') or default_role))
                             if is_valid_person_name(cand):
                                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
-                                return cand, role, matched_li, clean_url_port(page_url)
+                                src_label = f'{role} (Source: {page_url})'
+                                if DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path):
+                                    src_label += ' [Legal Document/Offer]'
+                                return cand, src_label, matched_li, clean_url_port(page_url)
                         elif isinstance(val, list):
                             for sub in val:
                                 if isinstance(sub, dict) and sub.get('name'):
@@ -1027,29 +956,59 @@ def extract_decision_maker_deep(
                                     role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
                                     if is_valid_person_name(cand):
                                         matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
-                                        return cand, role, matched_li, clean_url_port(page_url)
+                                        src_label = f'{role} (Source: {page_url})'
+                                        if DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path):
+                                            src_label += ' [Legal Document/Offer]'
+                                        return cand, src_label, matched_li, clean_url_port(page_url)
             except Exception:
                 continue
 
     for page_url, _, page_text in pages_with_urls:
-        if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
-            continue
-
         for m in NAME_BEFORE_ROLE_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             cand_role = normalize_executive_role(m.group(2))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, cand_role, matched_li, clean_url_port(page_url)
+                src_label = f'{cand_role} (Source: {page_url})'
+                if DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path):
+                    src_label += ' [Legal Document/Offer]'
+                return cand_name, src_label, matched_li, clean_url_port(page_url)
 
         for m in ROLE_BEFORE_NAME_PATTERN.finditer(page_text):
             cand_role = normalize_executive_role(m.group(1))
             cand_name = strip_role_tokens_from_name(m.group(2))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, cand_role, matched_li, clean_url_port(page_url)
+                src_label = f'{cand_role} (Source: {page_url})'
+                if DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path):
+                    src_label += ' [Legal Document/Offer]'
+                return cand_name, src_label, matched_li, clean_url_port(page_url)
+
+        for m in FOP_OWNER_PATTERN.finditer(page_text):
+            cand_name = strip_role_tokens_from_name(m.group(1))
+            if is_valid_person_name(cand_name):
+                matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
+                src_label = f'Registered Business Owner / ФОП (Source: {page_url})'
+                if DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path):
+                    src_label += ' [Legal Document/Offer]'
+                return cand_name, src_label, matched_li, clean_url_port(page_url)
 
     return None, None, None, None
+
+
+def strip_role_tokens_from_name(candidate: str) -> str:
+    words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
+    while words and (
+        words[0].lower() in ROLE_TOKEN_BLACKLIST
+        or re.fullmatch(ROLES_REGEX_PART, words[0], re.UNICODE)
+    ):
+        words.pop(0)
+    while words and (
+        words[-1].lower() in ROLE_TOKEN_BLACKLIST
+        or re.fullmatch(ROLES_REGEX_PART, words[-1], re.UNICODE)
+    ):
+        words.pop(-1)
+    return ' '.join(words)
 
 
 def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> str:
@@ -1061,7 +1020,7 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v41(
+def evaluate_qualification_v42(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1355,7 +1314,6 @@ def parse_html_sync(
         if any(path_lower.endswith(ext) for ext in JUNK_EXTENSIONS):
             continue
 
-        # Не додаємо оферти/договори в список обходу контактів
         if DM_SOURCE_BLACKLIST.search(path_lower):
             continue
 
@@ -1388,10 +1346,6 @@ def parse_html_sync(
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
-    """
-    П.8: Завантажує та парсить robots.txt для домену (User-agent: *),
-    повертаючи список Disallow-префіксів та Crawl-delay (0.25s - 2.0s).
-    """
     disallowed: list[str] = []
     crawl_delay = 0.25
     try:
@@ -1599,7 +1553,6 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # П.3 & П.4: Читаємо кеш тільки якщо його _schema == CACHE_SCHEMA_VERSION
             if cache_store is not None:
                 for candidate_key in (canonical_kv_key, input_kv_key):
                     try:
@@ -1713,7 +1666,6 @@ async def process_domain(
         pages_with_urls = [(final_url, html, main_text)]
         base_root = f"{scheme}://{re.sub(r':\d+$', '', parsed_final.netloc) or canonical_domain}"
 
-        # П.8: Завантажуємо правила robots.txt перед обходом підсторінок
         disallowed_paths, crawl_delay = await load_robots_rules(client, base_root)
 
         if scan_contacts and not contact_links:
@@ -1736,10 +1688,7 @@ async def process_domain(
                     if is_soft_404_page(sub_html, sub_title):
                         continue
 
-                    if not page_title and sub_title:
-                        page_title = sub_title
-                    if not meta_desc and sub_desc:
-                        meta_desc = sub_desc
+                    # П.7: Забороняємо підсторінкам перезаписувати заголовок головної сторінки
                     pages_with_urls.append((sub_final_url, sub_html, sub_text))
                     for em, src in sub_e.items():
                         email_sources.setdefault(em, src)
@@ -1751,7 +1700,7 @@ async def process_domain(
 
         ranked_emails_with_src = rank_and_clean_emails(email_sources, canonical_domain)
 
-        # П.12: Обмежуємо all_phones до 3 топових B2B-номерів без телефонного шуму
+        # П.12: Обмежуємо all_phones до 3 найрелевантніших B2B-номерів
         sorted_phones_with_src = sorted(
             phone_map.items(),
             key=lambda item: -item[1][0]
@@ -1887,7 +1836,6 @@ async def process_domain(
             'last_checked_at': checked_at
         }
 
-        # П.3 & П.4: Симетричний запис у кеш з версією схеми (_schema: 2) під canonical та input ключами
         if cache_store is not None and final_status in ('success', 'no_contacts_found'):
             cache_payload = {'_schema': CACHE_SCHEMA_VERSION, **result_record}
             try:
