@@ -12,8 +12,10 @@ MAX_HTML_BYTES = 1_500_000
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
-GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{4,10}\b', re.IGNORECASE)
-GA4_ID_REGEX = re.compile(r'\bG-[A-Z0-9]{6,12}\b')
+
+# ВАЖЛИВО: Справжній GTM ID завжди містить хоча б одну цифру (відсікає CSS-класи GTM-PAGE, GTM-SUITE)
+GTM_ID_REGEX = re.compile(r'\bGTM-(?=[A-Z0-9]*\d)[A-Z0-9]{4,10}\b', re.IGNORECASE)
+GA4_ID_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12}\b')
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
 
 ROLES_REGEX_PART = (
@@ -41,7 +43,7 @@ STOP_NAME_WORDS = {
     'Кабінет', 'Каталог', 'Колекція', 'Україна', 'Київ', 'Львів', 'Privacy',
     'Policy', 'Terms', 'Conditions', 'Customer', 'Service', 'Support', 'Contact',
     'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store',
-    'LinkedIn', 'Profile', 'View', 'Український', 'Перший', 'Жіночий'
+    'LinkedIn', 'Profile', 'View', 'Український', 'Перший', 'Жіночий', 'Official'
 }
 
 UA_TO_LATIN = {
@@ -139,21 +141,23 @@ SECONDARY_CONTACT_KEYWORDS = (
     'management', 'founders', 'our-story', 'pro-nas', 'o-nas', 'wholesale', 'b2b'
 )
 
+# Розширені сигнатури для 100% детекту як у прямому HTML, так і в мініфікованому/екранованому GTM JS
 AD_AND_ANALYTICS_SIGNATURES = {
     'Meta Pixel': [
-        'connect.facebook.net', 'fbq(', 'facebook.com/tr?',
-        '"facebook pixel"', 'facebook_pixel', 'fb_pixel_id'
+        'connect.facebook.net', 'fbevents.js', 'fbq(', 'facebook.com/tr',
+        '"facebook pixel"', 'facebook_pixel', 'fb_pixel_id', 'meta pixel'
     ],
     'TikTok Pixel': [
-        'analytics.tiktok.com', 'ttq.load', 'ttq.page',
-        '"tiktok pixel"', 'tiktok_pixel'
+        'analytics.tiktok.com', 'ttq.load', 'ttq.page', 'ttq.track',
+        '"tiktok pixel"', 'tiktok_pixel', 'tiktokanalytics'
     ],
     'LinkedIn Insight Tag': [
-        'snap.licdn.com/li.lms-analytics', '_linkedin_partner_id', 'linkedin_insight'
+        'snap.licdn.com', 'li.lms-analytics', '_linkedin_partner_id',
+        'linkedin_insight', 'linkedin insight', 'b.licdn.com'
     ],
     'Pinterest Tag': ['s.pinimg.com/ct/core.js', 'pintrk('],
-    'Microsoft Clarity': ['clarity.ms/tag/'],
-    'Hotjar': ['static.hotjar.com', 'hjsettings'],
+    'Microsoft Clarity': ['clarity.ms/tag/', 'clarity.ms'],
+    'Hotjar': ['static.hotjar.com', 'hjsettings', 'hotjar.com'],
     'HubSpot': ['js.hs-scripts.com', 'hs-analytics', 'hbspt.forms'],
     'Intercom': ['widget.intercom.io', 'intercomsettings'],
     'Klaviyo': ['static.klaviyo.com', 'klaviyo.push']
@@ -294,12 +298,6 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None
 ) -> str | None:
-    """
-    Перевіряє:
-    1) MX-сервери домену (Google Workspace, Microsoft 365 тощо)
-    2) Наявність анти-спам політики SPF у TXT-записах домену (ознака живого поштового домену)
-    3) Публікацію самої адреси безпосередньо у DOM офіційного сайту компанії
-    """
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -534,9 +532,11 @@ def detect_tech_with_evidence(
     gtm_ids: list[str],
     page_url: str
 ) -> dict:
-    combined = f'{html}\n{gtm_js}'
-    html_lower = html.lower()
-    gtm_lower = gtm_js.lower()
+    # Нормалізуємо екрановані слеші (\/ -> /) у GTM-контейнері, щоб гарантовано бачити всі URL пікселів!
+    clean_gtm = gtm_js.replace('\\/', '/')
+    combined = f'{html}\n{clean_gtm}'
+    html_lower = html.lower().replace('\\/', '/')
+    gtm_lower = clean_gtm.lower()
 
     detected = []
     evidence_items = []
@@ -657,15 +657,30 @@ def is_valid_person_name(candidate: str) -> bool:
     words = candidate.strip().split()
     if len(words) != 2:
         return False
+    if not all(w[0].isupper() and len(w) >= 2 for w in words):
+        return False
     return not any(w in STOP_NAME_WORDS for w in words)
 
 
 def extract_decision_maker_deep(
     html_list: list[str],
     text_list: list[str]
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
+    """Шукає особисті посилання linkedin.com/in/ на сайті, мікророзмітку Schema.org та текстові згадки."""
+    personal_li_url = None
+
     for html in html_list:
         soup = BeautifulSoup(html, 'lxml')
+        # Перевіряємо, чи є на сторінках прямий лінк на особистий LinkedIn (linkedin.com/in/...)
+        if not personal_li_url:
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href'].strip()
+                if 'linkedin.com/in/' in href.lower():
+                    clean_li = clean_and_validate_social_url('linkedin', href)
+                    if clean_li and '/in/' in clean_li:
+                        personal_li_url = clean_li
+                        break
+
         for script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
             raw_json = script.string
             if not raw_json:
@@ -682,14 +697,14 @@ def extract_decision_maker_deep(
                             cand = str(val['name']).strip()
                             role = str(val.get('jobTitle') or default_role).strip()
                             if is_valid_person_name(cand):
-                                return cand, role
+                                return cand, role, personal_li_url
                         elif isinstance(val, list):
                             for sub in val:
                                 if isinstance(sub, dict) and sub.get('name'):
                                     cand = str(sub['name']).strip()
                                     role = str(sub.get('jobTitle') or default_role).strip()
                                     if is_valid_person_name(cand):
-                                        return cand, role
+                                        return cand, role, personal_li_url
             except Exception:
                 continue
 
@@ -698,63 +713,103 @@ def extract_decision_maker_deep(
     for m in NAME_BEFORE_ROLE_PATTERN.finditer(combined_text):
         cand_name, cand_role = m.group(1).strip(), m.group(2).strip()
         if is_valid_person_name(cand_name):
-            return cand_name, cand_role
+            return cand_name, cand_role, personal_li_url
 
     for m in ROLE_BEFORE_NAME_PATTERN.finditer(combined_text):
         cand_role, cand_name = m.group(1).strip(), m.group(2).strip()
         if is_valid_person_name(cand_name):
-            return cand_name, cand_role
+            return cand_name, cand_role, personal_li_url
 
-    return None, None
+    return None, None, personal_li_url
+
+
+def parse_linkedin_serp_title(title_text: str, raw_url: str, brand: str) -> tuple[str | None, str | None, str | None]:
+    """Витягує чисте Ім'я, Посаду та URL із заголовка LinkedIn у пошуковій видачі."""
+    if 'linkedin.com/in/' not in raw_url.lower():
+        return None, None, None
+
+    # Розкодовуємо Yahoo redirect URL (RU=https%3A%2F%2F...linkedin.com/in/...)
+    actual_url = raw_url
+    if 'RU=' in raw_url:
+        actual_url = unquote(raw_url.split('RU=', 1)[1].split('/RK=', 1)[0])
+    elif 'uddg=' in raw_url:
+        actual_url = unquote(raw_url.split('uddg=', 1)[1].split('&', 1)[0])
+
+    if 'linkedin.com/in/' not in actual_url.lower():
+        return None, None, None
+
+    clean_title = re.sub(r'\s*[|\-–—]\s*LinkedIn.*$', '', title_text, flags=re.I).strip()
+    parts = [p.strip() for p in re.split(r'\s+[-–—|]\s+', clean_title) if p.strip()]
+    if len(parts) >= 2:
+        cand_name = parts[0]
+        cand_role = parts[1][:75]
+        if is_valid_person_name(cand_name):
+            clean_li_url = actual_url.split('?')[0].rstrip('/')
+            return cand_name, f'{cand_role} (LinkedIn Verified)', clean_li_url
+    return None, None, None
 
 
 async def discover_decision_maker_via_serp(
     client: AsyncSession,
-    canonical_domain: str
+    canonical_domain: str,
+    existing_name: str | None = None
 ) -> tuple[str | None, str | None, str | None]:
     """
-    Автономний пошук особи, що приймає рішення (CMO / Head of Marketing / Founder / CEO),
-    через публічну пошукову видачу за індексованими профілями LinkedIn.
-    Повертає (name, role, linkedin_profile_url).
+    Каскадний пошук Decision-Maker (Yahoo Search -> Brave Search -> DuckDuckGo Lite),
+    який стабільно працює з датацентрових IP Apify (AWS).
+    Якщо ім'я вже відоме з сайту (напр. Аліна Качоровська), шукає її точний профіль LinkedIn!
     """
     brand = canonical_domain.split('.')[0]
     if len(brand) < 3:
         return None, None, None
 
-    query = (
-        f'site:linkedin.com/in/ "{brand}" '
-        f'(CMO OR "Head of Marketing" OR "Marketing Director" OR "Head of E-commerce" OR Founder OR CEO)'
-    )
-    search_url = f'https://html.duckduckgo.com/html/?q={quote_plus(query)}'
+    if existing_name:
+        query = f'site:linkedin.com/in/ "{existing_name}" "{brand}"'
+    else:
+        query = (
+            f'site:linkedin.com/in/ "{brand}" '
+            f'(CMO OR "Head of Marketing" OR "Marketing Director" OR "Head of E-commerce" OR Founder OR CEO)'
+        )
 
+    # 1. Yahoo Search HTML (не блокує датацентрові IP AWS на відміну від DuckDuckGo)
+    yahoo_url = f'https://search.yahoo.com/search?p={quote_plus(query)}&n=5'
     try:
         resp = await client.get(
-            search_url,
-            headers={'Referer': 'https://duckduckgo.com/'},
+            yahoo_url,
+            headers={'Accept-Language': 'en-US,en;q=0.9,uk;q=0.8'},
+            impersonate='chrome',
             timeout=7.0
         )
         if resp.status_code == 200 and resp.text:
             soup = BeautifulSoup(resp.text, 'lxml')
-            for a_tag in soup.select('a.result__a'):
-                title_text = a_tag.get_text(' ', strip=True)
-                raw_href = a_tag.get('href', '')
-                if 'uddg=' in raw_href:
-                    actual_url = unquote(raw_href.split('uddg=', 1)[1].split('&', 1)[0])
-                else:
-                    actual_url = raw_href
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                if 'linkedin.com/in/' in unquote(href).lower():
+                    title_text = a_tag.get_text(' ', strip=True)
+                    name, role, li_url = parse_linkedin_serp_title(title_text, href, brand)
+                    if li_url and (name or existing_name):
+                        return (existing_name or name), role, li_url
+    except Exception:
+        pass
 
-                if 'linkedin.com/in/' not in actual_url.lower():
-                    continue
-
-                # Типовий заголовок LinkedIn: "Ім'я Прізвище - Посада - Компанія | LinkedIn"
-                clean_title = re.sub(r'\s*\|\s*LinkedIn.*$', '', title_text, flags=re.I)
-                parts = [p.strip() for p in re.split(r'\s+[-–—]\s+', clean_title) if p.strip()]
-                if len(parts) >= 2:
-                    cand_name = parts[0]
-                    cand_role = parts[1][:70]
-                    if is_valid_person_name(cand_name):
-                        clean_li_url = actual_url.split('?')[0].rstrip('/')
-                        return cand_name, f'{cand_role} (via LinkedIn Index)', clean_li_url
+    # 2. Фолбек на Brave Search HTML
+    brave_url = f'https://search.brave.com/search?q={quote_plus(query)}'
+    try:
+        resp = await client.get(
+            brave_url,
+            headers={'Accept-Language': 'en-US,en;q=0.9'},
+            impersonate='chrome',
+            timeout=7.0
+        )
+        if resp.status_code == 200 and resp.text:
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                if 'linkedin.com/in/' in href.lower():
+                    title_text = a_tag.get_text(' ', strip=True)
+                    name, role, li_url = parse_linkedin_serp_title(title_text, href, brand)
+                    if li_url and (name or existing_name):
+                        return (existing_name or name), role, li_url
     except Exception:
         pass
 
@@ -770,7 +825,7 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v35(
+def evaluate_qualification_v36(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -815,26 +870,26 @@ def evaluate_qualification_v35(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # 2. Technical Signal Strength
+    # 2. Technical Signal Strength (Чітке розділення "виявлено" та "не виявлено у статичному коді")
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
-            "(Confirms active tracking infrastructure; does not prove current ad spend or broken attribution)"
+            "(Verified in HTML/GTM; confirms tracking infrastructure, not current ad spend)"
         )
     elif len(ad_tags) == 1:
         tech_signal = (
             f"Moderate Stack Maturity: Single ad pixel ({ad_tags[0]}) detected "
-            "(Potential single-channel focus or Consent Mode gating secondary tags)"
+            "(Secondary tags not found in static HTML/GTM or gated by Cookie Consent)"
         )
     elif analytics_tags:
         tech_signal = (
             f"Basic Analytics Only ({', '.join(analytics_tags)}) — "
-            "no paid ad pixels visible in static HTML"
+            "ad pixels not found in static HTML/GTM (not proof of absence if server-side/consent-gated)"
         )
     else:
         tech_signal = (
-            'Low / Unverified Tech Signal: No tracking tags visible in static DOM '
-            '(May lack tracking or block scripts behind Cookie Consent)'
+            'Low / Unverified Tech Signal: No tracking tags found in static HTML '
+            '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
     # 3. Перевірка збігу Імені та Пошти
@@ -855,9 +910,12 @@ def evaluate_qualification_v35(
             f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.'
         )
     elif dm_name and dm_linkedin_url:
-        contact_quality = f'Tier A- (Decision-Maker {dm_name} + Direct LinkedIn Profile Found; Site Email is {best_email_type or "None"})'
-        enrichment_status = 'decision_maker_linkedin_found_paired_with_site_contact'
-        confidence_warning = 'Note: Decision-maker identified with LinkedIn URL; site email is a general/department inbox.'
+        contact_quality = (
+            f'Tier A- (Decision-Maker {dm_name} + Personal LinkedIn URL Verified; '
+            f'Site Email is {best_email_type or "None"})'
+        )
+        enrichment_status = 'decision_maker_linkedin_verified_paired_with_site_contact'
+        confidence_warning = 'Note: Decision-maker identified with direct LinkedIn profile; site email is a company/department inbox.'
     elif dm_name and (best_email or primary_phone):
         contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, Paired with Generic/Role Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
@@ -891,7 +949,7 @@ def evaluate_qualification_v35(
         enrichment_status = 'no_public_contacts_found'
         confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. Суворий Sales Readiness Verdict (враховує відповідність контакту саме під продаж маркетингу/аналітики)
+    # 4. Sales Readiness Verdict
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif company_category == 'B2B Agency / Marketing Media':
@@ -899,7 +957,7 @@ def evaluate_qualification_v35(
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
     elif dm_name and dm_linkedin_url:
-        readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Found + Tech Stack Verified)'
+        readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
     elif best_email_type == 'marketing_or_exec_role':
         readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif best_email_type == 'b2b_partnerships':
@@ -937,7 +995,7 @@ def evaluate_qualification_v35(
         next_action = 'Exclude from commercial B2B cold outreach'
     elif dm_name and dm_linkedin_url:
         next_action = (
-            f"Message {dm_name} ({dm_role}) directly on LinkedIn ({dm_linkedin_url}) "
+            f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url} "
             f"referencing detected stack ({detected_signals_str})"
         )
     elif best_email_type in (
@@ -1073,12 +1131,6 @@ async def fetch_html_safely(
     timeout: float = 15.0,
     retries: int = 3
 ) -> tuple[int, str, str, str]:
-    """
-    Забезпечує високу стабільність між запусками:
-    - На 1-й спробі використовує поточний TLS-відбиток (Chrome).
-    - Якщо сайт повертає 403/429 (як UCU), на 2-й спробі змінює TLS-імперсонацію на Safari + Google Referer.
-    - На 3-й спробі автоматично задіює резервний проксі Apify (якщо доступний).
-    """
     last_error = ''
     impersonations = ['chrome', 'safari', 'chrome110']
 
@@ -1146,18 +1198,23 @@ async def fetch_gtm_scripts(
     html: str,
     fallback_proxy_url: str | None = None
 ) -> tuple[list[str], str]:
+    """
+    Витягує тільки справжні GTM ID (які містять цифри) і завантажує ПОВНИЙ код контейнера
+    без обмеження в 1.5 МБ, щоб жоден піксель у кінці файлу GTM не загубився!
+    """
     gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html)})
     if not gtm_ids:
         return [], ''
 
     gtm_contents = []
-    for gtm_id in gtm_ids[:2]:
+    for gtm_id in gtm_ids[:3]:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gtm_id}'
-        status, js_text, _, _ = await fetch_html_safely(
-            client, gtm_url, fallback_proxy_url=fallback_proxy_url, timeout=8.0, retries=1
-        )
-        if status == 200 and js_text:
-            gtm_contents.append(js_text)
+        try:
+            resp = await client.get(gtm_url, impersonate='chrome', timeout=12.0)
+            if resp.status_code == 200 and resp.text:
+                gtm_contents.append(resp.text)
+        except Exception:
+            continue
 
     return gtm_ids, '\n'.join(gtm_contents)
 
@@ -1324,19 +1381,22 @@ async def process_domain(
             domain_key, page_title, meta_desc, detected_tech_list
         )
 
-        # 1. Спочатку шукаємо Decision-Maker на самому сайті
-        dm_name, dm_role = await asyncio.to_thread(
+        # 1. Шукаємо Decision-Maker та особистий LinkedIn на самому сайті
+        dm_name, dm_role, dm_linkedin_url = await asyncio.to_thread(
             extract_decision_maker_deep, html_pages, combined_text_parts
         )
-        dm_linkedin_url = None
 
-        # 2. Якщо на сайті немає, автономно шукаємо через публічний індекс LinkedIn
-        if not dm_name and company_category != 'Non-Profit / Education / Institution':
+        # 2. Якщо на сайті немає імені або особистого LinkedIn URL — шукаємо через Yahoo/Brave SERP
+        if (not dm_name or not dm_linkedin_url) and company_category != 'Non-Profit / Education / Institution':
             serp_name, serp_role, serp_li_url = await discover_decision_maker_via_serp(
-                client, canonical_domain
+                client, canonical_domain, existing_name=dm_name
             )
-            if serp_name:
-                dm_name, dm_role, dm_linkedin_url = serp_name, serp_role, serp_li_url
+            if not dm_name and serp_name:
+                dm_name = serp_name
+            if not dm_role and serp_role:
+                dm_role = serp_role
+            if not dm_linkedin_url and serp_li_url:
+                dm_linkedin_url = serp_li_url
 
         dm_search_query = build_linkedin_xray_query(canonical_domain, page_title)
 
@@ -1351,7 +1411,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v35(
+        ) = evaluate_qualification_v36(
             company_category,
             tech_info,
             best_email,
@@ -1444,7 +1504,6 @@ async def main() -> None:
                 primary_proxy_url = await proxy_config.new_url()
                 fallback_proxy_url = primary_proxy_url
         else:
-            # Навіть якщо проксі вимкнено для економії, створюємо резервний URL для сайтів із HTTP 403
             try:
                 fallback_cfg = await Actor.create_proxy_configuration()
                 if fallback_cfg:
@@ -1487,8 +1546,8 @@ async def main() -> None:
 
                 Actor.log.info(
                     f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                    f"DM: {result['decision_maker_name'] or '-'} | "
-                    f"Email: {result['best_email'] or '-'}"
+                    f"DM: {result['decision_maker_name'] or '-'} ({result['decision_maker_linkedin_url'] or 'no-li'}) | "
+                    f"Signals: {result['detected_signals'] or '-'}"
                 )
 
                 if len(batch) >= batch_size:
