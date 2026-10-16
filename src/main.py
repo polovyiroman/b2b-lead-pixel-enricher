@@ -26,12 +26,10 @@ ROLES_REGEX_PART = (
 )
 NAME_REGEX_PART = r'([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,20}\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,25})'
 
-# 1) "Ім'я Прізвище — Посада"
 NAME_BEFORE_ROLE_PATTERN = re.compile(
     rf'\b{NAME_REGEX_PART}[\s,—–\-:|()•]{{1,20}}({ROLES_REGEX_PART})\b',
     re.UNICODE
 )
-# 2) "Посада — Ім'я Прізвище" (напр. "Засновниця бренду Аліна Качоровська")
 ROLE_BEFORE_NAME_PATTERN = re.compile(
     rf'\b({ROLES_REGEX_PART})(?:\s+бренду|\s+компанії|\s+агенції|\s+проєкту)?[\s,—–\-:|()•]{{1,20}}{NAME_REGEX_PART}\b',
     re.UNICODE
@@ -40,7 +38,7 @@ ROLE_BEFORE_NAME_PATTERN = re.compile(
 STOP_NAME_WORDS = {
     'Інтернет', 'Магазин', 'Онлайн', 'Бренд', 'Компанія', 'Агентство', 'Агенція',
     'Політика', 'Конфіденційності', 'Умови', 'Доставка', 'Оплата', 'Контакти',
-    'Кабінет', 'Каталог', ' Колекція', 'Україна', 'Київ', 'Львів', 'Privacy',
+    'Кабінет', 'Каталог', 'Колекція', 'Україна', 'Київ', 'Львів', 'Privacy',
     'Policy', 'Terms', 'Conditions', 'Customer', 'Service', 'Support', 'Contact',
     'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store'
 }
@@ -183,6 +181,23 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
     return prepared
 
 
+def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
+    """Витягує чистий кореневий домен, відсікаючи технічні платформні піддомени на кшталт checkout. або pay."""
+    parsed = urlparse(final_url)
+    netloc = parsed.netloc.lower().replace('www.', '')
+    if not netloc:
+        netloc = input_domain.lower().replace('www.', '')
+
+    parts = netloc.split('.')
+    if len(parts) > 2 and parts[0] in ('checkout', 'cart', 'pay', 'secure', 'shop', 'store', 'us', 'eu', 'uk'):
+        # Залишаємо останні 2 або 3 частини (наприклад brand.com або co.uk)
+        if parts[-2] in ('co', 'com', 'org', 'net', 'gov', 'edu') and len(parts) > 3:
+            netloc = '.'.join(parts[-3:])
+        else:
+            netloc = '.'.join(parts[-2:])
+    return netloc
+
+
 def decode_cf_email(encoded_str: str) -> str:
     try:
         r = int(encoded_str[:2], 16)
@@ -223,10 +238,6 @@ def classify_email_type(email: str | None) -> str | None:
 
 
 async def verify_email_mx_via_doh(client: AsyncSession, email: str | None) -> str | None:
-    """
-    Перевіряє реальні поштові сервери (MX-записи) домену через Google DNS-over-HTTPS
-    та визначає поштового провайдера (Google Workspace, Microsoft 365, Cloudflare тощо).
-    """
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -279,7 +290,7 @@ def rank_and_clean_emails(
         domain_root = domain_part.split('.')[0]
         clean_local = re.sub(r'[0-9._+-]+$', '', local_part)
 
-        if domain_part in JUNK_EMAIL_DOMAINS and base_domain != domain_part:
+        if domain_part in JUNK_EMAIL_DOMAINS and base_domain not in domain_part:
             continue
         if local_part in JUNK_EMAIL_LOCALS or clean_local in JUNK_EMAIL_LOCALS:
             continue
@@ -573,16 +584,11 @@ def is_valid_person_name(candidate: str) -> bool:
 
 def extract_decision_maker_deep(
     html_list: list[str],
-    text_list: list[str],
-    best_email: str | None
+    text_list: list[str]
 ) -> tuple[str | None, str | None]:
     """
-    1. Шукає founder / employee / author у мікророзмітці JSON-LD (Schema.org).
-    2. Шукає патерни "Ім'я Прізвище — Посада" та "Посада — Ім'я Прізвище" у тексті сторінок.
-    3. Якщо пошта іменна (напр. n.koshel@netpeak.net), намагається знайти повне ім'я з цим прізвищем у тексті.
-    Повертає тільки чисті (Name, Role) або (None, None) для CRM.
+    Витягує першу особу з мікророзмітки JSON-LD або тексту, НЕ звязуючи її сліпо з випадковими поштами.
     """
-    # 1. JSON-LD Schema.org
     for html in html_list:
         soup = BeautifulSoup(html, 'lxml')
         for script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
@@ -614,31 +620,20 @@ def extract_decision_maker_deep(
 
     combined_text = ' '.join(text_list)
 
-    # 2. "Ім'я Прізвище — Посада"
     for m in NAME_BEFORE_ROLE_PATTERN.finditer(combined_text):
         cand_name, cand_role = m.group(1).strip(), m.group(2).strip()
         if is_valid_person_name(cand_name):
             return cand_name, cand_role
 
-    # 3. "Посада — Ім'я Прізвище" (напр. "Засновниця бренду Аліна Качоровська")
     for m in ROLE_BEFORE_NAME_PATTERN.finditer(combined_text):
         cand_role, cand_name = m.group(1).strip(), m.group(2).strip()
         if is_valid_person_name(cand_name):
             return cand_name, cand_role
 
-    # 4. Якщо є іменний email типу i.surname@ або firstname.lastname@, реконструюємо або шукаємо на сторінці
-    if best_email and '@' in best_email:
-        local = best_email.split('@', 1)[0].lower()
-        if '.' in local and classify_email_type(best_email) == 'personal_or_named_inbox':
-            parts = [p for p in local.split('.') if p.isalpha()]
-            if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 3:
-                return f'{parts[0].capitalize()} {parts[1].capitalize()}', 'Named Corporate Contact'
-
     return None, None
 
 
 def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> str:
-    """Генерує готовий пошуковий запит для миттєвого знаходження CMO/Head of E-commerce у LinkedIn."""
     brand_root = canonical_domain.split('.')[0].capitalize()
     return (
         f'site:linkedin.com/in ("{canonical_domain}" OR "{brand_root}") '
@@ -647,7 +642,7 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v32(
+def evaluate_qualification_v33(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -680,7 +675,7 @@ def evaluate_qualification_v32(
     all_signals = ad_tags + analytics_tags
     detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
 
-    # 1. ICP Fit Tier
+    # 1. ICP Fit Tier (Ніколи не опускається через відсутність пошти!)
     if company_category == 'E-commerce / Retail Brand':
         icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
     elif company_category in ('SaaS / Tech Platform', 'General Business / Corporate'):
@@ -690,7 +685,7 @@ def evaluate_qualification_v32(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # 2. Technical Signal Strength (перейменовано з buying_signal_strength для 100% точності)
+    # 2. Technical Signal Strength
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
@@ -712,36 +707,45 @@ def evaluate_qualification_v32(
             '(May lack tracking or block scripts behind Cookie Consent)'
         )
 
-    # 3. Contact Quality Tier & Enrichment Status
+    # 3. Contact Quality Tier & Enrichment Status (Суворе розділення імені та пошти)
     if dm_name and best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
-        contact_quality = 'Tier A (Named Decision-Maker + Direct Email)'
-        enrichment_status = 'verified_decision_maker_on_site'
+        contact_quality = f'Tier A (Named Decision-Maker: {dm_name} + Direct Email)'
+        enrichment_status = 'verified_decision_maker_and_email_paired'
+        confidence_warning = 'None'
     elif dm_name and (best_email or primary_phone):
-        contact_quality = f'Tier B+ (Decision-Maker Identified: {dm_name}, Paired with Company Contact)'
-        enrichment_status = 'decision_maker_named_needs_direct_email'
+        contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, but Inbox is Generic/Role-based)'
+        enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
+        confidence_warning = 'Warning: Person name found in text/schema; email is company generic inbox (do not assume direct pairing).'
     elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
         contact_quality = f'Tier B+ (Direct / Role Inbox: {best_email_type}, Person Name Unlisted)'
         enrichment_status = 'named_or_role_email_found_needs_title_match'
+        confidence_warning = 'None'
     elif best_email_type == 'b2b_partnerships':
-        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Commercial/Partnership Pitch, Needs CMO Referral for Tech)'
+        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Commercial/Partnership Pitch)'
         enrichment_status = 'b2b_role_inbox_only_needs_linkedin_dm'
+        confidence_warning = 'None'
     elif best_email_type == 'general_office_inbox':
         contact_quality = 'Tier C (Generic Office Inbox — Suitable for Gatekeeper Routing Only)'
         enrichment_status = 'generic_inbox_only_needs_linkedin_dm'
+        confidence_warning = 'None'
     elif best_email_type in ('wholesale_or_sales_inbox', 'regional_branch'):
         contact_quality = f'Tier C- ({best_email_type} — Merchandise/Regional Channel, Not Marketing Buyer)'
         enrichment_status = 'non_marketing_department_inbox_needs_linkedin_dm'
+        confidence_warning = 'Warning: Email belongs to sales/wholesale department, not marketing decision-maker.'
     elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'legal_or_hr'):
         contact_quality = f'Tier D (Low Sales Fit: {best_email_type} — Do Not Cold Pitch Services Here)'
         enrichment_status = 'support_or_pr_inbox_only_requires_dm_enrichment'
+        confidence_warning = f'Warning: Email is {best_email_type}; avoid direct cold sales pitch.'
     elif primary_phone:
         contact_quality = 'Tier D (Phone Only — No Email Found on Public Pages)'
         enrichment_status = 'phone_only_requires_email_and_dm_enrichment'
+        confidence_warning = 'Warning: No public email found; phone routing or LinkedIn required.'
     else:
         contact_quality = 'Tier F (No Actionable Contacts Found on Website)'
         enrichment_status = 'no_public_contacts_found'
+        confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. Калібрована Sales Opportunity (гіпотеза для аудиту, а не твердження про поломку)
+    # 4. Калібрована Sales Opportunity
     if company_category == 'B2B Agency / Marketing Media':
         opportunity = (
             'Agency/Media Segment: Explore white-label analytics partnership, '
@@ -787,6 +791,7 @@ def evaluate_qualification_v32(
         tech_signal,
         contact_quality,
         enrichment_status,
+        confidence_warning,
         detected_signals_str,
         opportunity,
         next_action
@@ -971,7 +976,7 @@ async def process_domain(
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(client, root_url)
-        canonical_domain = urlparse(final_url).netloc.lower().replace('www.', '') or domain_key
+        canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
@@ -984,9 +989,10 @@ async def process_domain(
                 'error_message': err_msg,
                 'company_category': cat,
                 'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
-                'technical_signal_strength': None,
+                ' технический сигнал': None,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
+                'data_confidence_warning': 'Site blocked by WAF/Cloudflare; no data extracted.',
                 'page_title': None,
                 'meta_description': None,
                 'best_email': None,
@@ -1078,14 +1084,13 @@ async def process_domain(
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email)
 
-        # Явна стандартизація домену пошти відносно канонічного домену сайту
         email_domain = None
         if best_email and '@' in best_email:
             raw_em_dom = best_email.split('@', 1)[1].lower()
-            if raw_em_dom == canonical_domain or raw_em_dom == domain_key:
+            if raw_em_dom == canonical_domain or raw_em_dom in canonical_domain:
                 email_domain = f'{raw_em_dom} (matches_site)'
             else:
-                email_domain = f'{raw_em_dom} (external_or_alias_of_{canonical_domain})'
+                email_domain = f'{raw_em_dom} (external_or_alias)'
 
         deliverability_check = await verify_email_mx_via_doh(client, best_email) if best_email else None
 
@@ -1104,7 +1109,7 @@ async def process_domain(
         )
 
         dm_name, dm_role = await asyncio.to_thread(
-            extract_decision_maker_deep, html_pages, combined_text_parts, best_email
+            extract_decision_maker_deep, html_pages, combined_text_parts
         )
         dm_search_query = build_linkedin_xray_query(canonical_domain, page_title)
 
@@ -1114,10 +1119,11 @@ async def process_domain(
             technical_signal_strength,
             contact_quality_tier,
             enrichment_status,
+            confidence_warning,
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v32(
+        ) = evaluate_qualification_v33(
             company_category,
             tech_info,
             best_email,
@@ -1144,6 +1150,7 @@ async def process_domain(
             'technical_signal_strength': technical_signal_strength,
             'contact_quality_tier': contact_quality_tier,
             'contact_enrichment_status': enrichment_status,
+            'data_confidence_warning': confidence_warning,
             'page_title': page_title,
             'meta_description': meta_desc,
             'best_email': best_email,
@@ -1236,9 +1243,9 @@ async def main() -> None:
                 batch.append(result)
 
                 Actor.log.info(
-                    f"[{result['status'].upper()}] {result['input_domain']} -> {result['canonical_domain']} | "
-                    f"DM: {result['decision_maker_name'] or '-'} | "
-                    f"MX: {result['email_deliverability_check'] or '-'}"
+                    f"[{result['status'].upper()}] {result['canonical_domain']} | "
+                    f"ICP: {result['icp_fit_tier']} | "
+                    f"DM: {result['decision_maker_name'] or 'None'}"
                 )
 
                 if len(batch) >= batch_size:
