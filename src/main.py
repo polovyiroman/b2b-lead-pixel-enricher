@@ -43,6 +43,15 @@ STOP_NAME_WORDS = {
     'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store'
 }
 
+# Таблиця транслітерації для перевірки збігу "Ім'я Прізвище <-> email"
+UA_TO_LATIN = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g', 'д': 'd', 'е': 'e',
+    'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y',
+    'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
+    'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
+    'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya', '\'': '', '’': ''
+}
+
 JUNK_EMAIL_DOMAINS = {
     'sentry.io', 'wixpress.com', 'example.com', 'domain.com', 'test.com',
     'email.com', 'yoursite.com', 'yourdomain.com', 'company.com', 'website.com',
@@ -77,13 +86,19 @@ WHOLESALE_MERCH_PREFIXES = (
 )
 GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
-    'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'inquiries', 'enquiry'
+    'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'inquiries',
+    'enquiry', 'reception', 'secretariat', 'admin'
+)
+DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
+    'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
+    'department', 'faculty', 'edu', 'study', 'courses', 'academy',
+    'booking', 'reservation', 'delivery', 'logistics', 'export', 'import'
 )
 SUPPORT_PREFIXES = (
     'support', 'help', 'service', 'care', 'customerservice', 'client', 'clients', 'shop', 'store'
 )
 PR_MEDIA_PREFIXES = (
-    'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand'
+    'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand', 'events'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'legal', 'datenschutz', 'dpo', 'compliance', 'gdpr',
@@ -93,6 +108,19 @@ LOW_PRIORITY_PREFIXES = (
 REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
 }
+
+# Усі не-іменні слова, щоб не плутати service.vovk@ або vstup@ із "Ім'я.Прізвище@"
+NON_PERSON_TOKENS = (
+    set(MARKETING_EXEC_PREFIXES)
+    | set(B2B_PARTNERSHIP_PREFIXES)
+    | set(WHOLESALE_MERCH_PREFIXES)
+    | set(GENERAL_OFFICE_PREFIXES)
+    | set(DEPARTMENT_OR_ADMISSIONS_PREFIXES)
+    | set(SUPPORT_PREFIXES)
+    | set(PR_MEDIA_PREFIXES)
+    | set(LOW_PRIORITY_PREFIXES)
+    | REGIONAL_BRANCH_LOCALS
+)
 
 B2B_PHONE_KEYWORDS = (
     'опт', 'гурт', 'гуртов', 'співпрац', 'партнер', 'корпоратив', 'b2b',
@@ -182,20 +210,15 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
 
 
 def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
-    """Витягує чистий кореневий домен, відсікаючи технічні платформні піддомени на кшталт checkout. або pay."""
     parsed = urlparse(final_url)
     netloc = parsed.netloc.lower().replace('www.', '')
     if not netloc:
         netloc = input_domain.lower().replace('www.', '')
 
     parts = netloc.split('.')
-    if len(parts) > 2 and parts[0] in ('checkout', 'cart', 'pay', 'secure', 'shop', 'store', 'us', 'eu', 'uk'):
-        # Залишаємо останні 2 або 3 частини (наприклад brand.com або co.uk)
-        if parts[-2] in ('co', 'com', 'org', 'net', 'gov', 'edu') and len(parts) > 3:
-            netloc = '.'.join(parts[-3:])
-        else:
-            netloc = '.'.join(parts[-2:])
-    return netloc
+    while len(parts) > 2 and parts[0] in ('checkout', 'cart', 'pay', 'secure', 'shop', 'store', 'us', 'eu', 'uk'):
+        parts.pop(0)
+    return '.'.join(parts)
 
 
 def decode_cf_email(encoded_str: str) -> str:
@@ -210,31 +233,72 @@ def decode_cf_email(encoded_str: str) -> str:
 
 
 def classify_email_type(email: str | None) -> str | None:
+    """
+    Сувора класифікація пошт:
+    - 'vstup@', 'admission@' -> admissions_or_department_inbox
+    - 'personal_or_named_inbox' присвоюється ТІЛЬКИ якщо формат відповідає патерну i.surname@ або firstname.lastname@
+    """
     if not email or '@' not in email:
         return None
-    local = email.split('@', 1)[0].lower()
-    clean_local = re.split(r'[._+-]', local)[0]
+    local, domain = email.split('@', 1)
+    local = local.lower()
+    domain_root = domain.split('.')[0].lower()
+    tokens = [t for t in re.split(r'[._+-]', local) if t]
+    first_token = tokens[0] if tokens else local
 
-    if local.startswith(LOW_PRIORITY_PREFIXES) or clean_local in LOW_PRIORITY_PREFIXES:
-        return 'legal_or_hr'
-    if local in REGIONAL_BRANCH_LOCALS or clean_local in REGIONAL_BRANCH_LOCALS:
-        return 'regional_branch'
-    if local.startswith(MARKETING_EXEC_PREFIXES) or clean_local in MARKETING_EXEC_PREFIXES:
+    if local.startswith(LOW_PRIORITY_PREFIXES) or first_token in LOW_PRIORITY_PREFIXES:
+        return 'legal_or_hr_inbox'
+    if local in REGIONAL_BRANCH_LOCALS or first_token in REGIONAL_BRANCH_LOCALS:
+        return 'regional_branch_inbox'
+    if local.startswith(DEPARTMENT_OR_ADMISSIONS_PREFIXES) or first_token in DEPARTMENT_OR_ADMISSIONS_PREFIXES:
+        return 'admissions_or_department_inbox'
+    if local.startswith(MARKETING_EXEC_PREFIXES) or first_token in MARKETING_EXEC_PREFIXES:
         return 'marketing_or_exec_role'
-    if local.startswith(B2B_PARTNERSHIP_PREFIXES) or clean_local in B2B_PARTNERSHIP_PREFIXES:
+    if local.startswith(B2B_PARTNERSHIP_PREFIXES) or first_token in B2B_PARTNERSHIP_PREFIXES:
         return 'b2b_partnerships'
-    if local.startswith(WHOLESALE_MERCH_PREFIXES) or clean_local in WHOLESALE_MERCH_PREFIXES:
+    if local.startswith(WHOLESALE_MERCH_PREFIXES) or first_token in WHOLESALE_MERCH_PREFIXES:
         return 'wholesale_or_sales_inbox'
-    if local.startswith(GENERAL_OFFICE_PREFIXES) or clean_local in GENERAL_OFFICE_PREFIXES:
+    if local.startswith(GENERAL_OFFICE_PREFIXES) or first_token in GENERAL_OFFICE_PREFIXES:
         return 'general_office_inbox'
-    if local.startswith(SUPPORT_PREFIXES) or clean_local in SUPPORT_PREFIXES:
+    if local.startswith(SUPPORT_PREFIXES) or first_token in SUPPORT_PREFIXES:
         return 'customer_support_inbox'
-    if local.startswith(PR_MEDIA_PREFIXES) or clean_local in PR_MEDIA_PREFIXES:
+    if local.startswith(PR_MEDIA_PREFIXES) or first_token in PR_MEDIA_PREFIXES:
         return 'pr_and_media_inbox'
 
-    if '.' in local or len(local) >= 4:
-        return 'personal_or_named_inbox'
-    return 'general_office_inbox'
+    # Перевіряємо, чи це справді іменна корпоративна скринька (наприклад n.koshel@ або o.petrenko@)
+    if len(tokens) == 2 and all(t.isalpha() for t in tokens):
+        if tokens[0] not in NON_PERSON_TOKENS and tokens[1] not in NON_PERSON_TOKENS and tokens[1] != domain_root:
+            if (len(tokens[0]) == 1 and len(tokens[1]) >= 3) or (len(tokens[0]) >= 3 and len(tokens[1]) >= 3):
+                return 'personal_or_named_inbox'
+
+    return 'department_or_general_inbox'
+
+
+def transliterate_ua_to_latin(text: str) -> str:
+    return ''.join(UA_TO_LATIN.get(ch, ch) for ch in text.lower())
+
+
+def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
+    """
+    Перевіряє, чи дійсно іменна пошта (напр. n.koshel@netpeak.net) належить знайденій особі (напр. Артем Бородатюк).
+    Повертає True ТІЛЬКИ якщо прізвище або ім'я людини збігається з локальною частиною пошти.
+    """
+    if not full_name or not email or '@' not in email:
+        return False
+    local = email.split('@', 1)[0].lower()
+    name_parts = [p.strip() for p in full_name.split() if len(p.strip()) >= 2]
+    if len(name_parts) < 2:
+        return False
+
+    first_lat = transliterate_ua_to_latin(name_parts[0])
+    last_lat = transliterate_ua_to_latin(name_parts[-1])
+
+    # Перевіряємо входження прізвища (або перших 4 букв прізвища) у local-частину пошти
+    if len(last_lat) >= 4 and last_lat[:4] in local:
+        return True
+    if len(first_lat) >= 4 and first_lat in local and last_lat[0] in local:
+        return True
+    return False
 
 
 async def verify_email_mx_via_doh(client: AsyncSession, email: str | None) -> str | None:
@@ -304,12 +368,14 @@ def rank_and_clean_emails(
         'marketing_or_exec_role': 35,
         'personal_or_named_inbox': 32,
         'b2b_partnerships': 28,
-        'general_office_inbox': 22,
+        'general_office_inbox': 24,
         'wholesale_or_sales_inbox': 18,
-        'regional_branch': 14,
+        'department_or_general_inbox': 15,
+        'regional_branch_inbox': 14,
+        'admissions_or_department_inbox': 10,
         'customer_support_inbox': 8,
         'pr_and_media_inbox': 5,
-        'legal_or_hr': -40
+        'legal_or_hr_inbox': -40
     }
 
     def email_score(addr: str) -> tuple[int, str]:
@@ -586,9 +652,6 @@ def extract_decision_maker_deep(
     html_list: list[str],
     text_list: list[str]
 ) -> tuple[str | None, str | None]:
-    """
-    Витягує першу особу з мікророзмітки JSON-LD або тексту, НЕ звязуючи її сліпо з випадковими поштами.
-    """
     for html in html_list:
         soup = BeautifulSoup(html, 'lxml')
         for script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
@@ -642,7 +705,7 @@ def build_linkedin_xray_query(canonical_domain: str, page_title: str | None) -> 
     )
 
 
-def evaluate_qualification_v33(
+def evaluate_qualification_v34(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -650,7 +713,7 @@ def evaluate_qualification_v33(
     primary_phone: str | None,
     dm_name: str | None,
     linkedin_url: str | None
-) -> tuple[str, str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str, str]:
     ad_tags = []
     if tech_info.get('has_meta_pixel'):
         ad_tags.append('Meta Pixel')
@@ -675,7 +738,7 @@ def evaluate_qualification_v33(
     all_signals = ad_tags + analytics_tags
     detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
 
-    # 1. ICP Fit Tier (Ніколи не опускається через відсутність пошти!)
+    # 1. ICP Fit Tier
     if company_category == 'E-commerce / Retail Brand':
         icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
     elif company_category in ('SaaS / Tech Platform', 'General Business / Corporate'):
@@ -707,17 +770,29 @@ def evaluate_qualification_v33(
             '(May lack tracking or block scripts behind Cookie Consent)'
         )
 
-    # 3. Contact Quality Tier & Enrichment Status (Суворе розділення імені та пошти)
-    if dm_name and best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
-        contact_quality = f'Tier A (Named Decision-Maker: {dm_name} + Direct Email)'
-        enrichment_status = 'verified_decision_maker_and_email_paired'
+    # 3. Перевірка реального збігу Імені та Пошти (унеможливлює помилку Netpeak)
+    is_same_person_email = verify_person_email_match(dm_name, best_email)
+
+    if dm_name and is_same_person_email:
+        contact_quality = f'Tier A (Verified Match: {dm_name} + Direct Personal Email)'
+        enrichment_status = 'verified_decision_maker_and_matching_email'
         confidence_warning = 'None'
+    elif dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
+        contact_quality = (
+            f'Tier B+ (Named Staff Inbox {best_email} Found, '
+            f'Different from Listed Executive {dm_name})'
+        )
+        enrichment_status = 'unmatched_executive_and_staff_email'
+        confidence_warning = (
+            f'Warning: Email {best_email} belongs to a different person than '
+            f'the executive found in text ({dm_name}). Do not address {best_email} as {dm_name}.'
+        )
     elif dm_name and (best_email or primary_phone):
-        contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, but Inbox is Generic/Role-based)'
+        contact_quality = f'Tier B+ (Decision-Maker Found: {dm_name}, Paired with Generic/Role Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
-        confidence_warning = 'Warning: Person name found in text/schema; email is company generic inbox (do not assume direct pairing).'
+        confidence_warning = 'Warning: Person name found in text/schema; email is company role/generic inbox (not direct personal email).'
     elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
-        contact_quality = f'Tier B+ (Direct / Role Inbox: {best_email_type}, Person Name Unlisted)'
+        contact_quality = f'Tier B+ (Direct / Named Staff Inbox: {best_email_type}, Full Name Unlisted)'
         enrichment_status = 'named_or_role_email_found_needs_title_match'
         confidence_warning = 'None'
     elif best_email_type == 'b2b_partnerships':
@@ -728,11 +803,11 @@ def evaluate_qualification_v33(
         contact_quality = 'Tier C (Generic Office Inbox — Suitable for Gatekeeper Routing Only)'
         enrichment_status = 'generic_inbox_only_needs_linkedin_dm'
         confidence_warning = 'None'
-    elif best_email_type in ('wholesale_or_sales_inbox', 'regional_branch'):
-        contact_quality = f'Tier C- ({best_email_type} — Merchandise/Regional Channel, Not Marketing Buyer)'
+    elif best_email_type in ('wholesale_or_sales_inbox', 'regional_branch_inbox', 'department_or_general_inbox', 'admissions_or_department_inbox'):
+        contact_quality = f'Tier C- ({best_email_type} — Non-Marketing Department Channel)'
         enrichment_status = 'non_marketing_department_inbox_needs_linkedin_dm'
-        confidence_warning = 'Warning: Email belongs to sales/wholesale department, not marketing decision-maker.'
-    elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'legal_or_hr'):
+        confidence_warning = f'Warning: Email belongs to {best_email_type}, not marketing decision-maker.'
+    elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'legal_or_hr_inbox'):
         contact_quality = f'Tier D (Low Sales Fit: {best_email_type} — Do Not Cold Pitch Services Here)'
         enrichment_status = 'support_or_pr_inbox_only_requires_dm_enrichment'
         confidence_warning = f'Warning: Email is {best_email_type}; avoid direct cold sales pitch.'
@@ -745,7 +820,21 @@ def evaluate_qualification_v33(
         enrichment_status = 'no_public_contacts_found'
         confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. Калібрована Sales Opportunity
+    # 4. Чесний комерційний вердикт готовності ліда (Sales Readiness Verdict)
+    if company_category == 'Non-Profit / Education / Institution':
+        readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
+    elif company_category == 'B2B Agency / Marketing Media':
+        readiness_verdict = 'Partner Pipeline Only (Agency / Media Segment)'
+    elif dm_name and is_same_person_email:
+        readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Direct Email)'
+    elif best_email_type in ('b2b_partnerships', 'marketing_or_exec_role', 'personal_or_named_inbox'):
+        readiness_verdict = 'Sales-Ready Tier 2 (Relevant B2B / Staff Inbox Found)'
+    elif best_email_type == 'general_office_inbox':
+        readiness_verdict = 'Gatekeeper-Ready Only (Generic Office Inbox — Needs DM Lookup for Cold Outbound)'
+    else:
+        readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn DM Enrichment Before Outbound)'
+
+    # 5. Калібрована Sales Opportunity
     if company_category == 'B2B Agency / Marketing Media':
         opportunity = (
             'Agency/Media Segment: Explore white-label analytics partnership, '
@@ -766,12 +855,15 @@ def evaluate_qualification_v33(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 5. Next Best Action
+    # 6. Next Best Action
     if company_category == 'B2B Agency / Marketing Media':
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
-    elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox', 'regional_branch'):
+    elif best_email_type in (
+        'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
+        'regional_branch_inbox', 'admissions_or_department_inbox'
+    ):
         next_action = (
             f"DO NOT send marketing pitch to {best_email} ({best_email_type}); "
             f"use decision_maker_search_query on LinkedIn or call {primary_phone or 'company'} to reach Marketing Lead"
@@ -787,6 +879,7 @@ def evaluate_qualification_v33(
         next_action = 'Run decision_maker_search_query in LinkedIn / Apollo to locate marketing decision-maker'
 
     return (
+        readiness_verdict,
         icp_fit_tier,
         tech_signal,
         contact_quality,
@@ -987,9 +1080,10 @@ async def process_domain(
                 'website_url': final_url,
                 'status': fail_status,
                 'error_message': err_msg,
+                'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
                 'company_category': cat,
                 'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
-                ' технический сигнал': None,
+                'technical_signal_strength': None,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare; no data extracted.',
@@ -1115,6 +1209,7 @@ async def process_domain(
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
+            sales_readiness_verdict,
             icp_fit_tier,
             technical_signal_strength,
             contact_quality_tier,
@@ -1123,7 +1218,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v33(
+        ) = evaluate_qualification_v34(
             company_category,
             tech_info,
             best_email,
@@ -1145,6 +1240,7 @@ async def process_domain(
             'website_url': final_url,
             'status': final_status,
             'error_message': '',
+            'sales_readiness_verdict': sales_readiness_verdict,
             'company_category': company_category,
             'icp_fit_tier': icp_fit_tier,
             'technical_signal_strength': technical_signal_strength,
@@ -1244,8 +1340,8 @@ async def main() -> None:
 
                 Actor.log.info(
                     f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                    f"ICP: {result['icp_fit_tier']} | "
-                    f"DM: {result['decision_maker_name'] or 'None'}"
+                    f"Verdict: {result['sales_readiness_verdict']} | "
+                    f"Email: {result['best_email'] or '-'} ({result['best_email_type'] or '-'})"
                 )
 
                 if len(batch) >= batch_size:
