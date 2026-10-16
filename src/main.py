@@ -16,18 +16,13 @@ GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{4,10}\b', re.IGNORECASE)
 GA4_ID_REGEX = re.compile(r'\bG-[A-Z0-9]{6,12}\b')
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
 
-# Пошук імен та посад (Decision Makers) у тексті або мікророзмітці
-DM_ROLE_PATTERN = re.compile(
-    r'\b(CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
-    r'Marketing Director|E-commerce Manager| Head of E-commerce|Commercial Director|'
-    r'Managing Partner|Засновник|Співзасновник|Генеральний директор|Директор з маркетингу|'
-    r'Керівник відділу маркетингу|Керівник відділу продажу|Комерційний директор)\b',
-    re.IGNORECASE
-)
+# Строгий патерн для реального Імені + Прізвища поруч із B2B-посадою
 NAME_NEAR_ROLE_PATTERN = re.compile(
-    r'([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\']+\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\']+)[\s,—–\-:|()]{1,15}'
-    r'(CEO|Founder|Co-Founder|CMO|Head of Marketing|Marketing Director|Managing Partner|'
-    r'Засновник|Співзасновник|Генеральний директор|Директор з маркетингу|Комерційний директор)',
+    r'\b([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\']{2,20}\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\']{2,25})'
+    r'[\s,—–\-:|()]{1,15}'
+    r'(CEO|Founder|Co-Founder|CMO|Chief Marketing Officer|Head of Marketing|'
+    r'Marketing Director|Head of E-commerce|Commercial Director|Managing Partner|'
+    r'Засновник|Співзасновник|Генеральний директор|Директор з маркетингу|Комерційний директор)\b',
     re.UNICODE
 )
 
@@ -53,28 +48,35 @@ JUNK_EXTENSIONS = (
     '.pdf', '.zip', '.rar', '.xml', '.json', '.docx', '.xlsx'
 )
 
-SALES_ONLY_PREFIXES = (
-    'sales', 'sale', 'b2b', 'wholesale', 'opt', 'commercial', 'deals',
-    'enterprise', 'corporate', 'orders', 'quote', 'quotes', 'inquiries', 'enquiry', 'enquiries'
+# Чіткий поділ поштових скриньок очима покупця маркетингових послуг
+MARKETING_EXEC_PREFIXES = (
+    'marketing', 'cmo', 'digital', 'growth', 'ecommerce', 'e-commerce',
+    'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner'
 )
-PARTNERSHIPS_PREFIXES = (
-    'partner', 'partners', 'partnerships', 'affiliate', 'affiliates', 'alliances', 'bizdev', 'bd'
+B2B_PARTNERSHIP_PREFIXES = (
+    'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial', 'corporate', 'deals'
 )
-GENERAL_PREFIXES = (
+WHOLESALE_MERCH_PREFIXES = (
+    'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer'
+)
+GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
-    'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'ceo', 'founder', 'owner'
+    'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'inquiries', 'enquiry'
 )
 SUPPORT_PREFIXES = (
     'support', 'help', 'service', 'care', 'customerservice', 'client', 'clients', 'shop', 'store'
 )
 PR_MEDIA_PREFIXES = (
-    'pr', 'press', 'media', 'comms', 'communications', 'marketing', 'ads', 'collab', 'brand'
+    'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'legal', 'datenschutz', 'dpo', 'compliance', 'gdpr',
     'billing', 'invoice', 'invoices', 'accounting', 'finance',
-    'jobs', 'careers', 'hr', 'recruiting', 'security', 'copyright', 'dmca'
+    'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca'
 )
+REGIONAL_BRANCH_LOCALS = {
+    'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
+}
 
 B2B_PHONE_KEYWORDS = (
     'опт', 'гурт', 'гуртов', 'співпрац', 'партнер', 'корпоратив', 'b2b',
@@ -93,7 +95,6 @@ SECONDARY_CONTACT_KEYWORDS = (
     'about', 'uber-uns', 'ueber-uns', 'team', 'company', 'leadership', 'management', 'wholesale', 'b2b'
 )
 
-# Рекламні та аналітичні пікселі (можуть бути як у HTML, так і всередині GTM)
 AD_AND_ANALYTICS_SIGNATURES = {
     'Meta Pixel': [
         'connect.facebook.net', 'fbq(', 'facebook.com/tr?',
@@ -114,7 +115,6 @@ AD_AND_ANALYTICS_SIGNATURES = {
     'Klaviyo': ['static.klaviyo.com', 'klaviyo.push']
 }
 
-# Платформи/CMS — перевіряються ТІЛЬКИ в прямому HTML сторінки (виключає хибні спрацювання через GTM)
 CMS_HTML_ONLY_SIGNATURES = {
     'Shopify': ['cdn.shopify.com', 'shopify.theme', 'shopify-digital-wallet'],
     'WooCommerce': [
@@ -122,11 +122,15 @@ CMS_HTML_ONLY_SIGNATURES = {
         'wc-cart-fragments', 'class="woocommerce'
     ],
     'WordPress': ['wp-content/themes/', 'wp-includes/js/'],
-    'Webflow': ['data-wf-site', ' data-wf-page'],
+    'Webflow': ['data-wf-site', 'data-wf-page'],
     'Wix': ['wixstatic.com', 'wix-warmup-data'],
     'Tilda': ['tildacdn.com', 'tilda-blocks'],
     'Squarespace': ['static1.squarespace.com', 'squarespace-cdn.com']
 }
+
+COOKIE_CONSENT_MARKERS = (
+    'cookiebot', 'onetrust', 'cookiefirst', 'usercentrics', 'complianz', 'cookieyes', 'Didomi'
+)
 
 SOCIAL_BAD_SEGMENTS = {
     'sharer', 'sharer.php', 'share', 'intent', 'plugins', 'status', 'posts',
@@ -172,6 +176,7 @@ def decode_cf_email(encoded_str: str) -> str:
 
 
 def classify_email_type(email: str | None) -> str | None:
+    """Точна класифікація поштової скриньки без змішування гуртових замовлень та особистих пошт."""
     if not email or '@' not in email:
         return None
     local = email.split('@', 1)[0].lower()
@@ -179,29 +184,37 @@ def classify_email_type(email: str | None) -> str | None:
 
     if local.startswith(LOW_PRIORITY_PREFIXES) or clean_local in LOW_PRIORITY_PREFIXES:
         return 'legal_or_hr'
-    if local.startswith(SALES_ONLY_PREFIXES) or clean_local in SALES_ONLY_PREFIXES:
-        return 'sales'
-    if local.startswith(PARTNERSHIPS_PREFIXES) or clean_local in PARTNERSHIPS_PREFIXES:
-        return 'partnerships'
-    if local.startswith(GENERAL_PREFIXES) or clean_local in GENERAL_PREFIXES:
-        return 'general'
+    if local in REGIONAL_BRANCH_LOCALS or clean_local in REGIONAL_BRANCH_LOCALS:
+        return 'regional_branch'
+    if local.startswith(MARKETING_EXEC_PREFIXES) or clean_local in MARKETING_EXEC_PREFIXES:
+        return 'marketing_or_exec_role'
+    if local.startswith(B2B_PARTNERSHIP_PREFIXES) or clean_local in B2B_PARTNERSHIP_PREFIXES:
+        return 'b2b_partnerships'
+    if local.startswith(WHOLESALE_MERCH_PREFIXES) or clean_local in WHOLESALE_MERCH_PREFIXES:
+        return 'wholesale_or_sales_inbox'
+    if local.startswith(GENERAL_OFFICE_PREFIXES) or clean_local in GENERAL_OFFICE_PREFIXES:
+        return 'general_office_inbox'
     if local.startswith(SUPPORT_PREFIXES) or clean_local in SUPPORT_PREFIXES:
-        return 'support'
+        return 'customer_support_inbox'
     if local.startswith(PR_MEDIA_PREFIXES) or clean_local in PR_MEDIA_PREFIXES:
-        return 'pr_and_media'
-    return 'direct_or_personal'
+        return 'pr_and_media_inbox'
+
+    # Якщо формат схожий на ім'я (наприклад, n.koshel@... або roman.polovyi@...)
+    if '.' in local or len(local) >= 4:
+        return 'personal_or_named_inbox'
+    return 'general_office_inbox'
 
 
-def verify_email_domain_dns(email: str | None) -> str:
-    """Перевіряє, чи має домен поштової адреси активні DNS-записи."""
+def check_domain_deliverability_status(email: str | None) -> str | None:
+    """Чесно розділяє перевірку DNS домену та неперевірене існування конкретної скриньки."""
     if not email or '@' not in email:
-        return 'none'
+        return None
     domain = email.split('@', 1)[1].strip()
     try:
         socket.getaddrinfo(domain, None)
-        return 'domain_dns_verified (syntax_ok + active_domain)'
+        return 'domain_dns_active (mailbox_unverified_by_smtp)'
     except Exception:
-        return 'syntax_only (domain_unverified)'
+        return 'domain_dns_failed'
 
 
 def rank_and_clean_emails(
@@ -235,14 +248,18 @@ def rank_and_clean_emails(
         if 6 <= len(email) <= 60 and email not in valid:
             valid[email] = source_url
 
+    # Пріоритизація саме для продажу B2B/Digital послуг:
+    # Іменні та маркетингові -> Партнерські -> Загальні офісні -> Гуртові -> Регіональні -> Саппорт -> PR
     type_weights = {
-        'sales': 30,
-        'partnerships': 26,
-        'direct_or_personal': 24,
-        'general': 20,
-        'support': 10,
-        'pr_and_media': 6,
-        'legal_or_hr': -35
+        'marketing_or_exec_role': 35,
+        'personal_or_named_inbox': 32,
+        'b2b_partnerships': 28,
+        'general_office_inbox': 22,
+        'wholesale_or_sales_inbox': 18,
+        'regional_branch': 14,
+        'customer_support_inbox': 8,
+        'pr_and_media_inbox': 5,
+        'legal_or_hr': -40
     }
 
     def email_score(addr: str) -> tuple[int, str]:
@@ -340,10 +357,6 @@ def extract_valid_phones(
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
 ) -> list[tuple[str, int]]:
-    """
-    Форматує телефони у міжнародний формат із пробілами (+380 44 333 6973),
-    щоб Excel та CSV-парсери завжди зберігали їх як ТЕКСТ (string) і не робили float (.0).
-    """
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
@@ -393,10 +406,6 @@ def detect_tech_with_evidence(
     gtm_ids: list[str],
     page_url: str
 ) -> dict:
-    """
-    Визначає рекламні пікселі (в HTML + GTM) і платформи CMS (строго в HTML),
-    вказуючи рівень достовірності кожного доказу.
-    """
     combined = f'{html}\n{gtm_js}'
     html_lower = html.lower()
     gtm_lower = gtm_js.lower()
@@ -404,11 +413,13 @@ def detect_tech_with_evidence(
     detected = []
     evidence_items = []
 
+    has_cookie_banner = any(cm.lower() in html_lower for cm in COOKIE_CONSENT_MARKERS)
+
     has_gtm = bool(gtm_ids) or 'googletagmanager.com/gtm.js' in html_lower
     if has_gtm:
         detected.append('Google Tag Manager')
         ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js)'
-        evidence_items.append(f'{ev_str} [Direct HTML, High Confidence] on {page_url}')
+        evidence_items.append(f'{ev_str} [Direct HTML] on {page_url}')
 
     ga4_matches = sorted({m.upper() for m in GA4_ID_REGEX.findall(combined)})
     has_ga4 = (
@@ -422,7 +433,7 @@ def detect_tech_with_evidence(
         in_html = bool(GA4_ID_REGEX.search(html) or 'gtag/js' in html_lower)
         src_where = 'Direct HTML' if in_html else 'GTM Container'
         ev_id = ga4_matches[0] if ga4_matches else 'gtag/js'
-        evidence_items.append(f'GA4 ({ev_id} in {src_where}, High Confidence)')
+        evidence_items.append(f'GA4 ({ev_id} in {src_where})')
 
     aw_matches = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(combined)})
     has_google_ads = (
@@ -435,7 +446,7 @@ def detect_tech_with_evidence(
         in_html = bool(GOOGLE_ADS_REGEX.search(html))
         src_where = 'Direct HTML' if in_html else 'GTM Container'
         ev_id = aw_matches[0] if aw_matches else 'conversion.js'
-        evidence_items.append(f'Google Ads ({ev_id} in {src_where}, High Confidence)')
+        evidence_items.append(f'Google Ads ({ev_id} in {src_where})')
 
     for name, markers in AD_AND_ANALYTICS_SIGNATURES.items():
         matched_in_html = next((m for m in markers if m in html_lower), None)
@@ -443,16 +454,23 @@ def detect_tech_with_evidence(
         if matched_in_html or matched_in_gtm:
             detected.append(name)
             if matched_in_html:
-                evidence_items.append(f"{name} ('{matched_in_html}' in Direct HTML, High Confidence)")
+                evidence_items.append(f"{name} ('{matched_in_html}' in Direct HTML)")
             else:
-                evidence_items.append(f"{name} ('{matched_in_gtm}' in GTM Container, Medium-High Confidence)")
+                evidence_items.append(f"{name} ('{matched_in_gtm}' in GTM Container)")
 
-    # CMS та e-commerce рушії перевіряємо ТІЛЬКИ в прямому HTML сторінки
     for cms_name, cms_markers in CMS_HTML_ONLY_SIGNATURES.items():
         matched_cms = next((m for m in cms_markers if m in html_lower), None)
         if matched_cms:
             detected.append(cms_name)
-            evidence_items.append(f"{cms_name} ('{matched_cms}' in Direct HTML, High Confidence)")
+            evidence_items.append(f"{cms_name} ('{matched_cms}' in Direct HTML)")
+
+    if not evidence_items:
+        if has_cookie_banner:
+            ev_summary = 'No static tags visible (Consent Mode / Cookie banner detected; tags may fire post-consent)'
+        else:
+            ev_summary = 'No tracking markers detected in static HTML'
+    else:
+        ev_summary = ' | '.join(evidence_items)
 
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
@@ -462,7 +480,7 @@ def detect_tech_with_evidence(
         'has_ga4': has_ga4,
         'has_gtm': has_gtm,
         'detected_technologies_list': detected,
-        'technology_evidence': ' | '.join(evidence_items) if evidence_items else 'No tracking markers detected'
+        'technology_evidence': ev_summary
     }
 
 
@@ -472,26 +490,30 @@ def classify_company_category(
     meta_desc: str,
     detected_tech: list[str]
 ) -> str:
-    """Класифікує тип бізнесу (E-commerce, Agency, Education, SaaS), щоб відокремити клієнтів від агенцій."""
     text = f'{domain} {page_title} {meta_desc}'.lower()
 
-    if domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua')) or any(
-        w in text for w in ('університет', 'university', 'college', 'академія', 'інститут', 'школа')
+    if domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua')) or any(
+        w in text for w in (
+            'університет', 'university', 'college', 'академія', 'інститут',
+            'благодійний фонд', 'charitable', 'foundation', 'ngo', 'громадська організація'
+        )
     ):
-        return 'Education / Institution'
+        return 'Non-Profit / Education / Institution'
 
     agency_keywords = (
         'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
         'онлайн-маркетинг', 'маркетингова агенція', 'seo agency', 'ppc agency',
-        'web studio', 'веб-студія', 'розробка сайтів', 'software development'
+        'web studio', 'веб-студія', 'розробка сайтів', 'software development',
+        'медіа про інтернет-маркетинг', 'netpeak', 'promodo'
     )
     if any(k in text for k in agency_keywords):
-        return 'B2B Agency / Service Provider'
+        return 'B2B Agency / Marketing Media'
 
     ecom_keywords = (
-        'інтернет-магазин', 'онлайн магазин', 'online store', 'shop', 'купити',
-        'доставка по', 'колекція', 'бренд одягу', 'бренд взуття', 'каталог товарів',
-        'checkout', 'add to cart', 'кошик'
+        'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
+        'shop', 'купити', 'купить', 'доставка по', 'колекція', 'бренд одягу',
+        'бренд взуття', 'жіночого одягу', 'женского белья', 'каталог товарів',
+        'checkout', 'add to cart', 'кошик', 'shoes', 'apparel', 'clothing'
     )
     if any(cms in detected_tech for cms in ('Shopify', 'WooCommerce')) or any(k in text for k in ecom_keywords):
         return 'E-commerce / Retail Brand'
@@ -503,35 +525,34 @@ def classify_company_category(
     return 'General Business / Corporate'
 
 
-def extract_decision_maker(text: str) -> tuple[str, str]:
-    """Шукає згадки Імені та Посади (CEO, Founder, CMO) на сторінках сайту."""
+def extract_decision_maker_clean(text: str) -> tuple[str | None, str | None]:
+    """
+    Повертає ТІЛЬКИ реальне Ім'я та Посаду або (None, None) для чистого імпорту в CRM!
+    Ніяких службових фраз у полях імені.
+    """
     match = NAME_NEAR_ROLE_PATTERN.search(text)
     if match:
         name = match.group(1).strip()
         role = match.group(2).strip()
         return name, role
-
-    role_match = DM_ROLE_PATTERN.search(text)
-    if role_match:
-        return 'Not explicitly named on site', f"Role mentioned on page ({role_match.group(1)})"
-
-    return (
-        'Not listed on public website (Generic inbox only)',
-        'Requires LinkedIn enrichment (Target: CMO / Head of E-commerce / Founder)'
-    )
+    return None, None
 
 
-def evaluate_lead_qualification(
+def evaluate_three_dimensional_qualification(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
     best_email_type: str | None,
     primary_phone: str | None,
+    dm_name: str | None,
     linkedin_url: str | None
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str]:
     """
-    Повертає 5 кваліфікаційних полів для продажу:
-    (icp_fit_score, detected_signals, sales_opportunity, signal_confidence, next_best_action)
+    Замість одного умовного 100/100 повертає три незалежні осі оцінки (як вимагає покупець):
+    1. icp_fit_tier (Хто ця компанія)
+    2. buying_signal_strength (Технічна потреба / Стек)
+    3. contact_quality_tier (Якість знайденого контакту та готовність до аутрічу)
+    + contact_enrichment_status, detected_signals, sales_opportunity, next_best_action
     """
     ad_tags = []
     if tech_info.get('has_meta_pixel'):
@@ -557,95 +578,115 @@ def evaluate_lead_qualification(
     all_signals = ad_tags + analytics_tags
     detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
 
-    # Розрахунок ICP Fit Score (0-100) для продавця маркетингових/e-commerce рішень
-    score = 0
+    # Вісь 1: ICP Fit Tier (Відповідність профілю цільового клієнта)
     if company_category == 'E-commerce / Retail Brand':
-        score += 40
-    elif company_category in ('General Business / Corporate', 'SaaS / Tech Platform'):
-        score += 25
-    elif company_category == 'B2B Agency / Service Provider':
-        score += 10  # Агенція — це партнер або конкурент, а не прямий клієнт на трафік
-
-    if len(ad_tags) >= 2:
-        score += 25
-    elif len(ad_tags) == 1:
-        score += 15
-
-    if analytics_tags:
-        score += 10
-
-    if best_email_type in ('sales', 'partnerships', 'direct_or_personal', 'general'):
-        score += 15
-    elif best_email_type in ('support', 'pr_and_media'):
-        score += 5
-
-    if primary_phone:
-        score += 10
-
-    score = min(score, 100)
-
-    if company_category == 'B2B Agency / Service Provider':
-        icp_label = f'{score}/100 (Agency / Potential Partner — Separate from Direct E-commerce Leads)'
-    elif score >= 75:
-        icp_label = f'{score}/100 (High ICP Fit — Active E-commerce / Digital Brand)'
-    elif score >= 50:
-        icp_label = f'{score}/100 (Medium ICP Fit — Needs Decision-Maker Qualification)'
+        icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
+    elif company_category in ('SaaS / Tech Platform', 'General Business / Corporate'):
+        icp_fit_tier = 'Tier 2: Secondary ICP (Corporate / Digital Business)'
+    elif company_category == 'B2B Agency / Marketing Media':
+        icp_fit_tier = 'Partner / Competitor Segment (Agency / Media — Exclude from Standard Client Outreach)'
     else:
-        icp_label = f'{score}/100 (Low ICP Fit)'
+        icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # Формування обґрунтованої Sales Opportunity залежно від категорії бізнесу
-    if company_category == 'B2B Agency / Service Provider':
-        opportunity = (
-            'Digital/Marketing Agency detected — do not pitch standard ad setup; '
-            'propose white-label partnership, data enrichment API, or B2B referral collaboration'
-        )
-    elif len(ad_tags) >= 2:
-        opportunity = (
-            f"Multi-channel ad tracking installed ({', '.join(ad_tags)}) — "
-            "pitch server-side conversion tracking (CAPI), attribution audit, or CRO to target CMO / Head of E-commerce"
+    # Вісь 2: Buying Signal Strength (Сила технічного сигналу)
+    if len(ad_tags) >= 2 and analytics_tags:
+        buying_signal = (
+            f"Strong Technical Signal: Multi-pixel ad stack ({', '.join(ad_tags)}) + { '/'.join(analytics_tags[:2]) } "
+            "(Note: confirms tracking setup, not active ad spend budget)"
         )
     elif len(ad_tags) == 1:
-        opportunity = (
-            f"Single ad pixel detected ({ad_tags[0]}) — "
-            "pitch omnichannel expansion (Google Shopping / Performance Max / TikTok) or tracking audit"
+        buying_signal = (
+            f"Moderate Technical Signal: Single ad network ({ad_tags[0]}) detected — "
+            "potential omnichannel expansion or Consent Mode hiding secondary tags"
         )
     elif analytics_tags:
+        buying_signal = (
+            f"Analytics-Only Signal ({', '.join(analytics_tags)}) — "
+            "no paid ad pixels visible in static HTML"
+        )
+    else:
+        buying_signal = (
+            'Weak / Unverified Signal: No tracking tags visible in static DOM '
+            '(may lack tracking or block scripts behind Cookie Consent)'
+        )
+
+    # Вісь 3: Contact Quality Tier & Enrichment Status (Реальна придатність контакту для B2B-продажу)
+    if dm_name and best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
+        contact_quality = 'Tier A (Decision-Maker Named + Direct Email)'
+        enrichment_status = 'verified_decision_maker_on_site'
+    elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
+        contact_quality = f'Tier B+ (Direct / Named Inbox: {best_email_type}, No Full Name on Site)'
+        enrichment_status = 'named_or_role_email_found_needs_title_match'
+    elif best_email_type == 'b2b_partnerships':
+        contact_quality = 'Tier B (B2B / Partnership Inbox — Good for Commercial/Partnership Pitch, Needs CMO Referral for Tech)'
+        enrichment_status = 'b2b_role_inbox_only_needs_linkedin_dm'
+    elif best_email_type == 'general_office_inbox':
+        contact_quality = 'Tier C (Generic Office Inbox — Suitable for Gatekeeper Routing Only)'
+        enrichment_status = 'generic_inbox_only_needs_linkedin_dm'
+    elif best_email_type in ('wholesale_or_sales_inbox', 'regional_branch'):
+        contact_quality = f'Tier C- ({best_email_type} — Merchandise/Regional Channel, Not Marketing Buyer)'
+        enrichment_status = 'non_marketing_department_inbox_needs_linkedin_dm'
+    elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'legal_or_hr'):
+        contact_quality = f'Tier D (Low Sales Fit: {best_email_type} — Do Not Cold Pitch Services Here)'
+        enrichment_status = 'support_or_pr_inbox_only_requires_dm_enrichment'
+    elif primary_phone:
+        contact_quality = 'Tier D (Phone Only — No Email Found on Public Pages)'
+        enrichment_status = 'phone_only_requires_email_and_dm_enrichment'
+    else:
+        contact_quality = 'Tier F (No Actionable Contacts Found on Website)'
+        enrichment_status = 'no_public_contacts_found'
+
+    # Комерційна гіпотеза (Sales Opportunity)
+    if company_category == 'B2B Agency / Marketing Media':
         opportunity = (
-            f"Analytics active ({', '.join(analytics_tags)}) without paid ad pixels — "
-            "pitch performance marketing launch & retargeting pixel setup"
+            'Agency/Media Segment: Pitch white-label analytics implementation, '
+            'data enrichment partnership, or B2B co-marketing'
+        )
+    elif company_category == 'Non-Profit / Education / Institution':
+        opportunity = 'Non-commercial / Institutional organization — disqualify or route to pro-bono / grant segment'
+    elif len(ad_tags) >= 2:
+        opportunity = (
+            f"Active multi-channel tracking ({', '.join(ad_tags)}) — "
+            "qualify for Server-Side GTM (CAPI), cross-channel attribution audit, or CRO"
+        )
+    elif len(ad_tags) == 1:
+        opportunity = (
+            f"Single ad pixel ({ad_tags[0]}) — "
+            "qualify for Google Ads / Meta / TikTok channel expansion & conversion tracking audit"
         )
     else:
-        opportunity = 'No analytics or ad pixels detected — pitch foundational GA4/GTM tracking setup'
+        opportunity = 'Manual site verification needed: check if tracking is blocked by Cookie Consent before pitching GA4/GTM setup'
 
-    # Окремо оцінюємо технічну достовірність і комерційну гіпотезу
-    if all_signals:
-        confidence = (
-            'Tech Data: High (Verified in DOM/GTM) | '
-            'Commercial Hypothesis: Medium (Tag presence confirms tracking setup, not active ad spend)'
-        )
-    else:
-        confidence = 'Tech Data: High | Commercial Hypothesis: Low (No active ad tags found)'
-
-    # Next Best Action для менеджера з продажу
-    if company_category == 'B2B Agency / Service Provider':
+    # Конкретний Next Best Action для SDR/Sales-менеджера
+    if company_category == 'B2B Agency / Marketing Media':
+        next_action = f"Move to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
+    elif company_category == 'Non-Profit / Education / Institution':
+        next_action = 'Exclude from commercial B2B cold outreach'
+    elif best_email_type in ('customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox', 'regional_branch'):
         next_action = (
-            f"Route to Partnership/BD flow: contact via {best_email or 'LinkedIn'} "
-            f"{'(' + linkedin_url + ')' if linkedin_url else ''} with B2B partnership offer"
-        )
-    elif best_email_type in ('pr_and_media', 'support'):
-        next_action = (
-            f"Current email ({best_email}) is {best_email_type} — avoid cold pitching here; "
-            f"call B2B phone ({primary_phone or 'N/A'}) or identify CMO / E-commerce Lead on LinkedIn first"
+            f"DO NOT send marketing pitch to {best_email} ({best_email_type}); "
+            f"enrich CMO / Head of E-commerce via LinkedIn {('(' + linkedin_url + ')') if linkedin_url else ''} "
+            f"or call {primary_phone or 'company'} to ask for Marketing Lead"
         )
     elif best_email:
         next_action = (
-            f"Send personalized audit outreach to {best_email} referencing detected stack ({detected_signals_str}) "
-            f"and follow up via phone ({primary_phone or 'N/A'})"
+            f"Send tailored audit intro to {best_email} ({best_email_type}) "
+            f"and enrich specific CMO/Head of Digital on LinkedIn in parallel"
         )
+    elif primary_phone:
+        next_action = f"Enrich decision-maker email via LinkedIn/Apollo or call {primary_phone} for routing"
     else:
-        next_action = f"Reach out via phone ({primary_phone or 'N/A'}) or social channels"
+        next_action = 'Enrich company contacts via LinkedIn Sales Navigator / external B2B database'
 
-    return icp_label, detected_signals_str, opportunity, confidence, next_action
+    return (
+        icp_fit_tier,
+        buying_signal,
+        contact_quality,
+        enrichment_status,
+        detected_signals_str,
+        opportunity,
+        next_action
+    )
 
 
 def parse_html_sync(
@@ -829,18 +870,22 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
+            cat = classify_company_category(domain_key, '', '', [])
             return {
                 'input_domain': domain_key,
                 'website_url': final_url,
                 'status': fail_status,
                 'error_message': err_msg,
-                'company_category': classify_company_category(domain_key, '', '', []),
-                'icp_fit_score': '0/100 (Unverified — Site Blocked/Unreachable)',
+                'company_category': cat,
+                'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
+                'buying_signal_strength': None,
+                'contact_quality_tier': 'Tier F (Site Blocked)',
+                'contact_enrichment_status': 'scan_blocked_by_waf',
                 'page_title': None,
                 'meta_description': None,
                 'best_email': None,
                 'best_email_type': None,
-                'email_verification_status': None,
+                'email_deliverability_check': None,
                 'email_source_url': None,
                 'primary_phone': None,
                 'phone_source_url': None,
@@ -854,8 +899,7 @@ async def process_domain(
                 'youtube_url': None,
                 'social_source_url': None,
                 'detected_signals': None,
-                'sales_opportunity': f'Site {fail_status} ({err_msg}) — cannot verify tech stack without access',
-                'signal_confidence': 'None (Access Denied / WAF Blocked)',
+                'sales_opportunity': f'Scan {fail_status} ({err_msg}) — cannot verify stack without access',
                 'next_best_action': 'Retry with residential proxy or enrich company via LinkedIn directly',
                 'technology_evidence': None,
                 'has_meta_pixel': None,
@@ -924,7 +968,10 @@ async def process_domain(
         best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email)
-        email_verification = await asyncio.to_thread(verify_email_domain_dns, best_email) if best_email else None
+        deliverability_check = (
+            await asyncio.to_thread(check_domain_deliverability_status, best_email)
+            if best_email else None
+        )
 
         primary_phone = sorted_phones_with_src[0][0] if sorted_phones_with_src else None
         phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
@@ -939,17 +986,27 @@ async def process_domain(
         company_category = classify_company_category(
             domain_key, page_title, meta_desc, detected_tech_list
         )
-        dm_name, dm_role = extract_decision_maker(' '.join(combined_text_parts))
+
+        # Чисте витягнення Імені та Посади (або None, None без засмічення CRM-полів)
+        dm_name, dm_role = extract_decision_maker_clean(' '.join(combined_text_parts))
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
-            icp_fit_score,
+            icp_fit_tier,
+            buying_signal_strength,
+            contact_quality_tier,
+            enrichment_status,
             detected_signals,
             sales_opportunity,
-            signal_confidence,
             next_best_action
-        ) = evaluate_lead_qualification(
-            company_category, tech_info, best_email, best_email_type, primary_phone, linkedin_url
+        ) = evaluate_three_dimensional_qualification(
+            company_category,
+            tech_info,
+            best_email,
+            best_email_type,
+            primary_phone,
+            dm_name,
+            linkedin_url
         )
 
         has_any_contact = bool(best_email or primary_phone or socials_with_source)
@@ -964,12 +1021,15 @@ async def process_domain(
             'status': final_status,
             'error_message': '',
             'company_category': company_category,
-            'icp_fit_score': icp_fit_score,
+            'icp_fit_tier': icp_fit_tier,
+            'buying_signal_strength': buying_signal_strength,
+            'contact_quality_tier': contact_quality_tier,
+            'contact_enrichment_status': enrichment_status,
             'page_title': page_title,
             'meta_description': meta_desc,
             'best_email': best_email,
             'best_email_type': best_email_type,
-            'email_verification_status': email_verification,
+            'email_deliverability_check': deliverability_check,
             'email_source_url': email_source_url,
             'primary_phone': primary_phone,
             'phone_source_url': phone_source_url,
@@ -984,7 +1044,6 @@ async def process_domain(
             'social_source_url': social_source_url,
             'detected_signals': detected_signals,
             'sales_opportunity': sales_opportunity,
-            'signal_confidence': signal_confidence,
             'next_best_action': next_best_action,
             'technology_evidence': tech_info['technology_evidence'],
             'has_meta_pixel': tech_info['has_meta_pixel'],
@@ -1057,9 +1116,8 @@ async def main() -> None:
 
                 Actor.log.info(
                     f"[{result['status'].upper()}] {result['input_domain']} | "
-                    f"Category: {result['company_category']} | "
-                    f"ICP: {result['icp_fit_score']} | "
-                    f"Phone: {result['primary_phone'] or '-'}"
+                    f"{result['icp_fit_tier']} | "
+                    f"Contact: {result['contact_quality_tier']}"
                 )
 
                 if len(batch) >= batch_size:
