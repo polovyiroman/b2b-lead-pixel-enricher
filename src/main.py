@@ -12,18 +12,39 @@ from bs4 import BeautifulSoup
 from apify import Actor
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
-GA4_ID_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12}\b')
+
+# П.1: Тільки верифіковані контекстні регулярки для GA4 (без сліпого \bG-[A-Z0-9]+\b, який ловив JS-хеші!)
 GTAG_CONFIG_GA4_REGEX = re.compile(
     r"gtag\(\s*['\"]config['\"]\s*,\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})['\"]",
     re.IGNORECASE
 )
+GA4_SCRIPT_SRC_REGEX = re.compile(
+    r"googletagmanager\.com/gtag/js\?[^'\"\s>]*?\bid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
+    re.IGNORECASE
+)
+GA4_WIRE_REGEX = re.compile(
+    r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
+    re.IGNORECASE
+)
+GTM_JSON_GA4_REGEX = re.compile(
+    r"(?:['\"](?:measurement_id|tag_id|send_to|ga_measurement_id)['\"]\s*:\s*['\"]|['\"]vtp_measurementId['\"]\s*,\s*['\"])"
+    r"(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})['\"]",
+    re.IGNORECASE
+)
+
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
+
+# П.7: Детект редіректів на технічні піддомени оплати/чекауту (кейс us.checkout.gymshark.com)
+CHECKOUT_REDIRECT_HOSTS = re.compile(
+    r'^(?:[a-z]{2}\.)?(?:checkout|cart|pay|secure|billing)\.',
+    re.IGNORECASE
+)
 
 SOFT_404_TITLE_REGEX = re.compile(
     r'^\s*(?:404|error\s*404|page\s*not\s*found|not\s*found|'
@@ -32,7 +53,6 @@ SOFT_404_TITLE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Вузький чорний список: лише privacy/cookie/gdpr; оферти та послуги дозволені для пошуку ФОП/власників
 DM_SOURCE_BLACKLIST = re.compile(
     r'/(?:privacy|policy|datenschutz|gdpr|cookie|dmca)\b',
     re.IGNORECASE
@@ -293,6 +313,17 @@ SOCIAL_BAD_SEGMENTS = {
     'legal', 'login', 'signin', 'signup', 'hashtag', 'search', 'discover', 'about'
 }
 
+REGION_DIALING_PREFIX_MAP = {
+    'UA': '+380',
+    'US': '+1',
+    'CA': '+1',
+    'GB': '+44',
+    'UK': '+44',
+    'PL': '+48',
+    'DE': '+49',
+    'FR': '+33'
+}
+
 DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
 
 
@@ -303,7 +334,11 @@ def sanitize_kv_key(domain: str) -> str:
 def clean_url_port(url: str | None) -> str | None:
     if not url:
         return None
-    return re.sub(r':(?:443|80)(?=/|$)', '', url)
+    cleaned = re.sub(r':(?:443|80)(?=/|$)', '', url)
+    parsed = urlparse(cleaned)
+    if not parsed.path:
+        cleaned = f'{cleaned}/'
+    return cleaned
 
 
 def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
@@ -373,7 +408,6 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
     tokens = [t for t in re.split(r'[._+-]', local) if t]
     first_token = tokens[0] if tokens else local
 
-    # Спеціальний клас для brand webmail (наприклад service.vovk@gmail.com)
     if domain in PUBLIC_WEBMAIL_DOMAINS and brand_token and brand_token in normalized_local:
         if (
             normalized_local.startswith(SUPPORT_PREFIXES)
@@ -755,7 +789,6 @@ def score_phone_context(context_text: str) -> int:
 
 
 def is_junk_phone(e164: str) -> bool:
-    """Відсікає тестові номери-заглушки на кшталт +380441234567."""
     digits = re.sub(r'\D', '', e164)
     if not digits:
         return True
@@ -771,9 +804,14 @@ def extract_valid_phones(
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
 ) -> list[tuple[str, int]]:
+    """
+    П.8: Додає бонус +15 балів телефонам, які відповідають коду країни цільового регіону
+    (напр. +380 для UA), щоб локальні B2B-номери завжди стояли вище за закордонні представництва.
+    """
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
+    preferred_prefix = REGION_DIALING_PREFIX_MAP.get(default_region.upper(), '')
 
     for raw_tel, context in raw_tel_candidates:
         try:
@@ -785,7 +823,8 @@ def extract_valid_phones(
                 formatted = phonenumbers.format_number(
                     parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL
                 )
-                ctx_score = 10 + score_phone_context(context)
+                region_bonus = 15 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
+                ctx_score = 10 + region_bonus + score_phone_context(context)
                 if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
                     phone_scores[formatted] = ctx_score
                 if formatted not in phone_order:
@@ -805,7 +844,8 @@ def extract_valid_phones(
             start_idx = max(0, match.start - 90)
             end_idx = min(len(text), match.end + 90)
             context = text[start_idx:end_idx]
-            ctx_score = score_phone_context(context)
+            region_bonus = 15 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
+            ctx_score = region_bonus + score_phone_context(context)
 
             if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
                 phone_scores[formatted] = ctx_score
@@ -820,16 +860,25 @@ def extract_valid_phones(
     return [(p, phone_scores[p]) for p in sorted_phones[:10]]
 
 
+def extract_verified_ga4_ids(text_blob: str) -> list[str]:
+    """
+    П.1: Витягує ТІЛЬКИ 100% підтверджені GA4 ID з явних викликів gtag('config'),
+    скриптів googletagmanager.com/gtag/js?id=, wire-протоколу g/collect?tid=
+    та JSON-конфігурації GTM (measurement_id / tag_id / send_to), ігноруючи випадкові G-* хеші!
+    """
+    found = set()
+    for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX, GTM_JSON_GA4_REGEX):
+        for m in rx.findall(text_blob):
+            found.add(m.upper())
+    return sorted(found)
+
+
 def detect_tech_with_evidence(
     html: str,
     gtm_js: str,
     gtm_ids: list[str],
     page_url: str
 ) -> dict:
-    """
-    Використовує sorted() для 100% стабільності GA4 та AW ID між запусками
-    та зберігає всі GA4 ID в окреме поле all_ga4_ids.
-    """
     clean_gtm = gtm_js.replace('\\/', '/')
     html_lower = html.lower().replace('\\/', '/')
     gtm_lower = clean_gtm.lower()
@@ -846,15 +895,15 @@ def detect_tech_with_evidence(
         ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js)'
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
 
-    ga4_cfg_html = sorted({m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html)})
-    ga4_cfg_gtm = sorted({m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(clean_gtm)})
-    ga4_in_html = ga4_cfg_html or sorted({m.upper() for m in GA4_ID_REGEX.findall(html)})
-    ga4_in_gtm = ga4_cfg_gtm or sorted({m.upper() for m in GA4_ID_REGEX.findall(clean_gtm)})
+    ga4_in_html = extract_verified_ga4_ids(html)
+    ga4_in_gtm = extract_verified_ga4_ids(clean_gtm)
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
         or 'google-analytics.com/g/collect' in html_lower
         or 'google-analytics.com/g/collect' in gtm_lower
+        or 'googletagmanager.com/gtag/js' in html_lower
+        or 'googletagmanager.com/gtag/js' in gtm_lower
     )
     if has_ga4:
         detected.append('Google Analytics (GA4)')
@@ -863,7 +912,7 @@ def detect_tech_with_evidence(
         elif ga4_in_gtm:
             evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
         else:
-            evidence_items.append('GA4 (g/collect endpoint)')
+            evidence_items.append('GA4 (gtag.js / g/collect script)')
 
     aw_in_html = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(html)})
     aw_in_gtm = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(clean_gtm)})
@@ -1011,9 +1060,8 @@ def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool]:
     """
-    Повертає 5 чистих значень:
-    (decision_maker_name, decision_maker_role, decision_maker_linkedin_url, decision_maker_source_url, dm_source_is_legal)
-    Спочатку шукає на бізнес-сторінках (/about, /contacts, /team), а в кінці — у публічних офертах (ФОП).
+    П.2: Для ФОП-фолбеку тепер виконується реальна перевірка DM_LEGAL_SOURCE_FLAG
+    замість захардкодженого True (brabrabra.ua/ua/our-services/ -> is_leg=False).
     """
     candidate_li_urls = []
 
@@ -1081,21 +1129,20 @@ def extract_decision_maker_deep(
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
                 return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
 
-    # Пошук ФОП (Registered Business Owner) як надійний фолбек, якщо не знайдено CMO/CEO
     for page_url, _, page_text in pages_with_urls:
         if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
             continue
+        is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, 'Registered Business Owner / ФОП', matched_li, clean_url_port(page_url), True
+                return cand_name, 'Registered Business Owner / ФОП', matched_li, clean_url_port(page_url), is_leg
 
     return None, None, None, None, False
 
 
 def build_linkedin_xray_query(canonical_domain: str, company_category: str = '') -> str:
-    """Адаптує пошукові ролі для комерційних компаній vs NGO/університетів."""
     brand_root = canonical_domain.split('.')[0].capitalize()
     if company_category == 'Non-Profit / Education / Institution':
         return (
@@ -1109,7 +1156,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v42(
+def evaluate_qualification_v50(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1146,16 +1193,19 @@ def evaluate_qualification_v42(
 
     all_signals = ad_tags + analytics_tags
     detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
+    is_agency = (company_category == 'B2B Agency / Marketing Media')
 
+    # 1. ICP Fit Tier
     if company_category == 'E-commerce / Retail Brand':
         icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
     elif company_category in ('SaaS / Marketplace / Tech Platform', 'General Business / Corporate'):
         icp_fit_tier = f'Tier 2: Secondary ICP ({company_category})'
-    elif company_category == 'B2B Agency / Marketing Media':
+    elif is_agency:
         icp_fit_tier = 'Partner / Competitor Segment (Agency / Media — Exclude from Standard Client Outreach)'
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
+    # 2. Technical Signal Strength
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
@@ -1177,11 +1227,31 @@ def evaluate_qualification_v42(
             '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
+    # 3. Contact Quality Tier & Warnings (П.5 & П.9: Окрема логіка для агенцій без зайвих попереджень)
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
 
-    if dm_name and is_same_person_email:
+    if is_agency:
+        if dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
+            contact_quality = (
+                f'Agency Partner Contact (Named Staff Inbox {best_email} Found, '
+                f'Different from Listed Executive {dm_name})'
+            )
+            enrichment_status = 'agency_partner_unmatched_executive_and_staff_email'
+            confidence_warning = (
+                f'Warning: Email {best_email} belongs to a different person than '
+                f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.'
+            )
+        elif dm_name:
+            contact_quality = f'Agency Partner Contact (Executive {dm_name} Identified — Route to Partner Pipeline)'
+            enrichment_status = 'agency_partner_executive_identified'
+            confidence_warning = 'None'
+        else:
+            contact_quality = f'Agency Partner Contact ({best_email or "General Channel"} — Route to Partner Pipeline)'
+            enrichment_status = 'agency_partner_channel'
+            confidence_warning = 'None'
+    elif dm_name and is_same_person_email:
         contact_quality = f'Tier A (Verified Match: {dm_name} + Direct Personal Email)'
         enrichment_status = 'verified_decision_maker_and_matching_email'
         confidence_warning = legal_note.strip() or 'None'
@@ -1261,10 +1331,15 @@ def evaluate_qualification_v42(
         enrichment_status = 'no_public_contacts_found'
         confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
+    # 4. П.4 & П.6: Узгоджений Sales Readiness Verdict (без "Tech-Qualified", коли tech=0, і з підтримкою відомого власника)
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
-    elif company_category == 'B2B Agency / Marketing Media':
+    elif is_agency:
         readiness_verdict = 'Partner Pipeline Only (Agency / Media Segment)'
+    elif not all_signals and not best_email and not primary_phone:
+        readiness_verdict = 'Unqualified (No Tech Signals & No Actionable Contacts — Needs Manual Review)'
+    elif not all_signals:
+        readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
     elif dm_name and is_same_person_li:
@@ -1273,12 +1348,17 @@ def evaluate_qualification_v42(
         readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif best_email_type == 'b2b_partnerships':
         readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
+    elif enrichment_status == 'owner_identified_paired_with_brand_webmail':
+        readiness_verdict = f'Gatekeeper-Ready + Owner Known ({dm_name} Identified — Route via Brand Webmail or LinkedIn)'
+    elif dm_name and best_email_type == 'general_office_inbox':
+        readiness_verdict = f'Gatekeeper-Ready + DM Known ({dm_name} Identified — Route via Office Inbox or LinkedIn)'
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
-        readiness_verdict = 'Gatekeeper-Ready Only (Office/Brand Inbox — Needs DM Lookup for Cold Outbound)'
+        readiness_verdict = 'Gatekeeper-Ready Only (Office/Brand Inbox — Locate DM on LinkedIn Before Cold Outbound)'
     else:
         readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn DM Enrichment Before Outbound)'
 
-    if company_category == 'B2B Agency / Marketing Media':
+    # 5. Sales Opportunity
+    if is_agency:
         opportunity = (
             'Agency/Media Segment: Explore white-label analytics partnership, '
             'data enrichment API integration, or B2B referral collaboration'
@@ -1298,10 +1378,13 @@ def evaluate_qualification_v42(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    if company_category == 'B2B Agency / Marketing Media':
+    # 6. П.10: Уніфікований Next Best Action (без суперечності між Gatekeeper-Ready та "Send discovery audit")
+    if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
+    elif not all_signals and not best_email and not primary_phone:
+        next_action = 'Skip or review website manually (no tech signals or contacts detected)'
     elif dm_name and is_same_person_li:
         next_action = (
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url} "
@@ -1309,21 +1392,28 @@ def evaluate_qualification_v42(
         )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
-        'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox'
+        'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox',
+        'department_or_general_inbox'
     ):
         next_action = (
-            f"DO NOT send marketing pitch to {best_email} ({best_email_type}); "
-            f"use decision_maker_search_query on LinkedIn or call {primary_phone or 'company'} to reach Marketing Lead"
+            f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
+            f"locate Marketing Lead via decision_maker_search_query on LinkedIn or call {primary_phone or 'company'}"
         )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
             f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics, "
             f"or locate CMO via decision_maker_search_query"
         )
-    elif best_email:
+    elif best_email_type == 'marketing_or_exec_role':
         next_action = (
-            f"Send discovery audit intro to {best_email} ({best_email_type}) "
-            f"and use decision_maker_search_query to connect with CMO/Head of E-commerce on LinkedIn"
+            f"Send tailored discovery audit offer to {best_email} ({best_email_type}) "
+            f"referencing detected stack ({detected_signals_str})"
+        )
+    elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
+        dm_hint = f" ({dm_name})" if dm_name else ""
+        next_action = (
+            f"Locate CMO / Head of E-commerce{dm_hint} via decision_maker_search_query on LinkedIn first; "
+            f"use {best_email} only for warm gatekeeper routing / referral request"
         )
     elif primary_phone:
         next_action = f"Use decision_maker_search_query on LinkedIn or call {primary_phone} for routing"
@@ -1422,7 +1512,7 @@ def parse_html_sync(
 
         if base_domain and link_domain == base_domain and parsed.scheme in ('http', 'https'):
             normalized_link = clean_url_port(f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}")
-            if not normalized_link or normalized_link == base_clean:
+            if not normalized_link or normalized_link.rstrip('/') == base_clean:
                 continue
 
             if any(k in path_lower for k in PRIMARY_CONTACT_KEYWORDS):
@@ -1505,10 +1595,10 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
 
     if not found_urls:
         found_urls = [
-            f'{base_root}/contacts',
-            f'{base_root}/kontakty',
-            f'{base_root}/about',
-            f'{base_root}/pro-nas'
+            f'{base_root}/contacts/',
+            f'{base_root}/kontakty/',
+            f'{base_root}/about/',
+            f'{base_root}/pro-nas/'
         ]
     return found_urls
 
@@ -1520,21 +1610,26 @@ async def fetch_html_safely(
     timeout: float = 15.0,
     retries: int = 4
 ) -> tuple[int, str, str, str]:
+    """
+    П.7: Якщо сервер редіректить на піддомен чекауту (us.checkout.gymshark.com),
+    перехоплює це і запитує www-версію основного домену без переходу в чекаут.
+    """
     last_error = ''
     impersonations = ['chrome', 'safari', 'chrome110', 'chrome']
+    current_target_url = url
 
     for attempt in range(retries):
         imp = impersonations[min(attempt, len(impersonations) - 1)]
         req_headers = {
-            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://www.google.com.ua/',
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-GB;q=0.8,en;q=0.7',
+            'Referer': 'https://www.google.com/',
             'Upgrade-Insecure-Requests': '1'
         }
         use_proxy = None
         if attempt >= 1 and proxy_config is not None:
             try:
                 use_proxy = await proxy_config.new_url(
-                    session_id=f"retry_{attempt}_{abs(hash(url)) % 100000}"
+                    session_id=f"retry_{attempt}_{abs(hash(current_target_url)) % 100000}"
                 )
             except Exception:
                 use_proxy = None
@@ -1542,7 +1637,7 @@ async def fetch_html_safely(
         try:
             async with client.stream(
                 'GET',
-                url,
+                current_target_url,
                 headers=req_headers,
                 impersonate=imp,
                 proxy=use_proxy,
@@ -1550,6 +1645,13 @@ async def fetch_html_safely(
             ) as resp:
                 status = resp.status_code
                 final_url = clean_url_port(str(resp.url)) or str(resp.url)
+                final_host = urlparse(final_url).netloc.lower()
+
+                # П.7: Якщо редірект викинув нас на checkout.domain.com, пробуємо www.canonical
+                if CHECKOUT_REDIRECT_HOSTS.match(final_host) and attempt == 0:
+                    clean_canon = get_clean_canonical_domain(final_url, urlparse(url).netloc)
+                    current_target_url = f'https://www.{clean_canon}/'
+                    continue
 
                 if status in (403, 429, 502, 503, 504) and attempt < retries - 1:
                     await asyncio.sleep(1.0 * (attempt + 1))
@@ -1591,7 +1693,7 @@ async def fetch_html_safely(
             if attempt < retries - 1:
                 await asyncio.sleep(1.0)
 
-    return 0, '', url, last_error or 'Connection failed'
+    return 0, '', current_target_url, last_error or 'Connection failed'
 
 
 async def fetch_gtm_scripts(
@@ -1650,6 +1752,7 @@ async def process_domain(
         parsed_final = urlparse(final_url)
         scheme = parsed_final.scheme or 'https'
         clean_website_url = f'{scheme}://{canonical_domain}/'
+        normalized_final_redirect = clean_url_port(final_url) or clean_website_url
         canonical_kv_key = sanitize_kv_key(canonical_domain)
         input_kv_key = sanitize_kv_key(domain_key)
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
@@ -1684,7 +1787,7 @@ async def process_domain(
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
                 'website_url': clean_website_url,
-                'final_redirect_url': final_url,
+                'final_redirect_url': normalized_final_redirect,
                 'status': fail_status,
                 'error_message': err_msg,
                 'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
@@ -1693,7 +1796,7 @@ async def process_domain(
                 'technical_signal_strength': None,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
-                'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached v3 snapshot available.',
+                'data_confidence_warning': f'Site blocked by WAF/Cloudflare and no prior cached v{CACHE_SCHEMA_VERSION} snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
                 'page_title': None,
                 'meta_description': None,
@@ -1746,12 +1849,13 @@ async def process_domain(
             socials_with_source,
             contact_links
         ) = await loop.run_in_executor(
-            thread_pool, parse_html_sync, html, final_url, default_region
+            thread_pool, parse_html_sync, html, normalized_final_redirect, default_region
         )
 
         homepage_was_soft_404 = is_soft_404_page(html, page_title)
         if homepage_was_soft_404:
             page_title = ''
+            meta_desc = ''
 
         if unpack_gtm:
             gtm_ids, gtm_js = await fetch_gtm_scripts(client, html)
@@ -1762,14 +1866,14 @@ async def process_domain(
             })
             gtm_js = ''
 
-        tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, final_url)
+        tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect)
 
         phone_map: dict[str, tuple[int, str]] = {}
         for p, sc, src in phones_with_source:
             if p not in phone_map or sc > phone_map[p][0]:
                 phone_map[p] = (sc, src)
 
-        pages_with_urls = [(final_url, html, main_text)]
+        pages_with_urls = [(normalized_final_redirect, html, main_text)]
         base_root = f"{scheme}://{re.sub(r':\d+$', '', parsed_final.netloc) or canonical_domain}"
 
         disallowed_paths, crawl_delay = await load_robots_rules(client, base_root)
@@ -1794,11 +1898,13 @@ async def process_domain(
                     if is_soft_404_page(sub_html, sub_title):
                         continue
 
-                    # Ніколи не перезаписуємо page_title головної сторінки підсторінками (крім випадку, коли головна була Soft-404)
-                    if homepage_was_soft_404 and not page_title and sub_title:
-                        page_title = sub_title
-                    if not meta_desc and sub_desc:
-                        meta_desc = sub_desc
+                    # П.3: Уніфікований захист page_title та meta_desc головної сторінки (беремо з підсторінки тільки якщо головна була Soft-404)
+                    if homepage_was_soft_404:
+                        if not page_title and sub_title:
+                            page_title = sub_title
+                        if not meta_desc and sub_desc:
+                            meta_desc = sub_desc
+
                     pages_with_urls.append((sub_final_url, sub_html, sub_text))
                     for em, src in sub_e.items():
                         email_sources.setdefault(em, src)
@@ -1873,7 +1979,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v42(
+        ) = evaluate_qualification_v50(
             company_category,
             tech_info,
             best_email,
@@ -1896,7 +2002,7 @@ async def process_domain(
             'input_domain': domain_key,
             'canonical_domain': canonical_domain,
             'website_url': clean_website_url,
-            'final_redirect_url': final_url,
+            'final_redirect_url': normalized_final_redirect,
             'status': final_status,
             'error_message': '',
             'sales_readiness_verdict': sales_readiness_verdict,
@@ -2033,7 +2139,8 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                        f"DM: {result['decision_maker_name'] or '-'} ({result['decision_maker_role'] or '-'}) | "
+                        f"GA4: {result['all_ga4_ids'] or '-'} | "
+                        f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
                     )
 
