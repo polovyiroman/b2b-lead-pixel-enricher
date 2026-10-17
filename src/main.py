@@ -13,14 +13,14 @@ from bs4 import BeautifulSoup
 from apify import Actor
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Строгий патерн для 10-символьних GA4 ID після G- (мінімум одна цифра й одна літера)
+# Строгий 10-символьний патерн GA4 ID після G- (мінімум одна цифра й одна літера)
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
 GTAG_CONFIG_GA4_REGEX = re.compile(
@@ -35,7 +35,6 @@ GA4_WIRE_REGEX = re.compile(
     r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
     re.IGNORECASE
 )
-# Тільки специфічні GA4-ключі у GTM (прибрано загальний 'value', який давав false positives)
 GTM_JSON_GA4_REGEX = re.compile(
     r"['\"](?:vtp_)?(?:measurement_?[Ii]d(?:Override)?|tag_?[Ii]d|send_?[Tt]o|"
     r"ga_measurement_?[Ii]d)['\"]\s*[:,\s]\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{8,12})['\"]",
@@ -228,7 +227,6 @@ SUPPORT_PREFIXES = (
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand', 'events'
 )
-# П.2: Додано data, datarequest, privacyrequest, dpo у LOW_PRIORITY_PREFIXES (виправляє data@gymshark.com)
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
@@ -305,8 +303,11 @@ CMS_HTML_ONLY_SIGNATURES = {
     'Squarespace': ['static1.squarespace.com', 'squarespace-cdn.com']
 }
 
+# Розширений список маркерів Cookie Consent та Privacy API (включно з Shopify Customer Privacy, Pandectes, OneTrust)
 COOKIE_CONSENT_MARKERS = (
-    'cookiebot', 'onetrust', 'cookiefirst', 'usercentrics', 'complianz', 'cookieyes', 'didomi'
+    'cookiebot', 'onetrust', 'cookiefirst', 'usercentrics', 'complianz',
+    'cookieyes', 'didomi', 'pandectes', 'shopify.customerprivacy',
+    'consent-banner', 'cookie-consent', 'osano', 'trustarc', 'iubenda'
 )
 
 SOCIAL_BAD_SEGMENTS = {
@@ -559,7 +560,6 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None
 ) -> str | None:
-    """П.4: Розпізнає Proofpoint Enterprise, Mimecast, Barracuda та Cloudflare Email Routing."""
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -870,46 +870,54 @@ def extract_valid_phones(
 
 
 def extract_verified_html_ga4_ids(html: str) -> list[str]:
-    """Tier 1: Витягує 100% підтверджені GA4 ID безпосередньо з HTML (gtag config, script src, wire protocol)."""
-    found = []
+    """Tier 1: Витягує 100% підтверджені GA4 ID з HTML строго за позицією їх першої появи у коді."""
+    pos_map: dict[str, int] = {}
     for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
-        for m in rx.findall(html):
-            gid = m.upper()
-            if gid not in found:
-                found.append(gid)
-    return found
+        for m in rx.finditer(html):
+            gid = m.group(1).upper()
+            pos = m.start()
+            if gid not in pos_map or pos < pos_map[gid]:
+                pos_map[gid] = pos
+    return sorted(pos_map.keys(), key=lambda g: pos_map[g])
 
 
-def extract_gtm_ga4_ids(gtm_js: str) -> list[str]:
+def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], list[str]]:
     """
-    П.1 & П.3 (Tier 2): Витягує GA4 ID з GTM-контейнера без false-positives:
-    1) Спочатку шукає точні ключі GTM (measurementId, tagId, sendTo) — cap 2.
-    2) Якщо немає — застосовує поріг частоти >= 3, сортуючи за спаданням частоти (-counts[m]) — cap 2.
-    3) Якщо в усьому контейнері лише 1 унікальний G-ID (компактний GTM-макрос), повертає його.
+    П.1 & П.2: 100% детермінований вибір GA4 ID у GTM за позицією першого входження (first_pos),
+    а не за випадковим count!
+    Повертає кортеж: (context_hits, freq_fallback_hits).
     """
     if not gtm_js:
-        return []
+        return [], []
 
-    strict_matches = [m.upper() for m in GA4_STRICT_10CHAR_REGEX.findall(gtm_js)]
-    counts = Counter(strict_matches)
-
-    context_hits = set()
+    # 1. Явні контекстні ключі GTM (measurementId, tagId, sendTo, gtag('config')) за позицією першої появи
+    ctx_pos_map: dict[str, int] = {}
     for rx in (GTM_JSON_GA4_REGEX, GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
-        for m in rx.findall(gtm_js):
-            context_hits.add(m.upper())
+        for m in rx.finditer(gtm_js):
+            gid = m.group(1).upper()
+            pos = m.start()
+            if gid not in ctx_pos_map or pos < ctx_pos_map[gid]:
+                ctx_pos_map[gid] = pos
 
-    if context_hits:
-        # Сортуємо спочатку за частотою в GTM (справжній головний ID зустрічається найчастіше), потім за алфавітом
-        return sorted(context_hits, key=lambda x: (-counts.get(x, 0), x))[:2]
+    context_ordered = sorted(ctx_pos_map.keys(), key=lambda g: ctx_pos_map[g])
 
-    freq_hits = [m for m, c in counts.items() if c >= 3]
-    if freq_hits:
-        return sorted(freq_hits, key=lambda x: (-counts[x], x))[:2]
+    # 2. Частотний фолбек (для макросів GTM), також відсортований строго за позицією першого входження в gtm.js!
+    strict_matches = []
+    first_pos: dict[str, int] = {}
+    for m in GA4_STRICT_10CHAR_REGEX.finditer(gtm_js):
+        gid = m.group(0).upper()
+        strict_matches.append(gid)
+        if gid not in first_pos:
+            first_pos[gid] = m.start()
 
-    if len(counts) == 1:
-        return list(counts.keys())
+    counts = Counter(strict_matches)
+    freq_candidates = [gid for gid, c in counts.items() if c >= 2]
+    freq_ordered = sorted(freq_candidates, key=lambda g: first_pos.get(g, 10**9))
 
-    return []
+    if not freq_ordered and len(counts) == 1:
+        freq_ordered = list(counts.keys())
+
+    return context_ordered[:1], freq_ordered[:1]
 
 
 def detect_tech_with_evidence(
@@ -926,7 +934,7 @@ def detect_tech_with_evidence(
     detected = []
     evidence_items = []
 
-    has_cookie_banner = any(cm in html_lower for cm in COOKIE_CONSENT_MARKERS)
+    has_cookie_banner = any(cm in html_lower or cm in gtm_lower for cm in COOKIE_CONSENT_MARKERS)
 
     has_gtm = bool(gtm_ids) or 'googletagmanager.com/gtm.js' in html_lower
     if has_gtm:
@@ -935,7 +943,8 @@ def detect_tech_with_evidence(
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
 
     ga4_in_html = extract_verified_html_ga4_ids(html)
-    ga4_in_gtm = extract_gtm_ga4_ids(clean_gtm)
+    ga4_ctx_gtm, ga4_freq_gtm = extract_gtm_ga4_ids(clean_gtm)
+    ga4_in_gtm = ga4_ctx_gtm or ga4_freq_gtm
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
@@ -985,23 +994,25 @@ def detect_tech_with_evidence(
             detected.append(cms_name)
             evidence_items.append(f"{cms_name} ('{matched_cms}' in Direct HTML)")
 
+    has_any_tracking = has_gtm or has_ga4 or has_google_ads or any(
+        t in detected for t in AD_AND_ANALYTICS_SIGNATURES
+    )
+
+    # П.4: Якщо знайдено лише CMS (як Shopify на gymshark.com), але трекінгу в статиці немає і є Consent Mode — додаємо явну підказку!
     if not evidence_items:
         if has_cookie_banner:
-            ev_summary = 'No static tags visible (Consent Mode / Cookie banner detected; tags may fire post-consent)'
+            ev_summary = 'No static tags visible (Consent Mode / Cookie banner detected; tags likely fire post-consent)'
         else:
             ev_summary = 'No tracking markers detected in static HTML'
     else:
+        if not has_any_tracking and has_cookie_banner:
+            evidence_items.append(
+                'Consent-gated tracking likely (Cookie Consent / Privacy API detected; pixels fire post-consent)'
+            )
         ev_summary = ' | '.join(evidence_items)
 
-    # П.1: HTML-first ordering для all_ga4_ids (ніколи не перезаписуємо прямий HTML-ID евристичними GTM-ID)
-    all_ga4_list: list[str] = []
-    for gid in ga4_in_html:
-        if gid not in all_ga4_list and len(all_ga4_list) < 3:
-            all_ga4_list.append(gid)
-    if not all_ga4_list:
-        for gid in ga4_in_gtm:
-            if gid not in all_ga4_list and len(all_ga4_list) < 2:
-                all_ga4_list.append(gid)
+    # П.1 & П.2: Чистий детермінований all_ga4_ids (HTML first -> GTM context -> GTM first-pos primary) без зайвих хвостів
+    all_ga4_list = ga4_in_html[:2] if ga4_in_html else ga4_in_gtm[:1]
 
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
@@ -1199,7 +1210,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v70(
+def evaluate_qualification_v80(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -2028,7 +2039,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v70(
+        ) = evaluate_qualification_v80(
             company_category,
             tech_info,
             best_email,
@@ -2044,7 +2055,12 @@ async def process_domain(
         has_any_contact = bool(best_email or primary_phone or socials_with_source)
         final_status = 'success' if has_any_contact else 'no_contacts_found'
 
-        all_emails_list = [em for em, _ in ranked_emails_with_src[:5]]
+        # П.3: Прибираємо legal_or_hr_inbox (data@, dpo@, job@) з all_emails, якщо є інші ділові пошти
+        non_legal_emails = [
+            em for em, _ in ranked_emails_with_src
+            if classify_email_type(em, brand_token) != 'legal_or_hr_inbox'
+        ]
+        all_emails_list = (non_legal_emails or [em for em, _ in ranked_emails_with_src])[:5]
         all_phones_list = [p for p, _ in sorted_phones_with_src]
 
         result_record = {
@@ -2062,7 +2078,7 @@ async def process_domain(
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
             'gdpr_eu_domain': is_eu_gdpr,
-            'page_title': page_title or None,
+            'page_title': page_title or canonical_domain,
             'meta_description': meta_desc or None,
             'best_email': best_email,
             'email_domain': email_domain,
