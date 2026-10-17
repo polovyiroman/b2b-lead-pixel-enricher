@@ -12,7 +12,6 @@ import phonenumbers
 from bs4 import BeautifulSoup
 from apify import Actor
 
-# Опціональний імпорт Playwright: якщо встановлений у Docker-образі — надає JS-рендер для SPA та клік по Cookie Banner
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_INSTALLED = True
@@ -20,8 +19,14 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 8
-MIN_COMPATIBLE_CACHE_SCHEMA = 8
+CACHE_SCHEMA_VERSION = 9
+MIN_COMPATIBLE_CACHE_SCHEMA = 9
+
+# П.3 & П.5: Семафор (максимум 2 одночасні вкладки) та глобальний Singleton Browser для захисту від OOM
+PW_SEMAPHORE = asyncio.Semaphore(2)
+_PW_INIT_LOCK = asyncio.Lock()
+_PW_INSTANCE = None
+_PW_BROWSER = None
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(
@@ -316,7 +321,7 @@ CMS_HTML_ONLY_SIGNATURES = {
 COOKIE_CONSENT_MARKERS = (
     'cookiebot', 'onetrust', 'cookiefirst', 'usercentrics', 'complianz',
     'cookieyes', 'didomi', 'pandectes', 'shopify.customerprivacy',
-    'consent-banner', 'cookie-consent', 'osano', 'trustarc', 'iubenda'
+    'shopify-pc__banner', 'consent-banner', 'cookie-consent', 'osano', 'trustarc', 'iubenda'
 )
 
 SOCIAL_BAD_SEGMENTS = {
@@ -890,9 +895,6 @@ def extract_verified_html_ga4_ids(html: str) -> list[str]:
 
 
 def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], bool, str]:
-    """
-    П.5: Повертає (ga4_ids_list, is_multi_property, confidence_level).
-    """
     if not gtm_js:
         return [], False, 'None'
 
@@ -968,7 +970,6 @@ def detect_tech_with_evidence(
             ga4_confidence = gtm_ga4_conf
             if is_multi_ga4 and len(ga4_in_gtm) >= 2:
                 preview_ids = ', '.join(ga4_in_gtm[:3])
-                # П.4: Явна позначка (+N more), коли в контейнері більше 3 ID (кейс meest.com)
                 if len(ga4_in_gtm) > 3:
                     preview_ids += f', ... (+{len(ga4_in_gtm) - 3} more)'
                 evidence_items.append(
@@ -1245,7 +1246,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v100(
+def evaluate_qualification_v110(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1326,7 +1327,7 @@ def evaluate_qualification_v100(
             '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
-    # 3. Contact Quality Tier & Warnings (П.7: Консистентний префікс Agency Tier A-/B+/B/C)
+    # 3. Contact Quality Tier & Warnings
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
@@ -1589,7 +1590,7 @@ def parse_html_sync(
         if decoded and EMAIL_REGEX.match(decoded):
             email_sources[decoded] = clean_page
 
-    # П.1 (Рівень 1): Розпакування вбудованих JSON-стейтів SPA (__NEXT_DATA__, Nuxt, JSON конфіги)
+    # Рівень 1: Розпакування вбудованих JSON-стейтів SPA (__NEXT_DATA__, Nuxt, JSON конфіги)
     spa_text_fragments = []
     for script_tag in soup.find_all('script'):
         sc_text = script_tag.string
@@ -1674,37 +1675,75 @@ def parse_html_sync(
     return page_title, meta_desc, text_content, email_sources, phones_with_source, socials_with_source, ordered_contact_links
 
 
+async def get_shared_playwright_browser():
+    """П.5: Lazy Singleton для повторного використання одного інстансу Chromium між доменами."""
+    global _PW_INSTANCE, _PW_BROWSER
+    if not PLAYWRIGHT_INSTALLED:
+        return None
+    async with _PW_INIT_LOCK:
+        if _PW_BROWSER is None:
+            _PW_INSTANCE = await async_playwright().start()
+            _PW_BROWSER = await _PW_INSTANCE.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+    return _PW_BROWSER
+
+
+async def close_shared_playwright_browser():
+    global _PW_INSTANCE, _PW_BROWSER
+    async with _PW_INIT_LOCK:
+        if _PW_BROWSER is not None:
+            try:
+                await _PW_BROWSER.close()
+            except Exception:
+                pass
+            _PW_BROWSER = None
+        if _PW_INSTANCE is not None:
+            try:
+                await _PW_INSTANCE.stop()
+            except Exception:
+                pass
+            _PW_INSTANCE = None
+
+
 async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str]:
     """
-    П.1 (Рівень 2): Опціональний Headless Chromium (Playwright) фолбек для важких SPA
-    та сайтів із Cookie-Consent блокуванням тегів. Автоматично натискає 'Accept Cookies'.
-    Якщо Playwright не встановлений в образі — безпечно повертає ('', url).
+    П.2, П.3, П.5: Виконує рендеринг у спільному Singleton Browser під захистом PW_SEMAPHORE(2)
+    та натискає банери згоди (включно з Shopify Customer Privacy #shopify-pc__banner__btn-accept).
     """
     if not PLAYWRIGHT_INSTALLED:
         return '', url
 
-    try:
-        async with async_playwright() as p:
-            launch_kwargs = {'headless': True}
-            if proxy_url:
-                launch_kwargs['proxy'] = {'server': proxy_url}
-            browser = await p.chromium.launch(**launch_kwargs)
-            try:
-                context = await browser.new_context(
-                    locale='uk-UA',
-                    user_agent=(
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-                    )
+    async with PW_SEMAPHORE:
+        try:
+            browser = await get_shared_playwright_browser()
+            if browser is None:
+                return '', url
+
+            ctx_kwargs = {
+                'locale': 'uk-UA',
+                'user_agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
                 )
+            }
+            if proxy_url:
+                ctx_kwargs['proxy'] = {'server': proxy_url}
+
+            context = await browser.new_context(**ctx_kwargs)
+            try:
                 page = await context.new_page()
                 await page.goto(url, wait_until='domcontentloaded', timeout=15000)
                 await page.wait_for_timeout(1500)
 
-                # Програмний клік на банери згоди Cookie Consent (OneTrust, Cookiebot тощо)
+                # П.2: Повний список селекторів згоди (включно з Shopify Privacy для gymshark.com)
                 consent_selectors = [
+                    '#shopify-pc__banner__btn-accept',
+                    '[id^="shopify-pc__banner__btn-accept"]',
                     '#onetrust-accept-btn-handler',
                     '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                    '[data-testid="cookie-accept"]',
                     'button:has-text("Accept all")',
                     'button:has-text("Accept")',
                     'button:has-text("Прийняти")',
@@ -1714,9 +1753,9 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 for sel in consent_selectors:
                     try:
                         loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=400):
+                        if await loc.is_visible(timeout=350):
                             await loc.click(timeout=800)
-                            await page.wait_for_timeout(1200)
+                            await page.wait_for_timeout(1400)
                             break
                     except Exception:
                         continue
@@ -1725,9 +1764,9 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 final_u = clean_url_port(page.url) or url
                 return rendered_html, final_u
             finally:
-                await browser.close()
-    except Exception:
-        return '', url
+                await context.close()
+        except Exception:
+            return '', url
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
@@ -1930,6 +1969,7 @@ async def process_domain(
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
+    pw_used_flag = False
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
@@ -1985,6 +2025,8 @@ async def process_domain(
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
+                'playwright_available': PLAYWRIGHT_INSTALLED,
+                'playwright_used': False,
                 'page_title': None,
                 'meta_description': None,
                 'best_email': None,
@@ -2104,14 +2146,18 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
-        # П.1 (Рівень 2): Якщо після статичного обходу контактів 0 (як на SPA justin.ua / meest.com)
-        # або трекінг прихований за Consent Banner — викликаємо Playwright fallback (якщо встановлено)
-        has_initial_contacts = bool(email_sources or phone_map or socials_with_source)
+        # П.2, П.4, П.6: Тригер Playwright для:
+        # 1) Сайтів без жодного email/phone (justin.ua, meest.com)
+        # 2) Сайтів із Consent Banner, де не видно GTM/GA4 (gymshark.com)
+        # 3) Сайтів, де page_title порожній і 0 технологій (ukrposhta.ua)
+        has_email_or_phone = bool(email_sources or phone_map)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
+        needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
 
-        if PLAYWRIGHT_INSTALLED and (not has_initial_contacts or needs_pw_tech):
+        if PLAYWRIGHT_INSTALLED and (not has_email_or_phone or needs_pw_tech or needs_pw_empty_shell):
             pw_html, pw_url = await fetch_html_playwright_fallback(normalized_final_redirect)
             if pw_html and len(pw_html) > 500:
+                pw_used_flag = True
                 pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, _ = await loop.run_in_executor(
                     thread_pool, parse_html_sync, pw_html, pw_url, default_region
                 )
@@ -2127,7 +2173,7 @@ async def process_domain(
                         phone_map[p] = (sc, src)
                 for k, v in pw_s.items():
                     socials_with_source.setdefault(k, v)
-                if needs_pw_tech:
+                if needs_pw_tech or needs_pw_empty_shell:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
 
@@ -2196,7 +2242,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v100(
+        ) = evaluate_qualification_v110(
             company_category,
             tech_info,
             best_email,
@@ -2234,6 +2280,8 @@ async def process_domain(
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
             'gdpr_eu_domain': is_eu_gdpr,
+            'playwright_available': PLAYWRIGHT_INSTALLED,
+            'playwright_used': pw_used_flag,
             'page_title': page_title or None,
             'meta_description': meta_desc or None,
             'best_email': best_email,
@@ -2294,6 +2342,12 @@ async def process_domain(
 
 async def main() -> None:
     async with Actor:
+        if not PLAYWRIGHT_INSTALLED:
+            Actor.log.warning(
+                'PLAYWRIGHT NOT INSTALLED: Browser SPA fallback disabled. '
+                'Update Dockerfile to `FROM apify/actor-python-playwright:3.12` to enable.'
+            )
+
         actor_input = await Actor.get_input() or {}
         raw_domains = actor_input.get('domains', [])
         scan_contacts = actor_input.get('scanContactPages', True)
@@ -2365,6 +2419,7 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{result['status'].upper()}] {result['canonical_domain']} | "
+                        f"PW: {result['playwright_used']} | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
@@ -2377,6 +2432,7 @@ async def main() -> None:
                 if batch:
                     await Actor.push_data(batch)
         finally:
+            await close_shared_playwright_browser()
             thread_pool.shutdown(wait=False)
 
 
