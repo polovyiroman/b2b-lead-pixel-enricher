@@ -19,10 +19,9 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 9
-MIN_COMPATIBLE_CACHE_SCHEMA = 9
+CACHE_SCHEMA_VERSION = 10
+MIN_COMPATIBLE_CACHE_SCHEMA = 10
 
-# П.3 & П.5: Семафор (максимум 2 одночасні вкладки) та глобальний Singleton Browser для захисту від OOM
 PW_SEMAPHORE = asyncio.Semaphore(2)
 _PW_INIT_LOCK = asyncio.Lock()
 _PW_INSTANCE = None
@@ -330,6 +329,11 @@ SOCIAL_BAD_SEGMENTS = {
     'explore', 'watch', 'groups', 'events', 'marketplace', 'gaming',
     'business', 'partner-directory', 'ads', 'help', 'policies', 'privacy',
     'legal', 'login', 'signin', 'signup', 'hashtag', 'search', 'discover', 'about'
+}
+
+# П.4: Чорний список плейсхолдерних Telegram-хендлів
+TELEGRAM_PLACEHOLDER_SLUGS = {
+    'your', 'example', 'demo', 'test', 'channel', 'group', 'username', 'bot', 'mychannel'
 }
 
 REGION_DIALING_PREFIX_MAP = {
@@ -772,6 +776,10 @@ def clean_and_validate_social_url(platform: str, href: str) -> str | None:
 
     if platform == 'telegram':
         if host not in ('t.me', 'telegram.me') or segments_lower[0] in ('share', 'joinchat', 'addstickers'):
+            return None
+        # П.4: Відсікаємо плейсхолдерні Telegram-хендли та закриті інвайт-хеші (+...)
+        tg_slug = segments_lower[0]
+        if tg_slug.startswith('+') or tg_slug in TELEGRAM_PLACEHOLDER_SLUGS or len(tg_slug) < 4:
             return None
         return f'https://t.me/{segments[0]}'
 
@@ -1246,7 +1254,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v110(
+def evaluate_qualification_v120(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1481,9 +1489,10 @@ def evaluate_qualification_v110(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. Next Best Action
+    # 6. Next Best Action (П.6: Явна вказівка, якщо немає публічного телефону)
+    phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
     if is_agency:
-        next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
+        next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
     elif not all_signals and not best_email and not primary_phone:
@@ -1501,7 +1510,7 @@ def evaluate_qualification_v110(
         dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
             f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-            f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn or call {primary_phone or 'company'}"
+            f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
         )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
@@ -1590,7 +1599,6 @@ def parse_html_sync(
         if decoded and EMAIL_REGEX.match(decoded):
             email_sources[decoded] = clean_page
 
-    # Рівень 1: Розпакування вбудованих JSON-стейтів SPA (__NEXT_DATA__, Nuxt, JSON конфіги)
     spa_text_fragments = []
     for script_tag in soup.find_all('script'):
         sc_text = script_tag.string
@@ -1676,17 +1684,35 @@ def parse_html_sync(
 
 
 async def get_shared_playwright_browser():
-    """П.5: Lazy Singleton для повторного використання одного інстансу Chromium між доменами."""
-    global _PW_INSTANCE, _PW_BROWSER
+    """
+    П.2: Exception-safe ініціалізація Singleton Chromium з анти-детект прапорцем
+    --disable-blink-features=AutomationControlled та graceful degradation у разі збою.
+    """
+    global _PW_INSTANCE, _PW_BROWSER, PLAYWRIGHT_INSTALLED
     if not PLAYWRIGHT_INSTALLED:
         return None
     async with _PW_INIT_LOCK:
         if _PW_BROWSER is None:
-            _PW_INSTANCE = await async_playwright().start()
-            _PW_BROWSER = await _PW_INSTANCE.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
-            )
+            try:
+                _PW_INSTANCE = await async_playwright().start()
+                _PW_BROWSER = await _PW_INSTANCE.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled'
+                    ]
+                )
+            except Exception as e:
+                Actor.log.warning(f'Playwright launch failed ({e}); disabling browser fallback for this run.')
+                if _PW_INSTANCE is not None:
+                    try:
+                        await _PW_INSTANCE.stop()
+                    except Exception:
+                        pass
+                    _PW_INSTANCE = None
+                PLAYWRIGHT_INSTALLED = False
+                return None
     return _PW_BROWSER
 
 
@@ -1707,22 +1733,23 @@ async def close_shared_playwright_browser():
             _PW_INSTANCE = None
 
 
-async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str]:
+async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str]:
     """
-    П.2, П.3, П.5: Виконує рендеринг у спільному Singleton Browser під захистом PW_SEMAPHORE(2)
-    та натискає банери згоди (включно з Shopify Customer Privacy #shopify-pc__banner__btn-accept).
+    П.1: Повертає (rendered_html, final_url, pw_status_enum), де pw_status_enum:
+    'rendered' | 'launched_blocked' | 'launched_empty' | 'disabled'
     """
     if not PLAYWRIGHT_INSTALLED:
-        return '', url
+        return '', url, 'disabled'
 
     async with PW_SEMAPHORE:
         try:
             browser = await get_shared_playwright_browser()
             if browser is None:
-                return '', url
+                return '', url, 'disabled'
 
             ctx_kwargs = {
                 'locale': 'uk-UA',
+                'ignore_https_errors': True,
                 'user_agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
@@ -1732,12 +1759,17 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 ctx_kwargs['proxy'] = {'server': proxy_url}
 
             context = await browser.new_context(**ctx_kwargs)
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
             try:
                 page = await context.new_page()
-                await page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
+                if resp and resp.status in (401, 403, 429):
+                    return '', url, f'launched_blocked (HTTP {resp.status})'
+
                 await page.wait_for_timeout(1500)
 
-                # П.2: Повний список селекторів згоди (включно з Shopify Privacy для gymshark.com)
                 consent_selectors = [
                     '#shopify-pc__banner__btn-accept',
                     '[id^="shopify-pc__banner__btn-accept"]',
@@ -1762,11 +1794,14 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
 
                 rendered_html = await page.content()
                 final_u = clean_url_port(page.url) or url
-                return rendered_html, final_u
+                if not rendered_html or len(rendered_html) <= 500:
+                    return '', final_u, 'launched_empty'
+                return rendered_html, final_u, 'rendered'
             finally:
                 await context.close()
-        except Exception:
-            return '', url
+        except Exception as e:
+            err_short = str(e).splitlines()[0][:60] if str(e) else 'error'
+            return '', url, f'launched_blocked ({err_short})'
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
@@ -1970,6 +2005,7 @@ async def process_domain(
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
     pw_used_flag = False
+    pw_status_str = 'not_needed' if PLAYWRIGHT_INSTALLED else 'disabled'
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
@@ -2027,6 +2063,7 @@ async def process_domain(
                 'gdpr_eu_domain': is_eu_gdpr,
                 'playwright_available': PLAYWRIGHT_INSTALLED,
                 'playwright_used': False,
+                'playwright_status': 'not_attempted_site_blocked',
                 'page_title': None,
                 'meta_description': None,
                 'best_email': None,
@@ -2146,17 +2183,21 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
-        # П.2, П.4, П.6: Тригер Playwright для:
-        # 1) Сайтів без жодного email/phone (justin.ua, meest.com)
-        # 2) Сайтів із Consent Banner, де не видно GTM/GA4 (gymshark.com)
-        # 3) Сайтів, де page_title порожній і 0 технологій (ukrposhta.ua)
-        has_email_or_phone = bool(email_sources or phone_map)
+        # П.1, П.3, П.5: Розширена діагностика та логування Playwright
+        has_initial_contacts = bool(email_sources or phone_map or socials_with_source)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
 
-        if PLAYWRIGHT_INSTALLED and (not has_email_or_phone or needs_pw_tech or needs_pw_empty_shell):
-            pw_html, pw_url = await fetch_html_playwright_fallback(normalized_final_redirect)
-            if pw_html and len(pw_html) > 500:
+        if PLAYWRIGHT_INSTALLED and (not has_initial_contacts or needs_pw_tech or needs_pw_empty_shell):
+            Actor.log.info(
+                f'Playwright triggered for {canonical_domain} '
+                f'(no_contacts={not has_initial_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
+            )
+            pw_html, pw_url, pw_status_str = await fetch_html_playwright_fallback(normalized_final_redirect)
+            Actor.log.info(
+                f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
+            )
+            if pw_status_str == 'rendered' and pw_html:
                 pw_used_flag = True
                 pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, _ = await loop.run_in_executor(
                     thread_pool, parse_html_sync, pw_html, pw_url, default_region
@@ -2242,7 +2283,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v110(
+        ) = evaluate_qualification_v120(
             company_category,
             tech_info,
             best_email,
@@ -2282,6 +2323,7 @@ async def process_domain(
             'gdpr_eu_domain': is_eu_gdpr,
             'playwright_available': PLAYWRIGHT_INSTALLED,
             'playwright_used': pw_used_flag,
+            'playwright_status': pw_status_str,
             'page_title': page_title or None,
             'meta_description': meta_desc or None,
             'best_email': best_email,
@@ -2419,7 +2461,7 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                        f"PW: {result['playwright_used']} | "
+                        f"PW: {result['playwright_status']} | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
