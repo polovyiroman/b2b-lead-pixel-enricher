@@ -13,14 +13,15 @@ from bs4 import BeautifulSoup
 from apify import Actor
 
 MAX_HTML_BYTES = 1_500_000
+# Заморожена версія схеми кешу (приймає >= 6, щоб не скидати валідні снапшоти між перезапусками)
 CACHE_SCHEMA_VERSION = 7
+MIN_COMPATIBLE_CACHE_SCHEMA = 6
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Строгий 10-символьний патерн GA4 ID після G- (мінімум одна цифра й одна літера)
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
 GTAG_CONFIG_GA4_REGEX = re.compile(
@@ -303,7 +304,6 @@ CMS_HTML_ONLY_SIGNATURES = {
     'Squarespace': ['static1.squarespace.com', 'squarespace-cdn.com']
 }
 
-# Розширений список маркерів Cookie Consent та Privacy API (включно з Shopify Customer Privacy, Pandectes, OneTrust)
 COOKIE_CONSENT_MARKERS = (
     'cookiebot', 'onetrust', 'cookiefirst', 'usercentrics', 'complianz',
     'cookieyes', 'didomi', 'pandectes', 'shopify.customerprivacy',
@@ -870,7 +870,7 @@ def extract_valid_phones(
 
 
 def extract_verified_html_ga4_ids(html: str) -> list[str]:
-    """Tier 1: Витягує 100% підтверджені GA4 ID з HTML строго за позицією їх першої появи у коді."""
+    """Tier A: Витягує 100% підтверджені GA4 ID з HTML у детермінованому порядку першої появи."""
     pos_map: dict[str, int] = {}
     for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
         for m in rx.finditer(html):
@@ -881,43 +881,46 @@ def extract_verified_html_ga4_ids(html: str) -> list[str]:
     return sorted(pos_map.keys(), key=lambda g: pos_map[g])
 
 
-def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], list[str]]:
+def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], bool]:
     """
-    П.1 & П.2: 100% детермінований вибір GA4 ID у GTM за позицією першого входження (first_pos),
-    а не за випадковим count!
-    Повертає кортеж: (context_hits, freq_fallback_hits).
+    П.1 & П.2: Трирівнева детермінована класифікація GA4 у GTM:
+    - Tier B1: Явні виклики gtag('config') / gtag/js / g/collect всередині GTM.
+    - Tier B2: JSON-ключі measurementId / tagId / sendTo у GTM (якщо >= 2 ID, повертає всі у стабільному sorted()-порядку як multi-property).
+    - Tier C: Частотний фолбек (для макросів GTM), відсортований через sorted() для 100% ідентичності між запусками.
+    Повертає (ga4_ids_list, is_multi_property).
     """
     if not gtm_js:
-        return [], []
+        return [], False
 
-    # 1. Явні контекстні ключі GTM (measurementId, tagId, sendTo, gtag('config')) за позицією першої появи
-    ctx_pos_map: dict[str, int] = {}
-    for rx in (GTM_JSON_GA4_REGEX, GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
+    # Tier B1: Активні скрипти/конфіги всередині GTM
+    tier_b1_set = set()
+    for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
         for m in rx.finditer(gtm_js):
-            gid = m.group(1).upper()
-            pos = m.start()
-            if gid not in ctx_pos_map or pos < ctx_pos_map[gid]:
-                ctx_pos_map[gid] = pos
+            tier_b1_set.add(m.group(1).upper())
+    if tier_b1_set:
+        ordered_b1 = sorted(tier_b1_set)
+        return ordered_b1[:5], len(ordered_b1) >= 2
 
-    context_ordered = sorted(ctx_pos_map.keys(), key=lambda g: ctx_pos_map[g])
+    # Tier B2: JSON-властивості measurementId / tagId / sendTo у GTM
+    tier_b2_set = {m.group(1).upper() for m in GTM_JSON_GA4_REGEX.finditer(gtm_js)}
+    if tier_b2_set:
+        ordered_b2 = sorted(tier_b2_set)
+        if len(ordered_b2) >= 2:
+            # Multi-property GTM (як на allbirds.com або kachorovska.com): не вгадуємо один випадковий ID, повертаємо всі стабільно!
+            return ordered_b2[:5], True
+        return ordered_b2[:1], False
 
-    # 2. Частотний фолбек (для макросів GTM), також відсортований строго за позицією першого входження в gtm.js!
-    strict_matches = []
-    first_pos: dict[str, int] = {}
-    for m in GA4_STRICT_10CHAR_REGEX.finditer(gtm_js):
-        gid = m.group(0).upper()
-        strict_matches.append(gid)
-        if gid not in first_pos:
-            first_pos[gid] = m.start()
-
+    # Tier C: Частотний фолбек для констант-макросів GTM
+    strict_matches = [m.group(0).upper() for m in GA4_STRICT_10CHAR_REGEX.finditer(gtm_js)]
     counts = Counter(strict_matches)
-    freq_candidates = [gid for gid, c in counts.items() if c >= 2]
-    freq_ordered = sorted(freq_candidates, key=lambda g: first_pos.get(g, 10**9))
+    freq_candidates = sorted(gid for gid, c in counts.items() if c >= 2)
+    if freq_candidates:
+        return freq_candidates[:1], False
 
-    if not freq_ordered and len(counts) == 1:
-        freq_ordered = list(counts.keys())
+    if len(counts) == 1:
+        return list(counts.keys()), False
 
-    return context_ordered[:1], freq_ordered[:1]
+    return [], False
 
 
 def detect_tech_with_evidence(
@@ -943,8 +946,7 @@ def detect_tech_with_evidence(
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
 
     ga4_in_html = extract_verified_html_ga4_ids(html)
-    ga4_ctx_gtm, ga4_freq_gtm = extract_gtm_ga4_ids(clean_gtm)
-    ga4_in_gtm = ga4_ctx_gtm or ga4_freq_gtm
+    ga4_in_gtm, is_multi_ga4 = extract_gtm_ga4_ids(clean_gtm)
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
@@ -958,7 +960,13 @@ def detect_tech_with_evidence(
         if ga4_in_html:
             evidence_items.append(f'GA4 ({ga4_in_html[0]} in Direct HTML)')
         elif ga4_in_gtm:
-            evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
+            if is_multi_ga4 and len(ga4_in_gtm) >= 2:
+                preview_ids = ', '.join(ga4_in_gtm[:3])
+                evidence_items.append(
+                    f'GA4 (multi-property GTM container: {len(ga4_in_gtm)} measurement IDs — {preview_ids})'
+                )
+            else:
+                evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
         else:
             evidence_items.append('GA4 (gtag.js endpoint detected; measurement_id not exposed in static HTML)')
 
@@ -988,17 +996,18 @@ def detect_tech_with_evidence(
             else:
                 evidence_items.append(f"{name} ('{matched_in_gtm}' in GTM Container)")
 
+    detected_cms = []
     for cms_name, cms_markers in CMS_HTML_ONLY_SIGNATURES.items():
         matched_cms = next((m for m in cms_markers if m in html_lower), None)
         if matched_cms:
             detected.append(cms_name)
+            detected_cms.append(cms_name)
             evidence_items.append(f"{cms_name} ('{matched_cms}' in Direct HTML)")
 
     has_any_tracking = has_gtm or has_ga4 or has_google_ads or any(
         t in detected for t in AD_AND_ANALYTICS_SIGNATURES
     )
 
-    # П.4: Якщо знайдено лише CMS (як Shopify на gymshark.com), але трекінгу в статиці немає і є Consent Mode — додаємо явну підказку!
     if not evidence_items:
         if has_cookie_banner:
             ev_summary = 'No static tags visible (Consent Mode / Cookie banner detected; tags likely fire post-consent)'
@@ -1011,8 +1020,7 @@ def detect_tech_with_evidence(
             )
         ev_summary = ' | '.join(evidence_items)
 
-    # П.1 & П.2: Чистий детермінований all_ga4_ids (HTML first -> GTM context -> GTM first-pos primary) без зайвих хвостів
-    all_ga4_list = ga4_in_html[:2] if ga4_in_html else ga4_in_gtm[:1]
+    all_ga4_list = ga4_in_html[:3] if ga4_in_html else ga4_in_gtm[:5]
 
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
@@ -1025,6 +1033,8 @@ def detect_tech_with_evidence(
         'has_ga4': has_ga4,
         'has_gtm': has_gtm,
         'all_ga4_ids': '; '.join(all_ga4_list) if all_ga4_list else None,
+        'detected_cms_list': detected_cms,
+        'has_cookie_banner': has_cookie_banner,
         'detected_technologies_list': detected,
         'technology_evidence': ev_summary
     }
@@ -1210,7 +1220,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v80(
+def evaluate_qualification_v90(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1246,7 +1256,18 @@ def evaluate_qualification_v80(
             analytics_tags.append(ux_tool)
 
     all_signals = ad_tags + analytics_tags
-    detected_signals_str = ', '.join(all_signals) if all_signals else 'None detected'
+    detected_cms = tech_info.get('detected_cms_list', [])
+    has_cookie_banner = tech_info.get('has_cookie_banner', False)
+
+    # П.4: Якщо рекламних сигналів у статиці 0, але виявлено CMS (як Shopify на gymshark), вказуємо це в detected_signals!
+    if all_signals:
+        detected_signals_str = ', '.join(all_signals)
+    elif detected_cms:
+        consent_note = ' — ad tags likely consent-gated' if has_cookie_banner else ''
+        detected_signals_str = f"None detected ({', '.join(detected_cms)} platform only{consent_note})"
+    else:
+        detected_signals_str = 'None detected'
+
     is_agency = (company_category == 'B2B Agency / Marketing Media')
 
     # 1. ICP Fit Tier
@@ -1674,10 +1695,11 @@ async def fetch_html_safely(
     url: str,
     proxy_config=None,
     timeout: float = 15.0,
-    retries: int = 4
+    retries: int = 5
 ) -> tuple[int, str, str, str]:
+    """П.5: Посилений 403-retry з експоненційним backoff та ротацією TLS-профілів."""
     last_error = ''
-    impersonations = ['chrome', 'safari', 'chrome110', 'chrome']
+    impersonations = ['chrome', 'safari', 'chrome110', 'edge99', 'chrome']
     current_target_url = url
 
     for attempt in range(retries):
@@ -1715,7 +1737,7 @@ async def fetch_html_safely(
                     continue
 
                 if status in (403, 429, 502, 503, 504) and attempt < retries - 1:
-                    await asyncio.sleep(1.0 * (attempt + 1))
+                    await asyncio.sleep(1.5 * (1.6 ** attempt))
                     continue
 
                 if status >= 400:
@@ -1745,14 +1767,14 @@ async def fetch_html_safely(
                     html = raw_bytes.decode('utf-8', errors='replace')
 
                 if ('<title>' not in html.lower() or len(html) < 800) and attempt < retries - 1:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.2)
                     continue
 
                 return status, html, final_url, ''
         except Exception as e:
             last_error = str(e)
             if attempt < retries - 1:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.2)
 
     return 0, '', current_target_url, last_error or 'Connection failed'
 
@@ -1826,7 +1848,7 @@ async def process_domain(
                         cached_record = await cache_store.get_value(candidate_key)
                         if (
                             isinstance(cached_record, dict)
-                            and cached_record.get('_schema') == CACHE_SCHEMA_VERSION
+                            and cached_record.get('_schema', 0) >= MIN_COMPATIBLE_CACHE_SCHEMA
                             and cached_record.get('status') in ('success', 'no_contacts_found')
                         ):
                             cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
@@ -1834,7 +1856,7 @@ async def process_domain(
                             cached_copy['input_domain'] = domain_key
                             cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
                             cached_copy['error_message'] = (
-                                f'Live request returned {err_msg}; preserved verified v{CACHE_SCHEMA_VERSION} snapshot from {prev_time}'
+                                f'Live request returned {err_msg}; preserved verified snapshot from {prev_time}'
                             )
                             cached_copy['data_confidence_warning'] = (
                                 f'Note: Live scan encountered {err_msg}; returning cached snapshot from {prev_time}.'
@@ -1857,7 +1879,7 @@ async def process_domain(
                 'technical_signal_strength': None,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
-                'data_confidence_warning': f'Site blocked by WAF/Cloudflare and no prior cached v{CACHE_SCHEMA_VERSION} snapshot available.',
+                'data_confidence_warning': f'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
                 'page_title': None,
                 'meta_description': None,
@@ -2039,7 +2061,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v80(
+        ) = evaluate_qualification_v90(
             company_category,
             tech_info,
             best_email,
@@ -2055,7 +2077,6 @@ async def process_domain(
         has_any_contact = bool(best_email or primary_phone or socials_with_source)
         final_status = 'success' if has_any_contact else 'no_contacts_found'
 
-        # П.3: Прибираємо legal_or_hr_inbox (data@, dpo@, job@) з all_emails, якщо є інші ділові пошти
         non_legal_emails = [
             em for em, _ in ranked_emails_with_src
             if classify_email_type(em, brand_token) != 'legal_or_hr_inbox'
@@ -2063,6 +2084,7 @@ async def process_domain(
         all_emails_list = (non_legal_emails or [em for em, _ in ranked_emails_with_src])[:5]
         all_phones_list = [p for p, _ in sorted_phones_with_src]
 
+        # П.3: Повернено чесний page_title or None (без підстановки canonical_domain)
         result_record = {
             'input_domain': domain_key,
             'canonical_domain': canonical_domain,
@@ -2078,7 +2100,7 @@ async def process_domain(
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
             'gdpr_eu_domain': is_eu_gdpr,
-            'page_title': page_title or canonical_domain,
+            'page_title': page_title or None,
             'meta_description': meta_desc or None,
             'best_email': best_email,
             'email_domain': email_domain,
