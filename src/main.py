@@ -19,8 +19,7 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 10
-# П.2: Дозволяємо читати всі сумісні снапшоти >= 6, автоматично доповнюючи їх новими полями v13
+CACHE_SCHEMA_VERSION = 11
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 
 PW_SEMAPHORE = asyncio.Semaphore(2)
@@ -362,6 +361,29 @@ def clean_url_port(url: str | None) -> str | None:
     if not parsed.path:
         cleaned = f'{cleaned}/'
     return cleaned
+
+
+def build_summary_from_cached_record(record: dict) -> str:
+    """П.4: Регенерує стислий technology_evidence_summary для старих кешованих снапшотів."""
+    existing = record.get('technology_evidence_summary')
+    if existing and ';' not in existing:
+        return existing
+    raw_tech = record.get('detected_technologies') or ''
+    if not raw_tech:
+        return 'None'
+    short_parts = []
+    for item in [x.strip() for x in raw_tech.split(';') if x.strip()]:
+        if item == 'Google Tag Manager':
+            short_parts.append('GTM')
+        elif item == 'Google Analytics (GA4)':
+            ga4_ids = record.get('all_ga4_ids')
+            first_ga4 = ga4_ids.split(';')[0].strip() if ga4_ids else ''
+            short_parts.append(f'GA4 ({first_ga4})' if first_ga4 else 'GA4')
+        elif item == 'Google Ads Conversion':
+            short_parts.append('Google Ads')
+        else:
+            short_parts.append(item)
+    return ', '.join(short_parts) if short_parts else 'None'
 
 
 def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
@@ -782,7 +804,6 @@ def clean_and_validate_social_url(platform: str, href: str) -> str | None:
             return None
         if tg_slug in TELEGRAM_PLACEHOLDER_SLUGS:
             return None
-        # П.1: Перевіряємо частини slug через роздільники (відсікає brabrabra_your, demo_channel, brand-example)
         tg_parts = [p for p in re.split(r'[._-]', tg_slug) if p]
         if any(p in TELEGRAM_PLACEHOLDER_SLUGS for p in tg_parts):
             return None
@@ -988,7 +1009,10 @@ def detect_tech_with_evidence(
                 evidence_items.append(
                     f'GA4 (multi-property GTM container: {len(ga4_in_gtm)} measurement IDs — {preview_ids})'
                 )
-                summary_items.append(f'GA4 ({len(ga4_in_gtm)} IDs: {ga4_in_gtm[0]}, ...)')
+                # П.3: Уніфікований формат (+N more) у короткому summary
+                summary_items.append(
+                    f'GA4 ({len(ga4_in_gtm)} IDs: {ga4_in_gtm[0]}, +{len(ga4_in_gtm) - 1} more)'
+                )
             else:
                 evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
                 summary_items.append(f'GA4 ({ga4_in_gtm[0]})')
@@ -1259,7 +1283,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v130(
+def evaluate_qualification_v140(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1494,7 +1518,7 @@ def evaluate_qualification_v130(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. Next Best Action
+    # 6. Next Best Action (П.2: phone_note додано і до фінальної else-гілки для meest.com)
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
@@ -1536,7 +1560,9 @@ def evaluate_qualification_v130(
     elif primary_phone:
         next_action = f"Use decision_maker_search_query on LinkedIn or call {primary_phone} for routing"
     else:
-        next_action = 'Run decision_maker_search_query in LinkedIn / Apollo to locate marketing decision-maker'
+        next_action = (
+            f"Run decision_maker_search_query in LinkedIn / Apollo to locate marketing decision-maker{phone_note}"
+        )
 
     return (
         readiness_verdict,
@@ -1762,10 +1788,10 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
             try:
                 page = await context.new_page()
                 resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
-                if resp and resp.status in (401, 403, 429):
+                if resp and resp.status >= 400:
                     return '', url, f'launched_blocked (HTTP {resp.status})'
 
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1200)
 
                 consent_selectors = [
                     '#shopify-pc__banner__btn-accept',
@@ -1782,12 +1808,19 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 for sel in consent_selectors:
                     try:
                         loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=350):
+                        if await loc.is_visible(timeout=300):
                             await loc.click(timeout=800)
-                            await page.wait_for_timeout(1400)
+                            await page.wait_for_timeout(1200)
                             break
                     except Exception:
                         continue
+
+                # Скролимо сторінку до футера, щоб тригернути lazy-rendered контакти та соцмережі у SPA (meest.com)
+                try:
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await page.wait_for_timeout(600)
+                except Exception:
+                    pass
 
                 rendered_html = await page.content()
                 final_u = clean_url_port(page.url) or url
@@ -2015,18 +2048,20 @@ async def process_domain(
         normalized_final_redirect = clean_url_port(final_url) or clean_website_url
         canonical_kv_key = sanitize_kv_key(canonical_domain)
         input_kv_key = sanitize_kv_key(domain_key)
+        evergreen_kv_key = f'evergreen_{canonical_kv_key}'
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # П.2: Читаємо кеш зі схемами >= 6, автоматично доповнюючи відсутні поля нової схеми v13
+            # Перевіряємо спочатку версійний кеш, а потім вічний evergreen-кеш для часто блокованих доменів
             if cache_store is not None:
-                for candidate_key in (canonical_kv_key, input_kv_key):
+                for candidate_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                     try:
                         cached_record = await cache_store.get_value(candidate_key)
+                        is_evergreen = (candidate_key == evergreen_kv_key)
                         if (
                             isinstance(cached_record, dict)
-                            and cached_record.get('_schema', 0) >= MIN_COMPATIBLE_CACHE_SCHEMA
+                            and (is_evergreen or cached_record.get('_schema', 0) >= MIN_COMPATIBLE_CACHE_SCHEMA)
                             and cached_record.get('status') in ('success', 'no_contacts_found')
                         ):
                             cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
@@ -2040,7 +2075,7 @@ async def process_domain(
                                 f'Note: Live scan encountered {err_msg}; returning cached snapshot from {prev_time}.'
                             )
                             cached_copy.setdefault('playwright_available', PLAYWRIGHT_INSTALLED)
-                            cached_copy.setdefault('playwright_used', False)
+                            cached_copy['playwright_used'] = False
                             cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
                             cached_copy.setdefault(
                                 'phone_availability',
@@ -2049,7 +2084,7 @@ async def process_domain(
                             cached_copy.setdefault('detected_cms', None)
                             cached_copy.setdefault('consent_mode_likely', None)
                             cached_copy.setdefault('ga4_detection_confidence', None)
-                            cached_copy.setdefault('technology_evidence_summary', cached_copy.get('detected_technologies'))
+                            cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                             return cached_copy
                     except Exception:
                         pass
@@ -2227,18 +2262,30 @@ async def process_domain(
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
 
-                # П.3: Level 3 Playwright — якщо після рендеру головної контактів все ще 0 (як на SPA meest.com),
-                # рендеримо через Playwright першу контактну підсторінку (/contacts або з pw_sub_links)!
+                # П.1: Розширений Level 3 Playwright для локалізованих SPA-маршрутів (/en/contacts, /ua/contacts, /about)
                 if scan_contacts and not (email_sources or phone_map):
-                    candidate_pw_subs = pw_sub_links[:1] if pw_sub_links else [f'{base_root}/contacts/']
-                    for pw_sub_u in candidate_pw_subs:
+                    candidate_pw_subs = (
+                        pw_sub_links[:3]
+                        if pw_sub_links
+                        else [
+                            f'{base_root}/contacts/',
+                            f'{base_root}/ua/contacts/',
+                            f'{base_root}/en/contacts/',
+                            f'{base_root}/about/'
+                        ]
+                    )
+                    for pw_sub_u in candidate_pw_subs[:3]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                             sub_pw_html, sub_pw_final, sub_pw_st = await fetch_html_playwright_fallback(pw_sub_u)
                             if sub_pw_st == 'rendered' and sub_pw_html:
-                                s_t, _, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
+                                s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
                                     thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, default_region
                                 )
                                 if not is_soft_404_page(sub_pw_html, s_t):
+                                    if not page_title and s_t:
+                                        page_title = s_t
+                                    if not meta_desc and s_d:
+                                        meta_desc = s_d
                                     pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
                                     for em, src in s_e.items():
                                         email_sources.setdefault(em, src)
@@ -2247,6 +2294,8 @@ async def process_domain(
                                             phone_map[p] = (sc, src)
                                     for k, v in s_s.items():
                                         socials_with_source.setdefault(k, v)
+                                    if email_sources or phone_map:
+                                        break
 
         ranked_emails_with_src = rank_and_clean_emails(email_sources, canonical_domain)
 
@@ -2314,7 +2363,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v130(
+        ) = evaluate_qualification_v140(
             company_category,
             tech_info,
             best_email,
@@ -2408,6 +2457,9 @@ async def process_domain(
                 await cache_store.set_value(canonical_kv_key, cache_payload)
                 if input_kv_key != canonical_kv_key:
                     await cache_store.set_value(input_kv_key, cache_payload)
+                # Зберігаємо також в evergreen-ключ, якщо знайдено реальні контакти (захист на роки вперед)
+                if final_status == 'success':
+                    await cache_store.set_value(evergreen_kv_key, cache_payload)
             except Exception:
                 pass
 
