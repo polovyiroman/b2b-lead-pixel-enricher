@@ -19,8 +19,9 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 11
+CACHE_SCHEMA_VERSION = 12
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
+EVERGREEN_MAX_AGE_DAYS = 180
 
 PW_SEMAPHORE = asyncio.Semaphore(2)
 _PW_INIT_LOCK = asyncio.Lock()
@@ -275,12 +276,18 @@ RETAIL_PHONE_KEYWORDS = (
 
 PRIMARY_CONTACT_KEYWORDS = (
     'contact', 'kontakt', 'impressum', 'contatti', 'contacto',
-    'get-in-touch', 'contact-information', 'kontakty', 'contacts'
+    'get-in-touch', 'contact-information', 'kontakty', 'contacts', 'contact-us'
 )
 SECONDARY_CONTACT_KEYWORDS = (
     'about', 'uber-uns', 'ueber-uns', 'team', 'komanda', 'company', 'leadership',
     'management', 'founders', 'our-story', 'pro-nas', 'o-nas', 'history', 'brand',
     'wholesale', 'b2b', 'investors', 'oferta', 'offer', 'terms', 'our-services', 'ugoda'
+)
+
+# П.1: Ключові слова для семантичного пошуку посилань за видимим текстом анкорів <a> у SPA
+CONTACT_ANCHOR_TEXT_KEYWORDS = (
+    'contact', 'contact us', 'get in touch', 'support', 'customer care',
+    'help center', 'контакти', 'зв\'язатися', 'про нас', 'about us', 'impressum'
 )
 
 AD_AND_ANALYTICS_SIGNATURES = {
@@ -363,8 +370,20 @@ def clean_url_port(url: str | None) -> str | None:
     return cleaned
 
 
+def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
+    """П.2 & П.3: Обчислює вік збереженого кеш-снапшоту в днях для TTL-контролю."""
+    if not checked_at_str or not isinstance(checked_at_str, str):
+        return None
+    try:
+        prev_dt = datetime.strptime(checked_at_str, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - prev_dt
+        return max(0, delta.days)
+    except Exception:
+        return None
+
+
 def build_summary_from_cached_record(record: dict) -> str:
-    """П.4: Регенерує стислий technology_evidence_summary для старих кешованих снапшотів."""
+    """П.5: Регенерує technology_evidence_summary для кеш-снапшотів з повною підтримкою multi-property GA4."""
     existing = record.get('technology_evidence_summary')
     if existing and ';' not in existing:
         return existing
@@ -376,14 +395,61 @@ def build_summary_from_cached_record(record: dict) -> str:
         if item == 'Google Tag Manager':
             short_parts.append('GTM')
         elif item == 'Google Analytics (GA4)':
-            ga4_ids = record.get('all_ga4_ids')
-            first_ga4 = ga4_ids.split(';')[0].strip() if ga4_ids else ''
-            short_parts.append(f'GA4 ({first_ga4})' if first_ga4 else 'GA4')
+            ga4_raw = record.get('all_ga4_ids') or ''
+            ga4_clean = [g.strip() for g in ga4_raw.split(';') if g.strip()]
+            if len(ga4_clean) >= 2:
+                short_parts.append(f'GA4 ({len(ga4_clean)} IDs: {ga4_clean[0]}, +{len(ga4_clean) - 1} more)')
+            elif ga4_clean:
+                short_parts.append(f'GA4 ({ga4_clean[0]})')
+            else:
+                short_parts.append('GA4')
         elif item == 'Google Ads Conversion':
             short_parts.append('Google Ads')
         else:
             short_parts.append(item)
     return ', '.join(short_parts) if short_parts else 'None'
+
+
+def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical_domain: str) -> list[str]:
+    """
+    П.1: Витягує посилання з тегів <a> у відрендереному PW DOM, спираючись на видимий текст анкора
+    ('Contact', 'Контакти', 'Get in touch') та підтримуючи офіційні піддомени (*.meest.com).
+    """
+    found = []
+    soup = BeautifulSoup(html, 'lxml')
+    base_clean = (clean_url_port(page_url) or page_url).rstrip('/')
+
+    for a_tag in soup.find_all('a', href=True):
+        href = a_tag['href'].strip()
+        if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+            continue
+        full_u = clean_url_port(urljoin(page_url, href))
+        if not full_u or full_u.rstrip('/') == base_clean:
+            continue
+
+        parsed = urlparse(full_u)
+        if parsed.scheme not in ('http', 'https'):
+            continue
+        host = re.sub(r':\d+$', '', parsed.netloc.lower().replace('www.', ''))
+        path_low = parsed.path.lower()
+
+        if any(path_low.endswith(ext) for ext in JUNK_EXTENSIONS) or DM_SOURCE_BLACKLIST.search(path_low):
+            continue
+
+        # Дозволяємо як сам canonical_domain, так і його офіційні піддомени (напр. us.meest.com, ua.meest.com)
+        if host != canonical_domain and not host.endswith(f'.{canonical_domain}'):
+            continue
+
+        anchor_txt = f"{a_tag.get_text(' ', strip=True)} {a_tag.get('aria-label', '')} {a_tag.get('title', '')}".lower()
+        is_contact_text = any(k in anchor_txt for k in CONTACT_ANCHOR_TEXT_KEYWORDS)
+        is_contact_path = any(k in path_low for k in PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS)
+
+        if (is_contact_text or is_contact_path) and full_u not in found:
+            found.append(full_u)
+            if len(found) >= 5:
+                break
+
+    return found
 
 
 def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
@@ -1009,7 +1075,6 @@ def detect_tech_with_evidence(
                 evidence_items.append(
                     f'GA4 (multi-property GTM container: {len(ga4_in_gtm)} measurement IDs — {preview_ids})'
                 )
-                # П.3: Уніфікований формат (+N more) у короткому summary
                 summary_items.append(
                     f'GA4 ({len(ga4_in_gtm)} IDs: {ga4_in_gtm[0]}, +{len(ga4_in_gtm) - 1} more)'
                 )
@@ -1283,7 +1348,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v140(
+def evaluate_qualification_v150(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1518,7 +1583,7 @@ def evaluate_qualification_v140(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. Next Best Action (П.2: phone_note додано і до фінальної else-гілки для meest.com)
+    # 6. Next Best Action
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
@@ -1686,12 +1751,13 @@ def parse_html_sync(
         if DM_SOURCE_BLACKLIST.search(path_lower):
             continue
 
-        if base_domain and link_domain == base_domain and parsed.scheme in ('http', 'https'):
+        if base_domain and (link_domain == base_domain or link_domain.endswith(f'.{base_domain}')) and parsed.scheme in ('http', 'https'):
             normalized_link = clean_url_port(f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}")
             if not normalized_link or normalized_link.rstrip('/') == base_clean:
                 continue
 
-            if any(k in path_lower for k in PRIMARY_CONTACT_KEYWORDS):
+            anchor_txt = a_tag.get_text(' ', strip=True).lower()
+            if any(k in path_lower for k in PRIMARY_CONTACT_KEYWORDS) or any(k in anchor_txt for k in ('contact', 'контакти', 'support')):
                 primary_links.add(normalized_link)
             elif any(k in path_lower for k in SECONDARY_CONTACT_KEYWORDS):
                 secondary_links.add(normalized_link)
@@ -1815,7 +1881,6 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                     except Exception:
                         continue
 
-                # Скролимо сторінку до футера, щоб тригернути lazy-rendered контакти та соцмережі у SPA (meest.com)
                 try:
                     await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                     await page.wait_for_timeout(600)
@@ -2036,6 +2101,8 @@ async def process_domain(
     loop = asyncio.get_running_loop()
     pw_used_flag = False
     pw_status_str = 'not_needed' if PLAYWRIGHT_INSTALLED else 'disabled'
+    pw_attempts_count = 0
+    pw_attempted_paths: list[str] = []
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
@@ -2053,39 +2120,50 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # Перевіряємо спочатку версійний кеш, а потім вічний evergreen-кеш для часто блокованих доменів
+            # П.2 & П.3: Перевірка кешу з підтримкою TTL EVERGREEN_MAX_AGE_DAYS та полів cached_snapshot_source / age_days
             if cache_store is not None:
                 for candidate_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                     try:
                         cached_record = await cache_store.get_value(candidate_key)
                         is_evergreen = (candidate_key == evergreen_kv_key)
-                        if (
-                            isinstance(cached_record, dict)
-                            and (is_evergreen or cached_record.get('_schema', 0) >= MIN_COMPATIBLE_CACHE_SCHEMA)
-                            and cached_record.get('status') in ('success', 'no_contacts_found')
-                        ):
-                            cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
-                            prev_time = cached_copy.get('last_checked_at', 'previous run')
-                            cached_copy['input_domain'] = domain_key
-                            cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
-                            cached_copy['error_message'] = (
-                                f'Live request returned {err_msg}; preserved verified snapshot from {prev_time}'
-                            )
-                            cached_copy['data_confidence_warning'] = (
-                                f'Note: Live scan encountered {err_msg}; returning cached snapshot from {prev_time}.'
-                            )
-                            cached_copy.setdefault('playwright_available', PLAYWRIGHT_INSTALLED)
-                            cached_copy['playwright_used'] = False
-                            cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
-                            cached_copy.setdefault(
-                                'phone_availability',
-                                'public' if cached_copy.get('primary_phone') else 'not_public'
-                            )
-                            cached_copy.setdefault('detected_cms', None)
-                            cached_copy.setdefault('consent_mode_likely', None)
-                            cached_copy.setdefault('ga4_detection_confidence', None)
-                            cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
-                            return cached_copy
+                        if not isinstance(cached_record, dict):
+                            continue
+                        if not is_evergreen and cached_record.get('_schema', 0) < MIN_COMPATIBLE_CACHE_SCHEMA:
+                            continue
+                        if cached_record.get('status') not in ('success', 'no_contacts_found'):
+                            continue
+
+                        prev_time = cached_record.get('last_checked_at', '')
+                        age_days = compute_snapshot_age_days(prev_time)
+                        if is_evergreen and age_days is not None and age_days > EVERGREEN_MAX_AGE_DAYS:
+                            continue
+
+                        cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
+                        cached_copy['input_domain'] = domain_key
+                        cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
+                        cached_copy['cached_snapshot_source'] = 'evergreen_cache' if is_evergreen else 'versioned_cache'
+                        cached_copy['cached_snapshot_age_days'] = age_days if age_days is not None else 0
+                        cached_copy['error_message'] = (
+                            f'Live request returned {err_msg}; preserved verified snapshot from {prev_time or "prior run"}'
+                        )
+                        cached_copy['data_confidence_warning'] = (
+                            f'Note: Live scan encountered {err_msg}; returning cached snapshot '
+                            f'({cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d) from {prev_time}.'
+                        )
+                        cached_copy.setdefault('playwright_available', PLAYWRIGHT_INSTALLED)
+                        cached_copy['playwright_used'] = False
+                        cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
+                        cached_copy['playwright_attempts_count'] = 0
+                        cached_copy['playwright_paths_attempted'] = None
+                        cached_copy.setdefault(
+                            'phone_availability',
+                            'public' if cached_copy.get('primary_phone') else 'not_public'
+                        )
+                        cached_copy.setdefault('detected_cms', None)
+                        cached_copy.setdefault('consent_mode_likely', None)
+                        cached_copy.setdefault('ga4_detection_confidence', None)
+                        cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
+                        return cached_copy
                     except Exception:
                         pass
 
@@ -2096,6 +2174,8 @@ async def process_domain(
                 'website_url': clean_website_url,
                 'final_redirect_url': normalized_final_redirect,
                 'status': fail_status,
+                'cached_snapshot_source': 'none (live_blocked)',
+                'cached_snapshot_age_days': None,
                 'error_message': err_msg,
                 'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
                 'company_category': cat,
@@ -2108,6 +2188,8 @@ async def process_domain(
                 'playwright_available': PLAYWRIGHT_INSTALLED,
                 'playwright_used': False,
                 'playwright_status': 'not_attempted_site_blocked',
+                'playwright_attempts_count': 0,
+                'playwright_paths_attempted': None,
                 'page_title': f'[Site blocked: {err_msg}]',
                 'meta_description': None,
                 'best_email': None,
@@ -2237,6 +2319,8 @@ async def process_domain(
                 f'Playwright triggered for {canonical_domain} '
                 f'(no_contacts={not has_initial_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
             )
+            pw_attempts_count += 1
+            pw_attempted_paths.append(normalized_final_redirect)
             pw_html, pw_url, pw_status_str = await fetch_html_playwright_fallback(normalized_final_redirect)
             Actor.log.info(
                 f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
@@ -2262,20 +2346,26 @@ async def process_domain(
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
 
-                # П.1: Розширений Level 3 Playwright для локалізованих SPA-маршрутів (/en/contacts, /ua/contacts, /about)
+                # П.1 & П.4: Семантичний витяг контактних посилань із PW DOM (за текстом анкорів <a> та піддоменами)
                 if scan_contacts and not (email_sources or phone_map):
-                    candidate_pw_subs = (
-                        pw_sub_links[:3]
-                        if pw_sub_links
-                        else [
-                            f'{base_root}/contacts/',
-                            f'{base_root}/ua/contacts/',
-                            f'{base_root}/en/contacts/',
-                            f'{base_root}/about/'
-                        ]
+                    semantic_pw_links = await loop.run_in_executor(
+                        thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
                     )
-                    for pw_sub_u in candidate_pw_subs[:3]:
+                    fallback_pw_paths = [
+                        f'{base_root}/contacts/',
+                        f'{base_root}/en/contact-us/',
+                        f'{base_root}/ua/kontakty/',
+                        f'{base_root}/about/'
+                    ]
+                    combined_pw_subs = []
+                    for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths):
+                        if u not in combined_pw_subs and u != normalized_final_redirect:
+                            combined_pw_subs.append(u)
+
+                    for pw_sub_u in combined_pw_subs[:3]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
+                            pw_attempts_count += 1
+                            pw_attempted_paths.append(pw_sub_u)
                             sub_pw_html, sub_pw_final, sub_pw_st = await fetch_html_playwright_fallback(pw_sub_u)
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
@@ -2363,7 +2453,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v140(
+        ) = evaluate_qualification_v150(
             company_category,
             tech_info,
             best_email,
@@ -2392,6 +2482,8 @@ async def process_domain(
             'website_url': clean_website_url,
             'final_redirect_url': normalized_final_redirect,
             'status': final_status,
+            'cached_snapshot_source': 'live',
+            'cached_snapshot_age_days': 0,
             'error_message': '',
             'sales_readiness_verdict': sales_readiness_verdict,
             'company_category': company_category,
@@ -2404,6 +2496,8 @@ async def process_domain(
             'playwright_available': PLAYWRIGHT_INSTALLED,
             'playwright_used': pw_used_flag,
             'playwright_status': pw_status_str,
+            'playwright_attempts_count': pw_attempts_count,
+            'playwright_paths_attempted': '; '.join(pw_attempted_paths) if pw_attempted_paths else None,
             'page_title': page_title or None,
             'meta_description': meta_desc or None,
             'best_email': best_email,
@@ -2457,7 +2551,6 @@ async def process_domain(
                 await cache_store.set_value(canonical_kv_key, cache_payload)
                 if input_kv_key != canonical_kv_key:
                     await cache_store.set_value(input_kv_key, cache_payload)
-                # Зберігаємо також в evergreen-ключ, якщо знайдено реальні контакти (захист на роки вперед)
                 if final_status == 'success':
                     await cache_store.set_value(evergreen_kv_key, cache_payload)
             except Exception:
@@ -2505,8 +2598,9 @@ async def main() -> None:
         except Exception:
             proxy_config = None
 
+        total_domains = len(prepared_domains)
         Actor.log.info(
-            f'Processing {len(prepared_domains)} unique domains '
+            f'Processing {total_domains} unique domains '
             f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, '
             f'playwright_available: {PLAYWRIGHT_INSTALLED}, cache schema: v{CACHE_SCHEMA_VERSION})...'
         )
@@ -2515,6 +2609,7 @@ async def main() -> None:
 
         batch = []
         batch_size = 5
+        metrics_counter = Counter()
 
         try:
             async with AsyncSession(
@@ -2543,9 +2638,16 @@ async def main() -> None:
                     result = await coro
                     batch.append(result)
 
+                    st = result['status']
+                    metrics_counter[f'status_{st}'] += 1
+                    if result.get('playwright_used'):
+                        metrics_counter['playwright_rendered'] += 1
+                    if result.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache'):
+                        metrics_counter['cache_fallbacks'] += 1
+
                     Actor.log.info(
-                        f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                        f"PW: {result['playwright_status']} | "
+                        f"[{st.upper()}] {result['canonical_domain']} | "
+                        f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
@@ -2557,6 +2659,22 @@ async def main() -> None:
 
                 if batch:
                     await Actor.push_data(batch)
+
+            run_telemetry = {
+                'total_domains': total_domains,
+                'live_success_count': metrics_counter['status_success'],
+                'cached_fallback_count': metrics_counter['cache_fallbacks'],
+                'playwright_rendered_count': metrics_counter['playwright_rendered'],
+                'no_contacts_count': metrics_counter['status_no_contacts_found'],
+                'blocked_count': metrics_counter['status_blocked'],
+                'checked_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            }
+            Actor.log.info(f'PIPELINE TELEMETRY SUMMARY: {json.dumps(run_telemetry)}')
+            if cache_store is not None:
+                try:
+                    await cache_store.set_value('LAST_RUN_METRICS', run_telemetry)
+                except Exception:
+                    pass
         finally:
             await close_shared_playwright_browser()
             thread_pool.shutdown(wait=False)
