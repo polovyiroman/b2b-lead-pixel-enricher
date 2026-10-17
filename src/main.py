@@ -13,14 +13,14 @@ from bs4 import BeautifulSoup
 from apify import Actor
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Строгий 10-символьний патерн GA4 ID (містить хоча б одну цифру та одну літеру після G-)
+# Строгий патерн для 10-символьних GA4 ID після G- (мінімум одна цифра й одна літера)
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
 GTAG_CONFIG_GA4_REGEX = re.compile(
@@ -35,10 +35,10 @@ GA4_WIRE_REGEX = re.compile(
     r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
     re.IGNORECASE
 )
-# П.1 & П.2: Повна підтримка camelCase та snake_case ключів всередині GTM-контейнера (vtp_tagId, vtp_measurementIdOverride, vtp_value тощо)
+# Тільки специфічні GA4-ключі у GTM (прибрано загальний 'value', який давав false positives)
 GTM_JSON_GA4_REGEX = re.compile(
     r"['\"](?:vtp_)?(?:measurement_?[Ii]d(?:Override)?|tag_?[Ii]d|send_?[Tt]o|"
-    r"ga_measurement_?[Ii]d|value)['\"]\s*[:,\s]\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{8,12})['\"]",
+    r"ga_measurement_?[Ii]d)['\"]\s*[:,\s]\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{8,12})['\"]",
     re.IGNORECASE
 )
 
@@ -222,17 +222,18 @@ DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'booking', 'reservation', 'delivery', 'logistics', 'export', 'import'
 )
 SUPPORT_PREFIXES = (
-    'support', 'supportua', 'help', 'service', 'care', 'customerservice',
+    'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
     'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
 )
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand', 'events'
 )
+# П.2: Додано data, datarequest, privacyrequest, dpo у LOW_PRIORITY_PREFIXES (виправляє data@gymshark.com)
 LOW_PRIORITY_PREFIXES = (
-    'privacy', 'legal', 'notices', 'notice', 'legalnotices', 'datenschutz',
-    'dpo', 'compliance', 'gdpr', 'billing', 'invoice', 'invoices',
-    'accounting', 'finance', 'jobs', 'careers', 'job', 'hr', 'recruiting',
-    'security', 'copyright', 'dmca', 'jira'
+    'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
+    'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
+    'gdpr', 'billing', 'invoice', 'invoices', 'accounting', 'finance',
+    'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira'
 )
 REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
@@ -558,6 +559,7 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None
 ) -> str | None:
+    """П.4: Розпізнає Proofpoint Enterprise, Mimecast, Barracuda та Cloudflare Email Routing."""
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -578,6 +580,14 @@ async def verify_email_deliverability_deep(
                     provider = 'Google' if is_public_webmail else 'Google Workspace'
                 elif 'outlook.com' in joined_mx or 'protection.outlook.com' in joined_mx:
                     provider = 'Microsoft' if is_public_webmail else 'Microsoft 365'
+                elif 'pphosted.com' in joined_mx or 'proofpoint' in joined_mx:
+                    provider = 'Proofpoint Enterprise'
+                elif 'mimecast.com' in joined_mx:
+                    provider = 'Mimecast Enterprise'
+                elif 'barracudanetworks.com' in joined_mx:
+                    provider = 'Barracuda Gateway'
+                elif 'route.mx.cloudflare.net' in joined_mx:
+                    provider = 'Cloudflare Email'
                 elif 'zoho.' in joined_mx:
                     provider = 'Zoho Mail'
                 elif 'protonmail.' in joined_mx:
@@ -860,40 +870,44 @@ def extract_valid_phones(
 
 
 def extract_verified_html_ga4_ids(html: str) -> list[str]:
-    """Витягує 100% підтверджені GA4 ID з HTML (gtag config, script src, wire protocol, JSON config)."""
-    found = set()
-    for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX, GTM_JSON_GA4_REGEX):
+    """Tier 1: Витягує 100% підтверджені GA4 ID безпосередньо з HTML (gtag config, script src, wire protocol)."""
+    found = []
+    for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
         for m in rx.findall(html):
-            found.add(m.upper())
-    return sorted(found)
+            gid = m.upper()
+            if gid not in found:
+                found.append(gid)
+    return found
 
 
 def extract_gtm_ga4_ids(gtm_js: str) -> list[str]:
     """
-    П.1 & П.2: Відновлює 100% детект GA4 у GTM без false-positives:
-    1) Шукає явні camelCase/snake_case GTM-ключі (vtp_tagId, vtp_measurementIdOverride, vtp_value, sendTo).
-    2) Застосовує частотну евристику (Counter >= 2) для 10-символьних G-XXXXXXXXXX.
-    3) Якщо у всьому GTM-контейнері лише 1-2 унікальні 10-символьні G-ID (немає JS-шуму бандлів), зберігає їх.
+    П.1 & П.3 (Tier 2): Витягує GA4 ID з GTM-контейнера без false-positives:
+    1) Спочатку шукає точні ключі GTM (measurementId, tagId, sendTo) — cap 2.
+    2) Якщо немає — застосовує поріг частоти >= 3, сортуючи за спаданням частоти (-counts[m]) — cap 2.
+    3) Якщо в усьому контейнері лише 1 унікальний G-ID (компактний GTM-макрос), повертає його.
     """
     if not gtm_js:
         return []
 
-    context_hits = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)}
-    context_hits |= {m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(gtm_js)}
-    context_hits |= {m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(gtm_js)}
-    context_hits |= {m.upper() for m in GA4_WIRE_REGEX.findall(gtm_js)}
-
     strict_matches = [m.upper() for m in GA4_STRICT_10CHAR_REGEX.findall(gtm_js)]
     counts = Counter(strict_matches)
-    freq_hits = {m for m, c in counts.items() if c >= 2}
 
-    combined = sorted(context_hits | freq_hits)
-    if combined:
-        return combined[:5]
+    context_hits = set()
+    for rx in (GTM_JSON_GA4_REGEX, GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
+        for m in rx.findall(gtm_js):
+            context_hits.add(m.upper())
 
-    # Якщо контейнер компактний і містить рівно 1 або 2 строгих G-ID (наприклад, один макрос у GTM), повертаємо їх
-    if 1 <= len(counts) <= 2:
-        return sorted(counts.keys())
+    if context_hits:
+        # Сортуємо спочатку за частотою в GTM (справжній головний ID зустрічається найчастіше), потім за алфавітом
+        return sorted(context_hits, key=lambda x: (-counts.get(x, 0), x))[:2]
+
+    freq_hits = [m for m, c in counts.items() if c >= 3]
+    if freq_hits:
+        return sorted(freq_hits, key=lambda x: (-counts[x], x))[:2]
+
+    if len(counts) == 1:
+        return list(counts.keys())
 
     return []
 
@@ -937,7 +951,6 @@ def detect_tech_with_evidence(
         elif ga4_in_gtm:
             evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
         else:
-            # П.3: Чітке пояснення, коли скрипт GA4 є, але ID підвантажується динамічно
             evidence_items.append('GA4 (gtag.js endpoint detected; measurement_id not exposed in static HTML)')
 
     aw_in_html = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(html)})
@@ -980,7 +993,15 @@ def detect_tech_with_evidence(
     else:
         ev_summary = ' | '.join(evidence_items)
 
-    all_ga4_list = sorted(set(ga4_in_html) | set(ga4_in_gtm))[:5]
+    # П.1: HTML-first ordering для all_ga4_ids (ніколи не перезаписуємо прямий HTML-ID евристичними GTM-ID)
+    all_ga4_list: list[str] = []
+    for gid in ga4_in_html:
+        if gid not in all_ga4_list and len(all_ga4_list) < 3:
+            all_ga4_list.append(gid)
+    if not all_ga4_list:
+        for gid in ga4_in_gtm:
+            if gid not in all_ga4_list and len(all_ga4_list) < 2:
+                all_ga4_list.append(gid)
 
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
@@ -1178,7 +1199,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v60(
+def evaluate_qualification_v70(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1261,7 +1282,6 @@ def evaluate_qualification_v60(
                 f'Listed Executive is {dm_name})'
             )
             enrichment_status = 'agency_partner_unmatched_executive_and_staff_email'
-            # П.4: Спокійна партнерська нотатка для агенцій замість клієнтського попередження
             confidence_warning = (
                 f'Note: Agency partnership contact — route to {best_email}, not to {dm_name}.'
             )
@@ -1317,7 +1337,8 @@ def evaluate_qualification_v60(
             f'Note: Company uses public webmail ({best_email}) as its primary contact.{legal_note}'
         )
     elif dm_name and (best_email or primary_phone):
-        contact_quality = f'Tier B (Decision-Maker Found: {dm_name}, Paired with Generic/B2B Inbox)'
+        tier_prefix = 'Tier B-' if not all_signals else 'Tier B'
+        contact_quality = f'{tier_prefix} (Decision-Maker Found: {dm_name}, Paired with Generic/B2B Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
         confidence_warning = f'Warning: Person name verified on site; email is company role/generic inbox (not direct personal email).{legal_note}'
     elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
@@ -1361,7 +1382,10 @@ def evaluate_qualification_v60(
     elif not all_signals and not best_email and not primary_phone:
         readiness_verdict = 'Unqualified (No Tech Signals & No Actionable Contacts — Needs Manual Review)'
     elif not all_signals:
-        readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
+        if dm_name:
+            readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
+        else:
+            readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
     elif dm_name and is_same_person_li:
@@ -1417,9 +1441,10 @@ def evaluate_qualification_v60(
         'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox',
         'department_or_general_inbox'
     ):
+        dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
             f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-            f"locate Marketing Lead via decision_maker_search_query on LinkedIn or call {primary_phone or 'company'}"
+            f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn or call {primary_phone or 'company'}"
         )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
@@ -1484,6 +1509,14 @@ def parse_html_sync(
     if soup.title and soup.title.string:
         raw_title = ' '.join(soup.title.string.split())
         page_title = textwrap.shorten(raw_title, width=150, placeholder='…')
+    if not page_title:
+        og_title = (
+            soup.find('meta', attrs={'property': re.compile(r'^og:title$', re.I)})
+            or soup.find('meta', attrs={'property': re.compile(r'^og:site_name$', re.I)})
+        )
+        if og_title and og_title.get('content'):
+            raw_og = ' '.join(str(og_title['content']).split())
+            page_title = textwrap.shorten(raw_og, width=150, placeholder='…')
 
     meta_desc = ''
     desc_tag = (
@@ -1995,7 +2028,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v60(
+        ) = evaluate_qualification_v70(
             company_category,
             tech_info,
             best_email,
