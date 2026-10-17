@@ -20,7 +20,8 @@ except ImportError:
 
 MAX_HTML_BYTES = 1_500_000
 CACHE_SCHEMA_VERSION = 10
-MIN_COMPATIBLE_CACHE_SCHEMA = 10
+# П.2: Дозволяємо читати всі сумісні снапшоти >= 6, автоматично доповнюючи їх новими полями v13
+MIN_COMPATIBLE_CACHE_SCHEMA = 6
 
 PW_SEMAPHORE = asyncio.Semaphore(2)
 _PW_INIT_LOCK = asyncio.Lock()
@@ -331,7 +332,6 @@ SOCIAL_BAD_SEGMENTS = {
     'legal', 'login', 'signin', 'signup', 'hashtag', 'search', 'discover', 'about'
 }
 
-# П.4: Чорний список плейсхолдерних Telegram-хендлів
 TELEGRAM_PLACEHOLDER_SLUGS = {
     'your', 'example', 'demo', 'test', 'channel', 'group', 'username', 'bot', 'mychannel'
 }
@@ -777,9 +777,14 @@ def clean_and_validate_social_url(platform: str, href: str) -> str | None:
     if platform == 'telegram':
         if host not in ('t.me', 'telegram.me') or segments_lower[0] in ('share', 'joinchat', 'addstickers'):
             return None
-        # П.4: Відсікаємо плейсхолдерні Telegram-хендли та закриті інвайт-хеші (+...)
         tg_slug = segments_lower[0]
-        if tg_slug.startswith('+') or tg_slug in TELEGRAM_PLACEHOLDER_SLUGS or len(tg_slug) < 4:
+        if tg_slug.startswith('+') or len(tg_slug) < 4:
+            return None
+        if tg_slug in TELEGRAM_PLACEHOLDER_SLUGS:
+            return None
+        # П.1: Перевіряємо частини slug через роздільники (відсікає brabrabra_your, demo_channel, brand-example)
+        tg_parts = [p for p in re.split(r'[._-]', tg_slug) if p]
+        if any(p in TELEGRAM_PLACEHOLDER_SLUGS for p in tg_parts):
             return None
         return f'https://t.me/{segments[0]}'
 
@@ -1254,7 +1259,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v120(
+def evaluate_qualification_v130(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1489,7 +1494,7 @@ def evaluate_qualification_v120(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. Next Best Action (П.6: Явна вказівка, якщо немає публічного телефону)
+    # 6. Next Best Action
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
@@ -1684,10 +1689,6 @@ def parse_html_sync(
 
 
 async def get_shared_playwright_browser():
-    """
-    П.2: Exception-safe ініціалізація Singleton Chromium з анти-детект прапорцем
-    --disable-blink-features=AutomationControlled та graceful degradation у разі збою.
-    """
     global _PW_INSTANCE, _PW_BROWSER, PLAYWRIGHT_INSTALLED
     if not PLAYWRIGHT_INSTALLED:
         return None
@@ -1734,10 +1735,6 @@ async def close_shared_playwright_browser():
 
 
 async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str]:
-    """
-    П.1: Повертає (rendered_html, final_url, pw_status_enum), де pw_status_enum:
-    'rendered' | 'launched_blocked' | 'launched_empty' | 'disabled'
-    """
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled'
 
@@ -2022,6 +2019,7 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
+            # П.2: Читаємо кеш зі схемами >= 6, автоматично доповнюючи відсутні поля нової схеми v13
             if cache_store is not None:
                 for candidate_key in (canonical_kv_key, input_kv_key):
                     try:
@@ -2041,6 +2039,17 @@ async def process_domain(
                             cached_copy['data_confidence_warning'] = (
                                 f'Note: Live scan encountered {err_msg}; returning cached snapshot from {prev_time}.'
                             )
+                            cached_copy.setdefault('playwright_available', PLAYWRIGHT_INSTALLED)
+                            cached_copy.setdefault('playwright_used', False)
+                            cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
+                            cached_copy.setdefault(
+                                'phone_availability',
+                                'public' if cached_copy.get('primary_phone') else 'not_public'
+                            )
+                            cached_copy.setdefault('detected_cms', None)
+                            cached_copy.setdefault('consent_mode_likely', None)
+                            cached_copy.setdefault('ga4_detection_confidence', None)
+                            cached_copy.setdefault('technology_evidence_summary', cached_copy.get('detected_technologies'))
                             return cached_copy
                     except Exception:
                         pass
@@ -2064,7 +2073,7 @@ async def process_domain(
                 'playwright_available': PLAYWRIGHT_INSTALLED,
                 'playwright_used': False,
                 'playwright_status': 'not_attempted_site_blocked',
-                'page_title': None,
+                'page_title': f'[Site blocked: {err_msg}]',
                 'meta_description': None,
                 'best_email': None,
                 'email_domain': None,
@@ -2073,6 +2082,7 @@ async def process_domain(
                 'email_source_url': None,
                 'primary_phone': None,
                 'e164_phone': None,
+                'phone_availability': 'site_blocked',
                 'phone_source_url': None,
                 'decision_maker_name': None,
                 'decision_maker_role': None,
@@ -2183,7 +2193,6 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
-        # П.1, П.3, П.5: Розширена діагностика та логування Playwright
         has_initial_contacts = bool(email_sources or phone_map or socials_with_source)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
@@ -2199,7 +2208,7 @@ async def process_domain(
             )
             if pw_status_str == 'rendered' and pw_html:
                 pw_used_flag = True
-                pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, _ = await loop.run_in_executor(
+                pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
                     thread_pool, parse_html_sync, pw_html, pw_url, default_region
                 )
                 if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
@@ -2217,6 +2226,27 @@ async def process_domain(
                 if needs_pw_tech or needs_pw_empty_shell:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
+
+                # П.3: Level 3 Playwright — якщо після рендеру головної контактів все ще 0 (як на SPA meest.com),
+                # рендеримо через Playwright першу контактну підсторінку (/contacts або з pw_sub_links)!
+                if scan_contacts and not (email_sources or phone_map):
+                    candidate_pw_subs = pw_sub_links[:1] if pw_sub_links else [f'{base_root}/contacts/']
+                    for pw_sub_u in candidate_pw_subs:
+                        if is_allowed_by_robots(pw_sub_u, disallowed_paths):
+                            sub_pw_html, sub_pw_final, sub_pw_st = await fetch_html_playwright_fallback(pw_sub_u)
+                            if sub_pw_st == 'rendered' and sub_pw_html:
+                                s_t, _, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
+                                    thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, default_region
+                                )
+                                if not is_soft_404_page(sub_pw_html, s_t):
+                                    pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
+                                    for em, src in s_e.items():
+                                        email_sources.setdefault(em, src)
+                                    for p, sc, src in s_p:
+                                        if p not in phone_map or sc > phone_map[p][0]:
+                                            phone_map[p] = (sc, src)
+                                    for k, v in s_s.items():
+                                        socials_with_source.setdefault(k, v)
 
         ranked_emails_with_src = rank_and_clean_emails(email_sources, canonical_domain)
 
@@ -2253,6 +2283,7 @@ async def process_domain(
 
         primary_phone = sorted_phones_with_src[0][0] if sorted_phones_with_src else None
         e164_phone = re.sub(r'[\s\-()]', '', primary_phone) if primary_phone else None
+        phone_availability = 'public' if primary_phone else 'not_public'
         phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
 
         social_source_url = None
@@ -2283,7 +2314,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v120(
+        ) = evaluate_qualification_v130(
             company_category,
             tech_info,
             best_email,
@@ -2333,6 +2364,7 @@ async def process_domain(
             'email_source_url': email_source_url,
             'primary_phone': primary_phone,
             'e164_phone': e164_phone,
+            'phone_availability': phone_availability,
             'phone_source_url': phone_source_url,
             'decision_maker_name': dm_name,
             'decision_maker_role': dm_role,
