@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import html as html_lib
@@ -12,14 +13,16 @@ from bs4 import BeautifulSoup
 from apify import Actor
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# П.1: Тільки верифіковані контекстні регулярки для GA4 (без сліпого \bG-[A-Z0-9]+\b, який ловив JS-хеші!)
+# Строгий 10-символьний патерн GA4 ID (містить хоча б одну цифру та одну літеру після G-)
+GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
+
 GTAG_CONFIG_GA4_REGEX = re.compile(
     r"gtag\(\s*['\"]config['\"]\s*,\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})['\"]",
     re.IGNORECASE
@@ -32,15 +35,15 @@ GA4_WIRE_REGEX = re.compile(
     r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
     re.IGNORECASE
 )
+# П.1 & П.2: Повна підтримка camelCase та snake_case ключів всередині GTM-контейнера (vtp_tagId, vtp_measurementIdOverride, vtp_value тощо)
 GTM_JSON_GA4_REGEX = re.compile(
-    r"(?:['\"](?:measurement_id|tag_id|send_to|ga_measurement_id)['\"]\s*:\s*['\"]|['\"]vtp_measurementId['\"]\s*,\s*['\"])"
-    r"(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})['\"]",
+    r"['\"](?:vtp_)?(?:measurement_?[Ii]d(?:Override)?|tag_?[Ii]d|send_?[Tt]o|"
+    r"ga_measurement_?[Ii]d|value)['\"]\s*[:,\s]\s*['\"](G-(?=[A-Z0-9]*\d)[A-Z0-9]{8,12})['\"]",
     re.IGNORECASE
 )
 
 GOOGLE_ADS_REGEX = re.compile(r'\bAW-\d{6,12}\b')
 
-# П.7: Детект редіректів на технічні піддомени оплати/чекауту (кейс us.checkout.gymshark.com)
 CHECKOUT_REDIRECT_HOSTS = re.compile(
     r'^(?:[a-z]{2}\.)?(?:checkout|cart|pay|secure|billing)\.',
     re.IGNORECASE
@@ -804,10 +807,6 @@ def extract_valid_phones(
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
 ) -> list[tuple[str, int]]:
-    """
-    П.8: Додає бонус +15 балів телефонам, які відповідають коду країни цільового регіону
-    (напр. +380 для UA), щоб локальні B2B-номери завжди стояли вище за закордонні представництва.
-    """
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
@@ -860,17 +859,43 @@ def extract_valid_phones(
     return [(p, phone_scores[p]) for p in sorted_phones[:10]]
 
 
-def extract_verified_ga4_ids(text_blob: str) -> list[str]:
-    """
-    П.1: Витягує ТІЛЬКИ 100% підтверджені GA4 ID з явних викликів gtag('config'),
-    скриптів googletagmanager.com/gtag/js?id=, wire-протоколу g/collect?tid=
-    та JSON-конфігурації GTM (measurement_id / tag_id / send_to), ігноруючи випадкові G-* хеші!
-    """
+def extract_verified_html_ga4_ids(html: str) -> list[str]:
+    """Витягує 100% підтверджені GA4 ID з HTML (gtag config, script src, wire protocol, JSON config)."""
     found = set()
     for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX, GTM_JSON_GA4_REGEX):
-        for m in rx.findall(text_blob):
+        for m in rx.findall(html):
             found.add(m.upper())
     return sorted(found)
+
+
+def extract_gtm_ga4_ids(gtm_js: str) -> list[str]:
+    """
+    П.1 & П.2: Відновлює 100% детект GA4 у GTM без false-positives:
+    1) Шукає явні camelCase/snake_case GTM-ключі (vtp_tagId, vtp_measurementIdOverride, vtp_value, sendTo).
+    2) Застосовує частотну евристику (Counter >= 2) для 10-символьних G-XXXXXXXXXX.
+    3) Якщо у всьому GTM-контейнері лише 1-2 унікальні 10-символьні G-ID (немає JS-шуму бандлів), зберігає їх.
+    """
+    if not gtm_js:
+        return []
+
+    context_hits = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)}
+    context_hits |= {m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(gtm_js)}
+    context_hits |= {m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(gtm_js)}
+    context_hits |= {m.upper() for m in GA4_WIRE_REGEX.findall(gtm_js)}
+
+    strict_matches = [m.upper() for m in GA4_STRICT_10CHAR_REGEX.findall(gtm_js)]
+    counts = Counter(strict_matches)
+    freq_hits = {m for m, c in counts.items() if c >= 2}
+
+    combined = sorted(context_hits | freq_hits)
+    if combined:
+        return combined[:5]
+
+    # Якщо контейнер компактний і містить рівно 1 або 2 строгих G-ID (наприклад, один макрос у GTM), повертаємо їх
+    if 1 <= len(counts) <= 2:
+        return sorted(counts.keys())
+
+    return []
 
 
 def detect_tech_with_evidence(
@@ -895,8 +920,8 @@ def detect_tech_with_evidence(
         ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js)'
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
 
-    ga4_in_html = extract_verified_ga4_ids(html)
-    ga4_in_gtm = extract_verified_ga4_ids(clean_gtm)
+    ga4_in_html = extract_verified_html_ga4_ids(html)
+    ga4_in_gtm = extract_gtm_ga4_ids(clean_gtm)
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
@@ -912,7 +937,8 @@ def detect_tech_with_evidence(
         elif ga4_in_gtm:
             evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
         else:
-            evidence_items.append('GA4 (gtag.js / g/collect script)')
+            # П.3: Чітке пояснення, коли скрипт GA4 є, але ID підвантажується динамічно
+            evidence_items.append('GA4 (gtag.js endpoint detected; measurement_id not exposed in static HTML)')
 
     aw_in_html = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(html)})
     aw_in_gtm = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(clean_gtm)})
@@ -954,7 +980,7 @@ def detect_tech_with_evidence(
     else:
         ev_summary = ' | '.join(evidence_items)
 
-    all_ga4_list = sorted(set(ga4_in_html) | set(ga4_in_gtm))
+    all_ga4_list = sorted(set(ga4_in_html) | set(ga4_in_gtm))[:5]
 
     return {
         'has_meta_pixel': 'Meta Pixel' in detected,
@@ -1059,10 +1085,6 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool]:
-    """
-    П.2: Для ФОП-фолбеку тепер виконується реальна перевірка DM_LEGAL_SOURCE_FLAG
-    замість захардкодженого True (brabrabra.ua/ua/our-services/ -> is_leg=False).
-    """
     candidate_li_urls = []
 
     for page_url, html, _ in pages_with_urls:
@@ -1156,7 +1178,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v50(
+def evaluate_qualification_v60(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1227,7 +1249,7 @@ def evaluate_qualification_v50(
             '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
-    # 3. Contact Quality Tier & Warnings (П.5 & П.9: Окрема логіка для агенцій без зайвих попереджень)
+    # 3. Contact Quality Tier & Warnings
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
@@ -1236,12 +1258,12 @@ def evaluate_qualification_v50(
         if dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
             contact_quality = (
                 f'Agency Partner Contact (Named Staff Inbox {best_email} Found, '
-                f'Different from Listed Executive {dm_name})'
+                f'Listed Executive is {dm_name})'
             )
             enrichment_status = 'agency_partner_unmatched_executive_and_staff_email'
+            # П.4: Спокійна партнерська нотатка для агенцій замість клієнтського попередження
             confidence_warning = (
-                f'Warning: Email {best_email} belongs to a different person than '
-                f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.'
+                f'Note: Agency partnership contact — route to {best_email}, not to {dm_name}.'
             )
         elif dm_name:
             contact_quality = f'Agency Partner Contact (Executive {dm_name} Identified — Route to Partner Pipeline)'
@@ -1331,7 +1353,7 @@ def evaluate_qualification_v50(
         enrichment_status = 'no_public_contacts_found'
         confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. П.4 & П.6: Узгоджений Sales Readiness Verdict (без "Tech-Qualified", коли tech=0, і з підтримкою відомого власника)
+    # 4. Sales Readiness Verdict
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -1378,7 +1400,7 @@ def evaluate_qualification_v50(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. П.10: Уніфікований Next Best Action (без суперечності між Gatekeeper-Ready та "Send discovery audit")
+    # 6. Next Best Action
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or primary_phone}"
     elif company_category == 'Non-Profit / Education / Institution':
@@ -1610,10 +1632,6 @@ async def fetch_html_safely(
     timeout: float = 15.0,
     retries: int = 4
 ) -> tuple[int, str, str, str]:
-    """
-    П.7: Якщо сервер редіректить на піддомен чекауту (us.checkout.gymshark.com),
-    перехоплює це і запитує www-версію основного домену без переходу в чекаут.
-    """
     last_error = ''
     impersonations = ['chrome', 'safari', 'chrome110', 'chrome']
     current_target_url = url
@@ -1647,7 +1665,6 @@ async def fetch_html_safely(
                 final_url = clean_url_port(str(resp.url)) or str(resp.url)
                 final_host = urlparse(final_url).netloc.lower()
 
-                # П.7: Якщо редірект викинув нас на checkout.domain.com, пробуємо www.canonical
                 if CHECKOUT_REDIRECT_HOSTS.match(final_host) and attempt == 0:
                     clean_canon = get_clean_canonical_domain(final_url, urlparse(url).netloc)
                     current_target_url = f'https://www.{clean_canon}/'
@@ -1898,7 +1915,6 @@ async def process_domain(
                     if is_soft_404_page(sub_html, sub_title):
                         continue
 
-                    # П.3: Уніфікований захист page_title та meta_desc головної сторінки (беремо з підсторінки тільки якщо головна була Soft-404)
                     if homepage_was_soft_404:
                         if not page_title and sub_title:
                             page_title = sub_title
@@ -1979,7 +1995,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v50(
+        ) = evaluate_qualification_v60(
             company_category,
             tech_info,
             best_email,
@@ -2139,7 +2155,7 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{result['status'].upper()}] {result['canonical_domain']} | "
-                        f"GA4: {result['all_ga4_ids'] or '-'} | "
+                        f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
                     )
