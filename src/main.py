@@ -12,13 +12,22 @@ import phonenumbers
 from bs4 import BeautifulSoup
 from apify import Actor
 
+# Опціональний імпорт Playwright: якщо встановлений у Docker-образі — надає JS-рендер для SPA та клік по Cookie Banner
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_INSTALLED = True
+except ImportError:
+    PLAYWRIGHT_INSTALLED = False
+
 MAX_HTML_BYTES = 1_500_000
-# Заморожена версія схеми кешу (приймає >= 6, щоб не скидати валідні снапшоти між перезапусками)
-CACHE_SCHEMA_VERSION = 7
-MIN_COMPATIBLE_CACHE_SCHEMA = 6
+CACHE_SCHEMA_VERSION = 8
+MIN_COMPATIBLE_CACHE_SCHEMA = 8
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-SCHEMA_PHONE_REGEX = re.compile(r'"telephone"\s*:\s*"([^"]{7,30})"', re.IGNORECASE)
+SCHEMA_PHONE_REGEX = re.compile(
+    r'"(?:telephone|phone|contactPhone|phoneNumber|tel)"\s*:\s*"([^"]{7,30})"',
+    re.IGNORECASE
+)
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
@@ -870,7 +879,6 @@ def extract_valid_phones(
 
 
 def extract_verified_html_ga4_ids(html: str) -> list[str]:
-    """Tier A: Витягує 100% підтверджені GA4 ID з HTML у детермінованому порядку першої появи."""
     pos_map: dict[str, int] = {}
     for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
         for m in rx.finditer(html):
@@ -881,46 +889,38 @@ def extract_verified_html_ga4_ids(html: str) -> list[str]:
     return sorted(pos_map.keys(), key=lambda g: pos_map[g])
 
 
-def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], bool]:
+def extract_gtm_ga4_ids(gtm_js: str) -> tuple[list[str], bool, str]:
     """
-    П.1 & П.2: Трирівнева детермінована класифікація GA4 у GTM:
-    - Tier B1: Явні виклики gtag('config') / gtag/js / g/collect всередині GTM.
-    - Tier B2: JSON-ключі measurementId / tagId / sendTo у GTM (якщо >= 2 ID, повертає всі у стабільному sorted()-порядку як multi-property).
-    - Tier C: Частотний фолбек (для макросів GTM), відсортований через sorted() для 100% ідентичності між запусками.
-    Повертає (ga4_ids_list, is_multi_property).
+    П.5: Повертає (ga4_ids_list, is_multi_property, confidence_level).
     """
     if not gtm_js:
-        return [], False
+        return [], False, 'None'
 
-    # Tier B1: Активні скрипти/конфіги всередині GTM
     tier_b1_set = set()
     for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
         for m in rx.finditer(gtm_js):
             tier_b1_set.add(m.group(1).upper())
     if tier_b1_set:
         ordered_b1 = sorted(tier_b1_set)
-        return ordered_b1[:5], len(ordered_b1) >= 2
+        return ordered_b1[:5], len(ordered_b1) >= 2, 'High (GTM Active Config)'
 
-    # Tier B2: JSON-властивості measurementId / tagId / sendTo у GTM
     tier_b2_set = {m.group(1).upper() for m in GTM_JSON_GA4_REGEX.finditer(gtm_js)}
     if tier_b2_set:
         ordered_b2 = sorted(tier_b2_set)
         if len(ordered_b2) >= 2:
-            # Multi-property GTM (як на allbirds.com або kachorovska.com): не вгадуємо один випадковий ID, повертаємо всі стабільно!
-            return ordered_b2[:5], True
-        return ordered_b2[:1], False
+            return ordered_b2[:5], True, 'Medium-High (GTM Multi-Property JSON)'
+        return ordered_b2[:1], False, 'Medium-High (GTM JSON Property)'
 
-    # Tier C: Частотний фолбек для констант-макросів GTM
     strict_matches = [m.group(0).upper() for m in GA4_STRICT_10CHAR_REGEX.finditer(gtm_js)]
     counts = Counter(strict_matches)
     freq_candidates = sorted(gid for gid, c in counts.items() if c >= 2)
     if freq_candidates:
-        return freq_candidates[:1], False
+        return freq_candidates[:1], False, 'Medium (GTM Macro Heuristic)'
 
     if len(counts) == 1:
-        return list(counts.keys()), False
+        return list(counts.keys()), False, 'Medium (GTM Single Macro)'
 
-    return [], False
+    return [], False, 'None'
 
 
 def detect_tech_with_evidence(
@@ -936,6 +936,7 @@ def detect_tech_with_evidence(
 
     detected = []
     evidence_items = []
+    summary_items = []
 
     has_cookie_banner = any(cm in html_lower or cm in gtm_lower for cm in COOKIE_CONSENT_MARKERS)
 
@@ -944,9 +945,10 @@ def detect_tech_with_evidence(
         detected.append('Google Tag Manager')
         ev_str = f"GTM ({', '.join(gtm_ids)})" if gtm_ids else 'GTM (gtm.js)'
         evidence_items.append(f'{ev_str} [Direct HTML] on {clean_page_url}')
+        summary_items.append(ev_str)
 
     ga4_in_html = extract_verified_html_ga4_ids(html)
-    ga4_in_gtm, is_multi_ga4 = extract_gtm_ga4_ids(clean_gtm)
+    ga4_in_gtm, is_multi_ga4, gtm_ga4_conf = extract_gtm_ga4_ids(clean_gtm)
 
     has_ga4 = (
         bool(ga4_in_html or ga4_in_gtm)
@@ -955,20 +957,31 @@ def detect_tech_with_evidence(
         or 'googletagmanager.com/gtag/js' in html_lower
         or 'googletagmanager.com/gtag/js' in gtm_lower
     )
+    ga4_confidence = None
     if has_ga4:
         detected.append('Google Analytics (GA4)')
         if ga4_in_html:
+            ga4_confidence = 'High (Direct HTML Config)'
             evidence_items.append(f'GA4 ({ga4_in_html[0]} in Direct HTML)')
+            summary_items.append(f'GA4 ({ga4_in_html[0]})')
         elif ga4_in_gtm:
+            ga4_confidence = gtm_ga4_conf
             if is_multi_ga4 and len(ga4_in_gtm) >= 2:
                 preview_ids = ', '.join(ga4_in_gtm[:3])
+                # П.4: Явна позначка (+N more), коли в контейнері більше 3 ID (кейс meest.com)
+                if len(ga4_in_gtm) > 3:
+                    preview_ids += f', ... (+{len(ga4_in_gtm) - 3} more)'
                 evidence_items.append(
                     f'GA4 (multi-property GTM container: {len(ga4_in_gtm)} measurement IDs — {preview_ids})'
                 )
+                summary_items.append(f'GA4 ({len(ga4_in_gtm)} IDs: {ga4_in_gtm[0]}, ...)')
             else:
                 evidence_items.append(f'GA4 ({ga4_in_gtm[0]} in GTM Container)')
+                summary_items.append(f'GA4 ({ga4_in_gtm[0]})')
         else:
+            ga4_confidence = 'Low (Script Endpoint Only — ID Dynamic)'
             evidence_items.append('GA4 (gtag.js endpoint detected; measurement_id not exposed in static HTML)')
+            summary_items.append('GA4 (dynamic ID)')
 
     aw_in_html = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(html)})
     aw_in_gtm = sorted({m.upper() for m in GOOGLE_ADS_REGEX.findall(clean_gtm)})
@@ -981,16 +994,20 @@ def detect_tech_with_evidence(
         detected.append('Google Ads Conversion')
         if aw_in_html:
             evidence_items.append(f'Google Ads ({aw_in_html[0]} in Direct HTML)')
+            summary_items.append(f'Google Ads ({aw_in_html[0]})')
         elif aw_in_gtm:
             evidence_items.append(f'Google Ads ({aw_in_gtm[0]} in GTM Container)')
+            summary_items.append(f'Google Ads ({aw_in_gtm[0]})')
         else:
             evidence_items.append('Google Ads (pagead/conversion script)')
+            summary_items.append('Google Ads')
 
     for name, markers in AD_AND_ANALYTICS_SIGNATURES.items():
         matched_in_html = next((m for m in markers if m in html_lower), None)
         matched_in_gtm = next((m for m in markers if m in gtm_lower), None)
         if matched_in_html or matched_in_gtm:
             detected.append(name)
+            summary_items.append(name)
             if matched_in_html:
                 evidence_items.append(f"{name} ('{matched_in_html}' in Direct HTML)")
             else:
@@ -1002,6 +1019,7 @@ def detect_tech_with_evidence(
         if matched_cms:
             detected.append(cms_name)
             detected_cms.append(cms_name)
+            summary_items.append(cms_name)
             evidence_items.append(f"{cms_name} ('{matched_cms}' in Direct HTML)")
 
     has_any_tracking = has_gtm or has_ga4 or has_google_ads or any(
@@ -1011,14 +1029,18 @@ def detect_tech_with_evidence(
     if not evidence_items:
         if has_cookie_banner:
             ev_summary = 'No static tags visible (Consent Mode / Cookie banner detected; tags likely fire post-consent)'
+            short_summary = 'Consent-Gated (No static tags)'
         else:
             ev_summary = 'No tracking markers detected in static HTML'
+            short_summary = 'None'
     else:
         if not has_any_tracking and has_cookie_banner:
             evidence_items.append(
                 'Consent-gated tracking likely (Cookie Consent / Privacy API detected; pixels fire post-consent)'
             )
+            summary_items.append('Consent-Gated Banner')
         ev_summary = ' | '.join(evidence_items)
+        short_summary = ', '.join(summary_items)
 
     all_ga4_list = ga4_in_html[:3] if ga4_in_html else ga4_in_gtm[:5]
 
@@ -1033,10 +1055,13 @@ def detect_tech_with_evidence(
         'has_ga4': has_ga4,
         'has_gtm': has_gtm,
         'all_ga4_ids': '; '.join(all_ga4_list) if all_ga4_list else None,
+        'ga4_detection_confidence': ga4_confidence,
         'detected_cms_list': detected_cms,
+        'detected_cms': '; '.join(detected_cms) if detected_cms else None,
         'has_cookie_banner': has_cookie_banner,
         'detected_technologies_list': detected,
-        'technology_evidence': ev_summary
+        'technology_evidence': ev_summary,
+        'technology_evidence_summary': short_summary
     }
 
 
@@ -1220,7 +1245,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v90(
+def evaluate_qualification_v100(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1259,7 +1284,6 @@ def evaluate_qualification_v90(
     detected_cms = tech_info.get('detected_cms_list', [])
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
 
-    # П.4: Якщо рекламних сигналів у статиці 0, але виявлено CMS (як Shopify на gymshark), вказуємо це в detected_signals!
     if all_signals:
         detected_signals_str = ', '.join(all_signals)
     elif detected_cms:
@@ -1302,7 +1326,7 @@ def evaluate_qualification_v90(
             '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
-    # 3. Contact Quality Tier & Warnings
+    # 3. Contact Quality Tier & Warnings (П.7: Консистентний префікс Agency Tier A-/B+/B/C)
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
@@ -1310,7 +1334,7 @@ def evaluate_qualification_v90(
     if is_agency:
         if dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
             contact_quality = (
-                f'Agency Partner Contact (Named Staff Inbox {best_email} Found, '
+                f'Agency Tier B+ (Named Staff Inbox {best_email} Found, '
                 f'Listed Executive is {dm_name})'
             )
             enrichment_status = 'agency_partner_unmatched_executive_and_staff_email'
@@ -1318,11 +1342,11 @@ def evaluate_qualification_v90(
                 f'Note: Agency partnership contact — route to {best_email}, not to {dm_name}.'
             )
         elif dm_name:
-            contact_quality = f'Agency Partner Contact (Executive {dm_name} Identified — Route to Partner Pipeline)'
+            contact_quality = f'Agency Tier A- (Executive {dm_name} Identified — Route to Partner Pipeline)'
             enrichment_status = 'agency_partner_executive_identified'
             confidence_warning = 'None'
         else:
-            contact_quality = f'Agency Partner Contact ({best_email or "General Channel"} — Route to Partner Pipeline)'
+            contact_quality = f'Agency Tier C ({best_email or "General Channel"} — Route to Partner Pipeline)'
             enrichment_status = 'agency_partner_channel'
             confidence_warning = 'None'
     elif dm_name and is_same_person_email:
@@ -1545,6 +1569,7 @@ def parse_html_sync(
         og_title = (
             soup.find('meta', attrs={'property': re.compile(r'^og:title$', re.I)})
             or soup.find('meta', attrs={'property': re.compile(r'^og:site_name$', re.I)})
+            or soup.find('meta', attrs={'name': re.compile(r'^application-name$', re.I)})
         )
         if og_title and og_title.get('content'):
             raw_og = ' '.join(str(og_title['content']).split())
@@ -1563,6 +1588,30 @@ def parse_html_sync(
         decoded = decode_cf_email(cf_tag['data-cfemail'])
         if decoded and EMAIL_REGEX.match(decoded):
             email_sources[decoded] = clean_page
+
+    # П.1 (Рівень 1): Розпакування вбудованих JSON-стейтів SPA (__NEXT_DATA__, Nuxt, JSON конфіги)
+    spa_text_fragments = []
+    for script_tag in soup.find_all('script'):
+        sc_text = script_tag.string
+        if not sc_text or len(sc_text) < 20:
+            continue
+        if (
+            script_tag.get('id') == '__NEXT_DATA__'
+            or '__NUXT__' in sc_text
+            or '"contact"' in sc_text.lower()
+            or '"email"' in sc_text.lower()
+            or '"phone"' in sc_text.lower()
+        ):
+            unesc_sc = html_lib.unescape(sc_text).replace('\\/', '/')
+            for em in EMAIL_REGEX.findall(unesc_sc):
+                email_sources.setdefault(em, clean_page)
+            for tel_m in SCHEMA_PHONE_REGEX.findall(unesc_sc):
+                raw_tel_candidates.append((tel_m, 'spa_json_state'))
+            for platform in social_candidates:
+                for url_m in re.findall(r'https?://[^\s"\'<>\\]+', unesc_sc):
+                    clean_soc = clean_and_validate_social_url(platform, url_m)
+                    if clean_soc:
+                        social_candidates[platform].append((clean_soc, clean_page))
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href'].strip()
@@ -1613,7 +1662,7 @@ def parse_html_sync(
         if best_soc and best_src:
             socials_with_source[platform] = (best_soc, best_src)
 
-    text_content = soup.get_text(' ', strip=True)
+    text_content = ' '.join([soup.get_text(' ', strip=True)] + spa_text_fragments)
     for m in EMAIL_REGEX.findall(text_content):
         email_sources.setdefault(m, clean_page)
 
@@ -1623,6 +1672,62 @@ def parse_html_sync(
     ordered_contact_links = sorted(primary_links) + sorted(secondary_links - primary_links)
 
     return page_title, meta_desc, text_content, email_sources, phones_with_source, socials_with_source, ordered_contact_links
+
+
+async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str]:
+    """
+    П.1 (Рівень 2): Опціональний Headless Chromium (Playwright) фолбек для важких SPA
+    та сайтів із Cookie-Consent блокуванням тегів. Автоматично натискає 'Accept Cookies'.
+    Якщо Playwright не встановлений в образі — безпечно повертає ('', url).
+    """
+    if not PLAYWRIGHT_INSTALLED:
+        return '', url
+
+    try:
+        async with async_playwright() as p:
+            launch_kwargs = {'headless': True}
+            if proxy_url:
+                launch_kwargs['proxy'] = {'server': proxy_url}
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                context = await browser.new_context(
+                    locale='uk-UA',
+                    user_agent=(
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+                    )
+                )
+                page = await context.new_page()
+                await page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                await page.wait_for_timeout(1500)
+
+                # Програмний клік на банери згоди Cookie Consent (OneTrust, Cookiebot тощо)
+                consent_selectors = [
+                    '#onetrust-accept-btn-handler',
+                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                    'button:has-text("Accept all")',
+                    'button:has-text("Accept")',
+                    'button:has-text("Прийняти")',
+                    'button:has-text("Погоджуюсь")',
+                    '[aria-label="Accept cookies"]'
+                ]
+                for sel in consent_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.is_visible(timeout=400):
+                            await loc.click(timeout=800)
+                            await page.wait_for_timeout(1200)
+                            break
+                    except Exception:
+                        continue
+
+                rendered_html = await page.content()
+                final_u = clean_url_port(page.url) or url
+                return rendered_html, final_u
+            finally:
+                await browser.close()
+    except Exception:
+        return '', url
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
@@ -1697,7 +1802,6 @@ async def fetch_html_safely(
     timeout: float = 15.0,
     retries: int = 5
 ) -> tuple[int, str, str, str]:
-    """П.5: Посилений 403-retry з експоненційним backoff та ротацією TLS-профілів."""
     last_error = ''
     impersonations = ['chrome', 'safari', 'chrome110', 'edge99', 'chrome']
     current_target_url = url
@@ -1879,7 +1983,7 @@ async def process_domain(
                 'technical_signal_strength': None,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
-                'data_confidence_warning': f'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
+                'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
                 'page_title': None,
                 'meta_description': None,
@@ -1904,8 +2008,12 @@ async def process_domain(
                 'youtube_url': None,
                 'social_source_url': None,
                 'detected_signals': None,
+                'detected_cms': None,
+                'consent_mode_likely': None,
+                'ga4_detection_confidence': None,
                 'sales_opportunity': f'Scan {fail_status} ({err_msg}) — cannot verify stack without access',
                 'next_best_action': 'Retry with residential proxy or run decision_maker_search_query on LinkedIn',
+                'technology_evidence_summary': None,
                 'technology_evidence': None,
                 'has_meta_pixel': None,
                 'has_tiktok_pixel': None,
@@ -1996,6 +2104,33 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
+        # П.1 (Рівень 2): Якщо після статичного обходу контактів 0 (як на SPA justin.ua / meest.com)
+        # або трекінг прихований за Consent Banner — викликаємо Playwright fallback (якщо встановлено)
+        has_initial_contacts = bool(email_sources or phone_map or socials_with_source)
+        needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
+
+        if PLAYWRIGHT_INSTALLED and (not has_initial_contacts or needs_pw_tech):
+            pw_html, pw_url = await fetch_html_playwright_fallback(normalized_final_redirect)
+            if pw_html and len(pw_html) > 500:
+                pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, _ = await loop.run_in_executor(
+                    thread_pool, parse_html_sync, pw_html, pw_url, default_region
+                )
+                if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
+                    page_title = pw_title
+                if not meta_desc and pw_desc:
+                    meta_desc = pw_desc
+                pages_with_urls.append((pw_url, pw_html, pw_text))
+                for em, src in pw_e.items():
+                    email_sources.setdefault(em, src)
+                for p, sc, src in pw_p:
+                    if p not in phone_map or sc > phone_map[p][0]:
+                        phone_map[p] = (sc, src)
+                for k, v in pw_s.items():
+                    socials_with_source.setdefault(k, v)
+                if needs_pw_tech:
+                    pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
+                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
+
         ranked_emails_with_src = rank_and_clean_emails(email_sources, canonical_domain)
 
         sorted_phones_with_src = sorted(
@@ -2061,7 +2196,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v90(
+        ) = evaluate_qualification_v100(
             company_category,
             tech_info,
             best_email,
@@ -2084,7 +2219,6 @@ async def process_domain(
         all_emails_list = (non_legal_emails or [em for em, _ in ranked_emails_with_src])[:5]
         all_phones_list = [p for p, _ in sorted_phones_with_src]
 
-        # П.3: Повернено чесний page_title or None (без підстановки canonical_domain)
         result_record = {
             'input_domain': domain_key,
             'canonical_domain': canonical_domain,
@@ -2123,8 +2257,12 @@ async def process_domain(
             'youtube_url': socials_with_source.get('youtube', (None, None))[0],
             'social_source_url': social_source_url,
             'detected_signals': detected_signals,
+            'detected_cms': tech_info['detected_cms'],
+            'consent_mode_likely': tech_info['has_cookie_banner'],
+            'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
             'sales_opportunity': sales_opportunity,
             'next_best_action': next_best_action,
+            'technology_evidence_summary': tech_info['technology_evidence_summary'],
             'technology_evidence': tech_info['technology_evidence'],
             'has_meta_pixel': tech_info['has_meta_pixel'],
             'has_tiktok_pixel': tech_info['has_tiktok_pixel'],
@@ -2189,7 +2327,8 @@ async def main() -> None:
 
         Actor.log.info(
             f'Processing {len(prepared_domains)} unique domains '
-            f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, cache schema: v{CACHE_SCHEMA_VERSION})...'
+            f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, '
+            f'playwright_available: {PLAYWRIGHT_INSTALLED}, cache schema: v{CACHE_SCHEMA_VERSION})...'
         )
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
