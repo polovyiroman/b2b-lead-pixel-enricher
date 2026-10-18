@@ -61,6 +61,60 @@ from .tech_detector import (
     detect_tech_with_evidence,
 )
 
+TECH_FLAG_TO_NAME_MAP = (
+    ('has_meta_pixel', 'Meta Pixel'),
+    ('has_tiktok_pixel', 'TikTok Pixel'),
+    ('has_google_ads', 'Google Ads Conversion'),
+    ('has_linkedin_pixel', 'LinkedIn Insight Tag'),
+    ('has_pinterest_tag', 'Pinterest Tag'),
+    ('has_hubspot', 'HubSpot'),
+    ('has_klaviyo', 'Klaviyo'),
+    ('has_ga4', 'Google Analytics (GA4)'),
+    ('has_gtm', 'Google Tag Manager'),
+)
+
+
+def normalize_tech_info_booleans(tech_info: dict) -> None:
+    """
+    P0 Fix (Bug 3): Примусово синхронізує всі булеві прапорці has_* із detected_technologies_list,
+    щоб унеможливити розбіжності після підтягування старого кешу (напр. readdle.com / ajax.systems).
+    """
+    techs_list = tech_info.get('detected_technologies_list') or []
+    techs_set = {t.strip() for t in techs_list if t and t.strip()}
+    is_partial = (tech_info.get('tech_scan_completeness', 'full') != 'full')
+
+    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
+        is_found = (tech_label in techs_set) or bool(tech_info.get(flag_key))
+        if flag_key == 'has_ga4' and tech_info.get('all_ga4_ids'):
+            is_found = True
+        if is_found and tech_label not in techs_set:
+            techs_list.append(tech_label)
+            techs_set.add(tech_label)
+        tech_info[flag_key] = True if is_found else (None if is_partial else False)
+
+    tech_info['detected_technologies_list'] = techs_list
+
+
+def normalize_cached_record_booleans(cached_copy: dict) -> None:
+    """
+    P0 Fix (Bug 3): Синхронізує булеві прапорці has_* та detected_technologies у повному кеш-фолбеку.
+    """
+    raw_tech_str = cached_copy.get('detected_technologies') or ''
+    techs_list = [x.strip() for x in raw_tech_str.split(';') if x.strip()]
+    techs_set = set(techs_list)
+    is_partial = (cached_copy.get('tech_scan_completeness', 'full') != 'full')
+
+    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
+        is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
+        if flag_key == 'has_ga4' and cached_copy.get('all_ga4_ids'):
+            is_found = True
+        if is_found and tech_label not in techs_set:
+            techs_list.append(tech_label)
+            techs_set.add(tech_label)
+        cached_copy[flag_key] = True if is_found else (None if is_partial else False)
+
+    cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
+
 
 async def process_domain(
     client: AsyncSession,
@@ -78,9 +132,8 @@ async def process_domain(
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
-    pw_avail = is_playwright_available()
     pw_used_flag = False
-    pw_status_str = 'not_needed' if pw_avail else 'disabled'
+    pw_status_str = 'not_needed' if is_playwright_available() else 'disabled'
     pw_attempts_count = 0
     pw_attempted_paths: list[str] = []
     pw_had_timeout_or_block = False
@@ -156,7 +209,8 @@ async def process_domain(
                             f'Note: Live scan encountered {short_err_msg}; returning cached snapshot '
                             f'({cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d) from {prev_time}.'
                         )
-                        cached_copy.setdefault('playwright_available', pw_avail)
+                        # P0 Fix (Bug 1): завжди беремо свіжий статус is_playwright_available()
+                        cached_copy['playwright_available'] = is_playwright_available()
                         cached_copy['playwright_used'] = False
                         cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
                         cached_copy['playwright_attempts_count'] = 0
@@ -181,6 +235,9 @@ async def process_domain(
                         cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
                         cached_copy.setdefault('decision_makers_found', None)
                         cached_copy.setdefault('named_email_owner_role_hint', None)
+
+                        # P0 Fix (Bug 3): синхронізація всіх булевих прапорців із detected_technologies
+                        normalize_cached_record_booleans(cached_copy)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
 
                         has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
@@ -210,7 +267,7 @@ async def process_domain(
                     fail_status,
                     short_err_msg,
                     checked_at,
-                    pw_avail
+                    is_playwright_available()
                 )
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
@@ -239,7 +296,8 @@ async def process_domain(
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
-                'playwright_available': pw_avail,
+                # P0 Fix (Bug 1): свіжий виклик is_playwright_available()
+                'playwright_available': is_playwright_available(),
                 'playwright_used': False,
                 'playwright_status': 'not_attempted_site_blocked',
                 'playwright_attempts_count': 0,
@@ -483,6 +541,9 @@ async def process_domain(
         if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm']):
             scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
+
+        # P0 Fix (Bug 3): фінальна нормалізація всіх булевих прапорців has_* перед кваліфікацією та записом
+        normalize_tech_info_booleans(tech_info)
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
@@ -817,7 +878,3 @@ async def main() -> None:
         finally:
             await close_shared_playwright_browser()
             thread_pool.shutdown(wait=False)
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
