@@ -461,22 +461,25 @@ def build_manual_seed_record(
     dm_src_type = seed.get('decision_maker_source_type') or classify_dm_source_type(dm_src)
     li_url = seed.get('linkedin_url')
 
+    seed_tech_list = [x.strip() for x in (seed.get('detected_technologies') or '').split(';') if x.strip()]
+    seed_tech_set = set(seed_tech_list)
+
     tech_info = {
-        'has_meta_pixel': seed.get('has_meta_pixel', True),
-        'has_tiktok_pixel': seed.get('has_tiktok_pixel', False),
-        'has_google_ads': seed.get('has_google_ads', True),
-        'has_linkedin_pixel': seed.get('has_linkedin_pixel', False),
-        'has_pinterest_tag': seed.get('has_pinterest_tag', False),
-        'has_hubspot': seed.get('has_hubspot', False),
-        'has_klaviyo': seed.get('has_klaviyo', False),
-        'has_ga4': seed.get('has_ga4', True),
-        'has_gtm': seed.get('has_gtm', True),
+        'has_meta_pixel': ('Meta Pixel' in seed_tech_set) or bool(seed.get('has_meta_pixel', True)),
+        'has_tiktok_pixel': ('TikTok Pixel' in seed_tech_set) or bool(seed.get('has_tiktok_pixel', False)),
+        'has_google_ads': ('Google Ads Conversion' in seed_tech_set) or bool(seed.get('has_google_ads', True)),
+        'has_linkedin_pixel': ('LinkedIn Insight Tag' in seed_tech_set) or bool(seed.get('has_linkedin_pixel', False)),
+        'has_pinterest_tag': ('Pinterest Tag' in seed_tech_set) or bool(seed.get('has_pinterest_tag', False)),
+        'has_hubspot': ('HubSpot' in seed_tech_set) or bool(seed.get('has_hubspot', False)),
+        'has_klaviyo': ('Klaviyo' in seed_tech_set) or bool(seed.get('has_klaviyo', False)),
+        'has_ga4': ('Google Analytics (GA4)' in seed_tech_set) or bool(seed.get('has_ga4', True)),
+        'has_gtm': ('Google Tag Manager' in seed_tech_set) or bool(seed.get('has_gtm', True)),
         'all_ga4_ids': seed.get('all_ga4_ids'),
         'ga4_detection_confidence': seed.get('ga4_detection_confidence', 'Verified (Manual Audit Seed)'),
         'detected_cms_list': [x.strip() for x in (seed.get('detected_cms') or '').split(';') if x.strip()],
         'detected_cms': seed.get('detected_cms'),
         'has_cookie_banner': bool(seed.get('consent_mode_likely', False)),
-        'detected_technologies_list': [x.strip() for x in (seed.get('detected_technologies') or '').split(';') if x.strip()],
+        'detected_technologies_list': seed_tech_list,
         'technology_evidence': seed.get('technology_evidence', 'Verified via manual_seed'),
         'technology_evidence_summary': seed.get('technology_evidence_summary', 'GTM, GA4, Meta Pixel (Manual Seed)'),
         'tech_scan_completeness': 'full'
