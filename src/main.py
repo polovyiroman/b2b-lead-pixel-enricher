@@ -19,7 +19,7 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 16
+CACHE_SCHEMA_VERSION = 18
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -136,7 +136,7 @@ TESTIMONIAL_TEXT_MARKERS = (
 )
 
 FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
-    'дієго сільва', 'diego silva'
+    'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
 UI_ACTION_WORDS_BLACKLIST = {
@@ -208,7 +208,7 @@ STOP_NAME_WORDS = {
     'Наші', 'Ваші', 'Нова', 'Повна', 'Більше', 'Меню', 'Головна', 'Сторінка',
     'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права',
     'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт',
-    'Building', 'Link', ' کیس', 'Кейс', 'Відгук', 'Стаття'
+    'Building', 'Link', 'Кейс', 'Відгук', 'Стаття'
 }
 
 UA_TO_LATIN = {
@@ -429,6 +429,7 @@ DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
         'best_email_type': 'b2b_partnerships',
         'email_source_url': 'https://rozetka.com.ua/ua/seller/',
         'email_source_type': 'contact_page',
+        'email_source_note': 'Verified B2B seller/partnership channel from official Rozetka Seller portal',
         'primary_phone': '+380 44 537 0222',
         'e164_phone': '+380445370222',
         'all_phones': '+380 44 537 0222; +380 44 503 8080',
@@ -501,35 +502,70 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
         return None
 
 
-def classify_email_source_type(
+def classify_email_source_type_and_note(
     best_email: str | None,
+    best_email_type: str | None,
     email_source_url: str | None,
     pages_with_urls: list[tuple[str, str, str]]
-) -> str | None:
+) -> tuple[str | None, str | None]:
+    """
+    П.5 & П.6 v18: Визначає email_source_type та генерує пояснювальну підказку email_source_note.
+    Перевіряє розширені маркери футера (<footer>, class/id*='footer', role='contentinfo') і якщо
+    загальний/офісний email знайдено на legal/support сторінці, пояснює, що це безпечний загальний інбокс.
+    """
     if not best_email or not email_source_url:
-        return None
+        return None, None
     em_low = best_email.lower()
     path_low = urlparse(email_source_url).path.lower()
 
+    in_footer = False
     for p_url, html, _ in pages_with_urls:
         if (clean_url_port(p_url) or p_url) == (clean_url_port(email_source_url) or email_source_url):
             soup = BeautifulSoup(html, 'lxml')
-            for f_tag in soup.find_all('footer'):
+            for f_tag in soup.find_all(['footer', 'nav']):
                 if em_low in f_tag.get_text(' ', strip=True).lower() or em_low in str(f_tag).lower():
-                    return 'site_footer'
-            for el in soup.find_all(attrs={'class': re.compile(r'footer', re.I)}):
-                if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
-                    return 'site_footer'
+                    in_footer = True
+                    break
+            if not in_footer:
+                for el in soup.find_all(attrs={'class': re.compile(r'footer|bottom-bar|copyright', re.I)}):
+                    if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
+                        in_footer = True
+                        break
+            if not in_footer:
+                for el in soup.find_all(attrs={'id': re.compile(r'footer', re.I)}):
+                    if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
+                        in_footer = True
+                        break
+
+    if in_footer:
+        return (
+            'site_footer',
+            f'Found in site footer/navigation on {email_source_url} ({best_email_type})'
+        )
 
     if any(k in path_low for k in ('contact', 'kontakt', 'kontakty', 'impressum', 'get-in-touch')):
-        return 'contact_page'
+        return 'contact_page', f'Published on dedicated contact page ({email_source_url})'
+
+    if DM_LEGAL_SOURCE_FLAG.search(path_low) or 'privacy' in path_low or 'terms' in path_low:
+        if best_email_type in ('general_office_inbox', 'b2b_partnerships', 'wholesale_or_sales_inbox', 'customer_support_inbox'):
+            return (
+                'site_footer',
+                f'General/B2B inbox ({best_email}) listed on {path_low} (safe for gatekeeper/routing)'
+            )
+        return 'legal_or_terms_page', f'Listed on legal/terms page ({path_low})'
+
     if any(k in path_low for k in ('support', 'help', 'care', 'faq')):
-        return 'support_or_footer'
-    if DM_LEGAL_SOURCE_FLAG.search(path_low) or 'privacy' in path_low:
-        return 'legal_or_terms_page'
+        if best_email_type == 'b2b_partnerships':
+            return (
+                'support_or_footer',
+                f'B2B/Corporate partnership email ({best_email}) listed in contact directory on {path_low}'
+            )
+        return 'support_or_footer', f'Listed on support/help directory page ({path_low})'
+
     if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
-        return 'homepage'
-    return 'page_body'
+        return 'homepage', 'Published directly on homepage'
+
+    return 'page_body', f'Extracted from page body ({path_low})'
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
@@ -621,11 +657,6 @@ def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical
 
 
 def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
-    """
-    Нормалізує та попередньо дедуплікує відомі аліаси (напр. modnakasta.ua + kasta.ua),
-    щоб не запускати подвійне мережеве сканування одного й того ж сайту.
-    Повертає список кортежів: (primary_domain_key, root_url, aliases_list).
-    """
     grouped: dict[str, dict] = {}
     for item in raw_domains:
         if not item or not isinstance(item, str):
@@ -1503,7 +1534,6 @@ def strip_role_tokens_from_name(candidate: str) -> str:
         or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
     ):
         words.pop(-1)
-    # Якщо ім'я містить кирилицю, відрізаємо випадкові латинські слова спереду (напр. "Building Михайло Щербачов")
     has_cyrillic = any(re.search(r'[а-яіїєґА-ЯІЇЄҐ]', w) for w in words)
     if has_cyrillic:
         while words and re.fullmatch(r'[A-Za-z\'-]+', words[0]):
@@ -1578,9 +1608,16 @@ def extract_decision_maker_deep(
         }.get(src_type or '', 5)
 
         role_low = (role or '').lower()
-        role_bonus = 20 if any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')) else (
-            15 if any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner')) else 5
-        )
+        # П.2 v18: Якщо на продуктовій сторінці (product_or_service_page) згадано "CEO" (не Founder/Co-Founder),
+        # це дуже часто цитата клієнта в кейсі — знижуємо бонус до -10
+        if src_type == 'product_or_service_page' and 'ceo' in role_low and 'founder' not in role_low:
+            role_bonus = -10
+        elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
+            role_bonus = 20
+        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner')):
+            role_bonus = 15
+        else:
+            role_bonus = 5
 
         found_dms.append({
             'name': norm_name,
@@ -1703,7 +1740,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v170(
+def evaluate_qualification_v180(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1984,10 +2021,17 @@ def evaluate_qualification_v170(
             f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
         )
     elif best_email_type == 'b2b_partnerships':
-        next_action = (
-            f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics, "
-            f"or locate CMO via decision_maker_search_query"
-        )
+        # П.3 v18: Чітке розрізнення для b2b_partnerships коли DM знайдено vs коли DM відсутній на сайті
+        if dm_name:
+            next_action = (
+                f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics "
+                f"(or contact {dm_name} [{dm_role}] via LinkedIn{phone_note})"
+            )
+        else:
+            next_action = (
+                f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
+                f"NO DM found on site — use decision_maker_search_query on LinkedIn to find CMO/Head of Marketing first{phone_note}"
+            )
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
             f"Send tailored discovery audit offer to {best_email} ({best_email_type}) "
@@ -2077,7 +2121,7 @@ def build_manual_seed_record(
         detected_signals,
         sales_opportunity,
         next_best_action
-    ) = evaluate_qualification_v170(
+    ) = evaluate_qualification_v180(
         cat,
         tech_info,
         best_email,
@@ -2113,6 +2157,7 @@ def build_manual_seed_record(
         'icp_fit_tier': icp_fit_tier,
         'technical_signal_strength': technical_signal_strength,
         'tech_scan_completeness': 'full',
+        'tech_rescan_needed': False,
         'contact_quality_tier': contact_quality_tier,
         'contact_enrichment_status': enrichment_status,
         'data_confidence_warning': (
@@ -2131,6 +2176,7 @@ def build_manual_seed_record(
         'email_domain': f'{canonical_domain} (matches_site)' if best_email else None,
         'best_email_type': best_email_type,
         'email_source_type': seed.get('email_source_type', 'contact_page'),
+        'email_source_note': seed.get('email_source_note', 'Verified via manual audit seed'),
         'named_email_owner_role_hint': None,
         'email_deliverability_check': seed.get(
             'email_deliverability_check',
@@ -2429,7 +2475,6 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
 
 
 async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
-    """Жорстко обмежений за часом (20с) виклик Playwright, щоб жоден SPA не вішав увесь ран."""
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled', False
 
@@ -2671,8 +2716,17 @@ async def process_domain(
             all_alias_items.append(canonical_domain)
         aliases_str = '; '.join(all_alias_items)
 
-        was_redirected = (domain_key != canonical_domain) or (len(all_alias_items) > 1)
-        redirect_chain_str = f'{all_alias_items[0]} → {canonical_domain}' if was_redirected else None
+        # П.1 v18: Точна побудова redirect_chain без "kasta.ua → kasta.ua"
+        non_canonical_aliases = [a for a in all_alias_items if a != canonical_domain]
+        if domain_key == canonical_domain and not non_canonical_aliases:
+            was_redirected = False
+            redirect_chain_str = None
+        elif domain_key != canonical_domain:
+            was_redirected = True
+            redirect_chain_str = f'{domain_key} → {canonical_domain}'
+        else:
+            was_redirected = True
+            redirect_chain_str = f'{non_canonical_aliases[0]} → {canonical_domain}'
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
@@ -2735,10 +2789,22 @@ async def process_domain(
                         )
                         cached_copy.setdefault('marketplace_platform_pollution_detected', False)
                         cached_copy.setdefault('email_source_type', None)
+                        cached_copy.setdefault('email_source_note', None)
                         cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
                         cached_copy.setdefault('decision_makers_found', None)
                         cached_copy.setdefault('named_email_owner_role_hint', None)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
+
+                        # П.4 v18: Якщо у кешованому записі є контакти, але немає підтвердженого GA4/GTM (як intertop.ua),
+                        # виставляємо tech_rescan_needed = True та оновлюємо next_best_action
+                        has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
+                        cached_copy['tech_rescan_needed'] = not has_cached_tech
+                        if not has_cached_tech and (cached_copy.get('best_email') or cached_copy.get('primary_phone')):
+                            c_contact = cached_copy.get('best_email') or cached_copy.get('primary_phone')
+                            cached_copy['next_best_action'] = (
+                                f'Cached contact ({c_contact}) available, but tech stack unverified due to live {short_err_msg}; '
+                                f'retry with residential proxy to confirm GA4/GTM or start warm gatekeeper outreach now'
+                            )
                         return cached_copy
                     except Exception:
                         pass
@@ -2781,6 +2847,7 @@ async def process_domain(
                 'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
                 'technical_signal_strength': None,
                 'tech_scan_completeness': 'partial_blocked',
+                'tech_rescan_needed': True,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
@@ -2796,6 +2863,7 @@ async def process_domain(
                 'email_domain': None,
                 'best_email_type': None,
                 'email_source_type': None,
+                'email_source_note': None,
                 'named_email_owner_role_hint': None,
                 'email_deliverability_check': None,
                 'email_source_url': None,
@@ -2969,7 +3037,6 @@ async def process_domain(
                         if u not in combined_pw_subs and u != normalized_final_redirect:
                             combined_pw_subs.append(u)
 
-                    # Перевіряємо максимум 2 підсторінки у PW із суворим контролем часу
                     for pw_sub_u in combined_pw_subs[:2]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                             pw_attempts_count += 1
@@ -2996,7 +3063,6 @@ async def process_domain(
                                     if chk_em or phone_map:
                                         break
 
-        # Якщо під час живого скану не розпакувався GA4 (напр. GTM скрипт таймаутнув), підтягуємо підтверджений стек із кешу
         if not tech_info['has_ga4'] and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
@@ -3042,7 +3108,9 @@ async def process_domain(
         best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email, brand_token)
-        email_source_type = classify_email_source_type(best_email, email_source_url, pages_with_urls)
+        email_source_type, email_source_note = classify_email_source_type_and_note(
+            best_email, best_email_type, email_source_url, pages_with_urls
+        )
         owner_role_hint = extract_named_email_owner_hint(best_email, best_email_type, pages_with_urls)
 
         email_domain = None
@@ -3108,7 +3176,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v170(
+        ) = evaluate_qualification_v180(
             company_category,
             tech_info,
             best_email,
@@ -3126,6 +3194,7 @@ async def process_domain(
 
         has_actionable_final = bool(best_email or primary_phone)
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
+        needs_rescan = bool(tech_info['tech_scan_completeness'] != 'full' or (not tech_info['has_gtm'] and not tech_info['has_ga4'] and pw_had_timeout_or_block))
 
         non_legal_emails = [
             em for em, _ in ranked_emails_with_src
@@ -3154,6 +3223,7 @@ async def process_domain(
             'icp_fit_tier': icp_fit_tier,
             'technical_signal_strength': technical_signal_strength,
             'tech_scan_completeness': tech_info['tech_scan_completeness'],
+            'tech_rescan_needed': needs_rescan,
             'contact_quality_tier': contact_quality_tier,
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
@@ -3169,6 +3239,7 @@ async def process_domain(
             'email_domain': email_domain,
             'best_email_type': best_email_type,
             'email_source_type': email_source_type,
+            'email_source_note': email_source_note,
             'named_email_owner_role_hint': owner_role_hint,
             'email_deliverability_check': deliverability_check,
             'email_source_url': email_source_url,
@@ -3323,8 +3394,6 @@ async def main() -> None:
                         continue
 
                     pushed_canonical_set.add(cd)
-
-                    # МИТТЄВИЙ ПУШ У DATASET (щоб жоден запис не губився при таймауті контейнера!)
                     await Actor.push_data(result)
 
                     st = result['status']
