@@ -36,8 +36,7 @@ SCHEMA_PHONE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# П.8: Справжній GTM ID майже завжди містить цифру або не входить у список JS-літералів
-GTM_ID_REGEX = re.compile(r'\bGTM-(?=[A-Z0-9]*\d)[A-Z0-9]{5,10}\b', re.IGNORECASE)
+GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
@@ -82,7 +81,6 @@ DM_LEGAL_SOURCE_FLAG = re.compile(
     re.IGNORECASE
 )
 
-# П.8: Розширений чорний список GTM-плейсхолдерів
 GTM_FALSE_POSITIVES = {
     'GTM-PAGE', 'GTM-SUITE', 'GTM-SECTION', 'GTM-WRAPPER', 'GTM-HEADER',
     'GTM-FOOTER', 'GTM-BUTTON', 'GTM-CLICK', 'GTM-EVENT', 'GTM-LOADER',
@@ -91,6 +89,18 @@ GTM_FALSE_POSITIVES = {
     'GTM-TRACK', 'GTM-NOSCRIPT', 'GTM-IFRAME', 'GTM-CUSTOM', 'GTM-CONFIG',
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
+
+
+def is_valid_gtm_id(candidate: str) -> bool:
+    up = candidate.upper()
+    if up in GTM_FALSE_POSITIVES:
+        return False
+    suffix = up[4:]
+    if any(ch.isdigit() for ch in suffix):
+        return True
+    vowels = sum(1 for ch in suffix if ch in 'AEIOUY')
+    return len(suffix) in (6, 7) and vowels <= 1
+
 
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
@@ -119,16 +129,22 @@ FOP_OWNER_PATTERN = re.compile(
     re.UNICODE
 )
 
-# П.6: Маркери відгуків клієнтів / кейсів у DOM та тексті
-TESTIMONIAL_ATTR_REGEX = re.compile(
-    r'(?:testimonial|review|feedback|quote|client-story|case-study|відгук|клієнт|отзыв|slider-review)',
-    re.IGNORECASE
-)
 TESTIMONIAL_TEXT_MARKERS = (
     'відгук', 'відгуки', 'наші клієнти', 'клієнти про нас', 'що кажуть клієнти',
     'testimonial', 'testimonials', 'what our clients say', 'customer stories',
     'client review', 'case study', 'дякуємо команді', 'користуємося сервісом'
 )
+
+FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
+    'дієго сільва', 'diego silva'
+}
+
+UI_ACTION_WORDS_BLACKLIST = {
+    'читати', 'детальніше', 'дивитися', 'дивитись', 'переглянути', 'написати',
+    'зв’язатися', 'звязатися', 'автор', 'спікер', 'експерт', 'блог', 'стаття',
+    'команда', 'кейс', 'відгук', 'клієнт', 'партнер', 'модератор', 'ведучий',
+    'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article', 'client'
+}
 
 ROLE_TOKEN_BLACKLIST = {
     'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
@@ -139,6 +155,7 @@ ROLE_TOKEN_BLACKLIST = {
     'засновник', 'засновниця', 'співзасновник', 'співзасновниця', 'власник',
     'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан'
 }
+ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
@@ -180,7 +197,8 @@ STOP_NAME_WORDS = {
     'About', 'Company', 'Digital', 'Marketing', 'Agency', 'Online', 'Store',
     'LinkedIn', 'Profile', 'View', 'Український', 'Перший', 'Жіночий', 'Official',
     'Наші', 'Ваші', 'Нова', 'Повна', 'Більше', 'Меню', 'Головна', 'Сторінка',
-    'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права'
+    'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права',
+    'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт'
 }
 
 UA_TO_LATIN = {
@@ -234,7 +252,6 @@ MARKETING_EXEC_PREFIXES = (
     'marketing', 'cmo', 'digital', 'growth', 'ecommerce', 'e-commerce',
     'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner'
 )
-# П.7: Додано enterprise, corp, business до B2B_PARTNERSHIP_PREFIXES
 B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
     'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp'
@@ -242,7 +259,6 @@ B2B_PARTNERSHIP_PREFIXES = (
 WHOLESALE_MERCH_PREFIXES = (
     'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer'
 )
-# П.10: Додано INFLUENCER_PREFIXES для gteam@glossier.com тощо
 INFLUENCER_PREFIXES = (
     'gteam', 'creators', 'influencers', 'influencer', 'gifting', 'collabs', 'ambassador', 'ambassadors'
 )
@@ -260,7 +276,6 @@ SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
     'customercare', 'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
 )
-# П.7: Додано insight, insights, research до PR_MEDIA_PREFIXES
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand',
     'events', 'insight', 'insights', 'research'
@@ -376,7 +391,6 @@ REGION_DIALING_PREFIX_MAP = {
     'FR': '+33'
 }
 
-# П.1 & П.15: Відомі мультибрендові маркетплейси / Tier-1 рітейлери
 KNOWN_MARKETPLACE_DOMAINS = {
     'answear.ua', 'answear.com', 'kasta.ua', 'modnakasta.ua', 'rozetka.com.ua',
     'comfy.ua', 'intertop.ua', 'epicentrk.ua', 'allo.ua', 'foxtrot.com.ua',
@@ -392,7 +406,6 @@ DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
 
 
 def truncate_error_msg(err: str | None, max_len: int = 80) -> str:
-    """П.11: Скорочує технічні помилки проксі/мережі до 80 символів."""
     if not err:
         return ''
     clean = ' '.join(str(err).split())
@@ -454,7 +467,6 @@ def build_summary_from_cached_record(record: dict) -> str:
 
 
 def is_marketplace_platform(canonical_domain: str, page_title: str, meta_desc: str) -> bool:
-    """П.1: Визначає, чи є сайт мультибрендовим маркетплейсом/рітейлером."""
     if canonical_domain.lower() in KNOWN_MARKETPLACE_DOMAINS:
         return True
     combined = f'{page_title} {meta_desc}'.lower()
@@ -580,7 +592,6 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
             return 'pr_and_media_inbox'
         return 'brand_webmail_general_inbox'
 
-    # П.10: Influencer / Gifting Team inbox (напр. gteam@glossier.com)
     if (
         normalized_local.startswith(INFLUENCER_PREFIXES)
         or local.startswith(INFLUENCER_PREFIXES)
@@ -588,7 +599,6 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
     ):
         return 'influencer_gifting_inbox'
 
-    # П.7: B2B Partnerships (включаючи enterprise@)
     if (
         normalized_local.startswith(B2B_PARTNERSHIP_PREFIXES)
         or local.startswith(B2B_PARTNERSHIP_PREFIXES)
@@ -783,10 +793,6 @@ def reject_external_domain_pollution(
     valid: dict[str, str],
     base_domain: str
 ) -> tuple[dict[str, str], bool]:
-    """
-    П.1: Відсікає чужі брендові адреси на маркетплейсах (напр. baronfilou.com на answear.ua).
-    Повертає (очищений словник, прапорець чи було відфільтровано external pollution).
-    """
     if not valid:
         return valid, False
     base_brand = base_domain.split('.')[0].lower() if base_domain else ''
@@ -807,7 +813,6 @@ def reject_external_domain_pollution(
     if native_subset:
         return native_subset, len(native_subset) < len(valid)
 
-    # Якщо жоден email не належить домену/бренду і це зовнішні корпоративні домени — відхиляємо отруту
     return {}, True
 
 
@@ -831,7 +836,6 @@ def rank_and_clean_emails(
         if not local_part or not domain_part or '.' not in domain_part:
             continue
 
-        # Відсікаємо технічні sentry-домени та довгі hex-хеші
         if 'sentry.' in domain_part or HEX_HASH_LOCAL_REGEX.match(local_part):
             continue
 
@@ -891,15 +895,22 @@ def extract_named_email_owner_hint(
     best_email_type: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> str | None:
-    """П.14: Шукає підказку про власника/роль іменного інбоксу (напр. a.glazyrina@inweb.ua) поруч у тексті."""
     if not best_email or best_email_type != 'personal_or_named_inbox':
         return None
     em_low = best_email.lower()
-    for _, _, text in pages_with_urls:
+    for _, html, text in pages_with_urls:
+        soup = BeautifulSoup(html, 'lxml')
+        for a_tag in soup.find_all('a', href=True):
+            if em_low in a_tag['href'].lower() or em_low in a_tag.get_text().lower():
+                container = a_tag.find_parent(['li', 'tr', 'td', 'p', 'div', 'article', 'section'])
+                if container:
+                    c_txt = ' '.join(container.get_text(' ', strip=True).split())
+                    if len(c_txt) <= 220:
+                        return textwrap.shorten(c_txt, width=140, placeholder='…')
         idx = text.lower().find(em_low)
         if idx != -1:
-            start = max(0, idx - 120)
-            end = min(len(text), idx + len(best_email) + 120)
+            start = max(0, idx - 110)
+            end = min(len(text), idx + len(best_email) + 45)
             snippet = ' '.join(text[start:end].split())
             return textwrap.shorten(snippet, width=140, placeholder='…')
     local_part = best_email.split('@', 1)[0]
@@ -1121,7 +1132,6 @@ def detect_tech_with_evidence(
     page_url: str,
     scan_completeness: str = 'full'
 ) -> dict:
-    """П.5: Якщо scan_completeness != 'full' (напр. PW timeout), непідтверджені теги отримують None замість False."""
     clean_gtm = gtm_js.replace('\\/', '/')
     html_lower = html.lower().replace('\\/', '/')
     gtm_lower = clean_gtm.lower()
@@ -1273,10 +1283,6 @@ def classify_company_category(
     detected_tech: list[str],
     html_sample: str = ''
 ) -> tuple[str, str]:
-    """
-    П.2: Повертає (company_category, category_confidence) із Hard Override для комерційного стеку (Ringostat тощо)
-    та розширеними маркерами E-commerce для українських маркетплейсів (Kasta, Liki24).
-    """
     text = f'{domain} {page_title} {meta_desc}'.lower()
     html_low = html_sample[:15000].lower()
 
@@ -1319,7 +1325,6 @@ def classify_company_category(
     if any(k in text for k in saas_keywords):
         return 'SaaS / Marketplace / Tech Platform', 'high'
 
-    # П.2: HARD OVERRIDE — комерційний стек + не explicit NPO (.edu/.gov/.org) ніколи не стає NGO
     has_commercial_stack = (
         'AW-' in html_sample
         or 'snap.licdn.com' in html_low
@@ -1369,9 +1374,7 @@ def is_valid_person_name(candidate: str) -> bool:
         return False
     if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
         return False
-    if any(w in STOP_NAME_WORDS for w in words):
-        return False
-    if any(w.lower() in ROLE_TOKEN_BLACKLIST for w in words):
+    if any(w in STOP_NAME_WORDS or w.lower() in ROLE_TOKEN_BLACKLIST for w in words):
         return False
     if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
         return False
@@ -1386,34 +1389,21 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
 
 
 def strip_testimonial_elements_and_get_clean_text(soup: BeautifulSoup) -> str:
-    """
-    П.6: Видаляє з копії DOM-дерева всі блоки відгуків/цитат клієнтів (blockquote, cite, класи testimonial/review),
-    щоб автори клієнтських відгуків (як Дієго Сільва на SendPulse) не потрапляли в decision_maker_name.
-    """
     for tag in soup.find_all(['blockquote', 'cite', 'q']):
         tag.decompose()
-
-    for el in list(soup.find_all(True)):
-        if el.attrs is None:
-            continue
-        cls_list = el.get('class') or []
-        cls_str = ' '.join(cls_list) if isinstance(cls_list, list) else str(cls_list)
-        id_str = str(el.get('id') or '')
-        if TESTIMONIAL_ATTR_REGEX.search(f'{cls_str} {id_str}'):
-            el.decompose()
-
     return soup.get_text(' ', strip=True)
 
 
-def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: int) -> bool:
-    """П.6: Додаткова текстова перевірка оточення знайденого імені на маркери відгуку/цитати."""
-    win_start = max(0, match_start - 220)
-    win_end = min(len(text), match_end + 160)
+def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: int, cand_name: str = '') -> bool:
+    if cand_name.strip().lower() in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
+        return True
+    win_start = max(0, match_start - 200)
+    win_end = min(len(text), match_end + 140)
     window = text[win_start:win_end]
     win_low = window.lower()
     if any(m in win_low for m in TESTIMONIAL_TEXT_MARKERS):
         return True
-    before_slice = text[max(0, match_start - 90):match_start]
+    before_slice = text[max(0, match_start - 80):match_start]
     if any(q in before_slice for q in ('«', '»', '“', '”', '„')):
         return True
     return False
@@ -1455,7 +1445,7 @@ def extract_decision_maker_deep(
                         if isinstance(val, dict) and val.get('name'):
                             cand = strip_role_tokens_from_name(str(val['name']))
                             role = normalize_executive_role(str(val.get('jobTitle') or default_role))
-                            if is_valid_person_name(cand):
+                            if is_valid_person_name(cand) and cand.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
                                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
                                 is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
                                 return cand, role, matched_li, clean_url_port(page_url), is_leg
@@ -1464,7 +1454,7 @@ def extract_decision_maker_deep(
                                 if isinstance(sub, dict) and sub.get('name'):
                                     cand = strip_role_tokens_from_name(str(sub['name']))
                                     role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
-                                    if is_valid_person_name(cand):
+                                    if is_valid_person_name(cand) and cand.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
                                         matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
                                         is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
                                         return cand, role, matched_li, clean_url_port(page_url), is_leg
@@ -1480,19 +1470,19 @@ def extract_decision_maker_deep(
         dm_clean_text = strip_testimonial_elements_and_get_clean_text(clean_soup)
 
         for m in NAME_BEFORE_ROLE_PATTERN.finditer(dm_clean_text):
-            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end()):
-                continue
             cand_name = strip_role_tokens_from_name(m.group(1))
+            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
+                continue
             cand_role = normalize_executive_role(m.group(2))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
                 return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
 
         for m in ROLE_BEFORE_NAME_PATTERN.finditer(dm_clean_text):
-            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end()):
+            cand_name = strip_role_tokens_from_name(m.group(2))
+            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
                 continue
             cand_role = normalize_executive_role(m.group(1))
-            cand_name = strip_role_tokens_from_name(m.group(2))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
                 return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
@@ -1503,7 +1493,7 @@ def extract_decision_maker_deep(
         is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
-            if is_valid_person_name(cand_name):
+            if is_valid_person_name(cand_name) and cand_name.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
                 return cand_name, 'Registered Business Owner / ФОП', matched_li, clean_url_port(page_url), is_leg
 
@@ -1524,7 +1514,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v160(
+def evaluate_qualification_v162(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1575,7 +1565,6 @@ def evaluate_qualification_v160(
 
     is_agency = (company_category == 'B2B Agency / Marketing Media')
 
-    # 1. ICP Fit Tier
     if company_category == 'E-commerce / Retail Brand':
         icp_fit_tier = 'Tier 1: Target ICP (E-commerce / Retail Brand)'
     elif company_category in ('SaaS / Marketplace / Tech Platform', 'General Business / Corporate'):
@@ -1585,7 +1574,6 @@ def evaluate_qualification_v160(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # 2. Technical Signal Strength
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
@@ -1605,7 +1593,6 @@ def evaluate_qualification_v160(
             '(Tag absence is not confirmed if site uses strict Cookie Consent or custom JS loader)'
         )
 
-    # 3. Contact Quality Tier & Warnings
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
@@ -1716,7 +1703,6 @@ def evaluate_qualification_v160(
         else:
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # 4. Sales Readiness Verdict
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -1745,7 +1731,6 @@ def evaluate_qualification_v160(
     else:
         readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn DM Enrichment Before Outbound)'
 
-    # 5. Sales Opportunity
     if is_agency:
         opportunity = (
             'Agency/Media Segment: Explore white-label analytics partnership, '
@@ -1766,7 +1751,6 @@ def evaluate_qualification_v160(
     else:
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
-    # 6. Next Best Action
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
@@ -2010,7 +1994,6 @@ async def close_shared_playwright_browser():
 
 
 async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
-    """П.5: Повертає 4-tuple (rendered_html, final_url, status_str, is_incomplete_timeout)."""
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled', False
 
@@ -2242,7 +2225,7 @@ async def fetch_gtm_scripts(
 ) -> tuple[list[str], str]:
     gtm_ids = sorted({
         m.upper() for m in GTM_ID_REGEX.findall(html)
-        if m.upper() not in GTM_FALSE_POSITIVES
+        if is_valid_gtm_id(m)
     })
     if not gtm_ids:
         return [], ''
@@ -2304,13 +2287,11 @@ async def process_domain(
         evergreen_kv_key = f'evergreen_{canonical_kv_key}'
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
 
-        # П.9: Прозорість редіректів
         was_redirected = (domain_key != canonical_domain)
         redirect_chain_str = f'{domain_key} → {canonical_domain}' if was_redirected else None
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # П.15: Для Tier-1 маркетплейсів спочатку перевіряємо evergreen_kv_key
             is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
             cache_keys_order = (
                 (evergreen_kv_key, canonical_kv_key, input_kv_key)
@@ -2354,7 +2335,6 @@ async def process_domain(
                         cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
                         cached_copy['playwright_attempts_count'] = 0
                         cached_copy['playwright_paths_attempted'] = None
-                        # П.13: Гарантоване заповнення phone_availability у cached fallback
                         cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
@@ -2474,7 +2454,7 @@ async def process_domain(
         else:
             gtm_ids = sorted({
                 m.upper() for m in GTM_ID_REGEX.findall(html)
-                if m.upper() not in GTM_FALSE_POSITIVES
+                if is_valid_gtm_id(m)
             })
             gtm_js = ''
 
@@ -2525,7 +2505,6 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
-        # П.4: Соцмережі не вважаються actionable-контактами! Перевіряємо чистий список email/phone
         prelim_clean_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
         has_actionable_contacts = bool(prelim_clean_emails or phone_map)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
@@ -2607,7 +2586,37 @@ async def process_domain(
                                     if chk_em or phone_map:
                                         break
 
-        # П.5: Якщо PW зазнав таймауту, а в статичному HTML не знайшли GA4/GTM, позначаємо partial_timeout і ставимо None замість False
+        # Якщо живий скан не знайшов GTM/GA4 (через урізаний антиботом HTML), перевіряємо чи є збережений стек у кеші
+        if not (tech_info['has_ga4'] or tech_info['has_gtm']) and cache_store is not None:
+            for c_key in (evergreen_kv_key, canonical_kv_key):
+                try:
+                    c_rec = await cache_store.get_value(c_key)
+                    if isinstance(c_rec, dict) and (c_rec.get('has_gtm') or c_rec.get('has_ga4')):
+                        raw_t = c_rec.get('detected_technologies') or ''
+                        tech_info = {
+                            'has_meta_pixel': bool(c_rec.get('has_meta_pixel')),
+                            'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel')),
+                            'has_google_ads': bool(c_rec.get('has_google_ads')),
+                            'has_linkedin_pixel': bool(c_rec.get('has_linkedin_pixel')),
+                            'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag')),
+                            'has_hubspot': bool(c_rec.get('has_hubspot')),
+                            'has_klaviyo': bool(c_rec.get('has_klaviyo')),
+                            'has_ga4': bool(c_rec.get('has_ga4')),
+                            'has_gtm': bool(c_rec.get('has_gtm')),
+                            'all_ga4_ids': c_rec.get('all_ga4_ids'),
+                            'ga4_detection_confidence': c_rec.get('ga4_detection_confidence'),
+                            'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()],
+                            'detected_cms': c_rec.get('detected_cms'),
+                            'has_cookie_banner': bool(c_rec.get('consent_mode_likely')),
+                            'detected_technologies_list': [x.strip() for x in raw_t.split(';') if x.strip()],
+                            'technology_evidence': c_rec.get('technology_evidence') or 'Recovered from verified cache',
+                            'technology_evidence_summary': build_summary_from_cached_record(c_rec),
+                            'tech_scan_completeness': 'full'
+                        }
+                        break
+                except Exception:
+                    pass
+
         if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm']):
             scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
@@ -2680,7 +2689,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v160(
+        ) = evaluate_qualification_v162(
             company_category,
             tech_info,
             best_email,
@@ -2694,7 +2703,6 @@ async def process_domain(
             had_marketplace_pollution
         )
 
-        # Статус базується на actionable контактах (email або телефон), щоб сайти без пошти/телефону чесно отримували no_contacts_found
         has_actionable_final = bool(best_email or primary_phone)
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
 
@@ -2874,7 +2882,6 @@ async def main() -> None:
                     cd = result.get('canonical_domain') or result.get('input_domain')
                     inp_dom = result.get('input_domain', '')
 
-                    # П.3 & П.12: Дедуплікація за canonical_domain на рівні всього рану зі збереженням aliases
                     if cd in seen_canonical_records:
                         existing = seen_canonical_records[cd]
                         existing_aliases = [a.strip() for a in (existing.get('aliases') or '').split(';') if a.strip()]
@@ -2890,7 +2897,6 @@ async def main() -> None:
                         Actor.log.info(f'[DEDUPED] {inp_dom} merged into canonical {cd} (aliases: {existing["aliases"]})')
                         continue
 
-                    # Якщо сам домен редіректнувся (напр. chubbies.com -> chubbiesshorts.com), записуємо обидва в aliases
                     if inp_dom and cd and inp_dom != cd:
                         result['aliases'] = f'{inp_dom}; {cd}'
                     else:
