@@ -19,7 +19,7 @@ except ImportError:
     PLAYWRIGHT_INSTALLED = False
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 12
+CACHE_SCHEMA_VERSION = 16
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -29,12 +29,15 @@ _PW_INSTANCE = None
 _PW_BROWSER = None
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+HEX_HASH_LOCAL_REGEX = re.compile(r'^[a-f0-9]{20,}$', re.IGNORECASE)
+
 SCHEMA_PHONE_REGEX = re.compile(
     r'"(?:telephone|phone|contactPhone|phoneNumber|tel)"\s*:\s*"([^"]{7,30})"',
     re.IGNORECASE
 )
 
-GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
+# П.8: Справжній GTM ID майже завжди містить цифру або не входить у список JS-літералів
+GTM_ID_REGEX = re.compile(r'\bGTM-(?=[A-Z0-9]*\d)[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
@@ -71,7 +74,7 @@ SOFT_404_TITLE_REGEX = re.compile(
 )
 
 DM_SOURCE_BLACKLIST = re.compile(
-    r'/(?:privacy|policy|datenschutz|gdpr|cookie|dmca)\b',
+    r'/(?:privacy|policy|datenschutz|gdpr|cookie|dmca|testimonial|testimonials|reviews|case-studies|case-study|clients|stories)\b',
     re.IGNORECASE
 )
 DM_LEGAL_SOURCE_FLAG = re.compile(
@@ -79,12 +82,14 @@ DM_LEGAL_SOURCE_FLAG = re.compile(
     re.IGNORECASE
 )
 
+# П.8: Розширений чорний список GTM-плейсхолдерів
 GTM_FALSE_POSITIVES = {
     'GTM-PAGE', 'GTM-SUITE', 'GTM-SECTION', 'GTM-WRAPPER', 'GTM-HEADER',
     'GTM-FOOTER', 'GTM-BUTTON', 'GTM-CLICK', 'GTM-EVENT', 'GTM-LOADER',
     'GTM-SCRIPT', 'GTM-DATA', 'GTM-CONTAINER', 'GTM-BLOCK', 'GTM-FORM',
     'GTM-MODAL', 'GTM-BANNER', 'GTM-SLIDER', 'GTM-MENU', 'GTM-NAV',
-    'GTM-TRACK', 'GTM-NOSCRIPT', 'GTM-IFRAME', 'GTM-CUSTOM', 'GTM-CONFIG'
+    'GTM-TRACK', 'GTM-NOSCRIPT', 'GTM-IFRAME', 'GTM-CUSTOM', 'GTM-CONFIG',
+    'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
 ROLES_REGEX_PART = (
@@ -112,6 +117,17 @@ FOP_OWNER_PATTERN = re.compile(
     r'(?:ФОП|Фізична особа[\s-]підприємець)\s+'
     r'([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,25}\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,20})',
     re.UNICODE
+)
+
+# П.6: Маркери відгуків клієнтів / кейсів у DOM та тексті
+TESTIMONIAL_ATTR_REGEX = re.compile(
+    r'(?:testimonial|review|feedback|quote|client-story|case-study|відгук|клієнт|отзыв|slider-review)',
+    re.IGNORECASE
+)
+TESTIMONIAL_TEXT_MARKERS = (
+    'відгук', 'відгуки', 'наші клієнти', 'клієнти про нас', 'що кажуть клієнти',
+    'testimonial', 'testimonials', 'what our clients say', 'customer stories',
+    'client review', 'case study', 'дякуємо команді', 'користуємося сервісом'
 )
 
 ROLE_TOKEN_BLACKLIST = {
@@ -181,7 +197,7 @@ JUNK_EMAIL_DOMAINS = {
     'sentry.wixpress.com', 'godaddy.com', 'sentry-next.wixpress.com',
     'wordpress.org', 'w3.org', 'schema.org', 'googleusercontent.com',
     'cloudflare.com', 'shopify.com', 'mysite.com', 'sample.com', 'mail.ru',
-    'atlassian.net', 'janesbakery.com'
+    'atlassian.net', 'janesbakery.com', 'sentry.softwear.co'
 }
 
 PUBLIC_WEBMAIL_DOMAINS = {
@@ -218,12 +234,17 @@ MARKETING_EXEC_PREFIXES = (
     'marketing', 'cmo', 'digital', 'growth', 'ecommerce', 'e-commerce',
     'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner'
 )
+# П.7: Додано enterprise, corp, business до B2B_PARTNERSHIP_PREFIXES
 B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
-    'corporate', 'corpcom', 'deals', 'tender', 'tenders'
+    'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp'
 )
 WHOLESALE_MERCH_PREFIXES = (
     'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer'
+)
+# П.10: Додано INFLUENCER_PREFIXES для gteam@glossier.com тощо
+INFLUENCER_PREFIXES = (
+    'gteam', 'creators', 'influencers', 'influencer', 'gifting', 'collabs', 'ambassador', 'ambassadors'
 )
 GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
@@ -237,10 +258,12 @@ DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
 )
 SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
-    'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
+    'customercare', 'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
 )
+# П.7: Додано insight, insights, research до PR_MEDIA_PREFIXES
 PR_MEDIA_PREFIXES = (
-    'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand', 'events'
+    'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand',
+    'events', 'insight', 'insights', 'research'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
@@ -256,6 +279,7 @@ NON_PERSON_TOKENS = (
     set(MARKETING_EXEC_PREFIXES)
     | set(B2B_PARTNERSHIP_PREFIXES)
     | set(WHOLESALE_MERCH_PREFIXES)
+    | set(INFLUENCER_PREFIXES)
     | set(GENERAL_OFFICE_PREFIXES)
     | set(DEPARTMENT_OR_ADMISSIONS_PREFIXES)
     | set(SUPPORT_PREFIXES)
@@ -284,7 +308,6 @@ SECONDARY_CONTACT_KEYWORDS = (
     'wholesale', 'b2b', 'investors', 'oferta', 'offer', 'terms', 'our-services', 'ugoda'
 )
 
-# П.1: Ключові слова для семантичного пошуку посилань за видимим текстом анкорів <a> у SPA
 CONTACT_ANCHOR_TEXT_KEYWORDS = (
     'contact', 'contact us', 'get in touch', 'support', 'customer care',
     'help center', 'контакти', 'зв\'язатися', 'про нас', 'about us', 'impressum'
@@ -353,7 +376,29 @@ REGION_DIALING_PREFIX_MAP = {
     'FR': '+33'
 }
 
+# П.1 & П.15: Відомі мультибрендові маркетплейси / Tier-1 рітейлери
+KNOWN_MARKETPLACE_DOMAINS = {
+    'answear.ua', 'answear.com', 'kasta.ua', 'modnakasta.ua', 'rozetka.com.ua',
+    'comfy.ua', 'intertop.ua', 'epicentrk.ua', 'allo.ua', 'foxtrot.com.ua',
+    'prom.ua', 'shafa.ua', 'liki24.com', 'makeup.com.ua', 'eva.ua'
+}
+
+MARKETPLACE_TEXT_MARKERS = (
+    'більше 500 брендів', 'понад 9 млн товарів', 'мільйони товарів', 'маркетплейс',
+    'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів'
+)
+
 DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
+
+
+def truncate_error_msg(err: str | None, max_len: int = 80) -> str:
+    """П.11: Скорочує технічні помилки проксі/мережі до 80 символів."""
+    if not err:
+        return ''
+    clean = ' '.join(str(err).split())
+    if len(clean) <= max_len:
+        return clean
+    return clean[:max_len - 1].rstrip() + '…'
 
 
 def sanitize_kv_key(domain: str) -> str:
@@ -371,7 +416,6 @@ def clean_url_port(url: str | None) -> str | None:
 
 
 def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
-    """П.2 & П.3: Обчислює вік збереженого кеш-снапшоту в днях для TTL-контролю."""
     if not checked_at_str or not isinstance(checked_at_str, str):
         return None
     try:
@@ -383,7 +427,6 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
 
 
 def build_summary_from_cached_record(record: dict) -> str:
-    """П.5: Регенерує technology_evidence_summary для кеш-снапшотів з повною підтримкою multi-property GA4."""
     existing = record.get('technology_evidence_summary')
     if existing and ';' not in existing:
         return existing
@@ -410,11 +453,15 @@ def build_summary_from_cached_record(record: dict) -> str:
     return ', '.join(short_parts) if short_parts else 'None'
 
 
+def is_marketplace_platform(canonical_domain: str, page_title: str, meta_desc: str) -> bool:
+    """П.1: Визначає, чи є сайт мультибрендовим маркетплейсом/рітейлером."""
+    if canonical_domain.lower() in KNOWN_MARKETPLACE_DOMAINS:
+        return True
+    combined = f'{page_title} {meta_desc}'.lower()
+    return any(m in combined for m in MARKETPLACE_TEXT_MARKERS)
+
+
 def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical_domain: str) -> list[str]:
-    """
-    П.1: Витягує посилання з тегів <a> у відрендереному PW DOM, спираючись на видимий текст анкора
-    ('Contact', 'Контакти', 'Get in touch') та підтримуючи офіційні піддомени (*.meest.com).
-    """
     found = []
     soup = BeautifulSoup(html, 'lxml')
     base_clean = (clean_url_port(page_url) or page_url).rstrip('/')
@@ -436,7 +483,6 @@ def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical
         if any(path_low.endswith(ext) for ext in JUNK_EXTENSIONS) or DM_SOURCE_BLACKLIST.search(path_low):
             continue
 
-        # Дозволяємо як сам canonical_domain, так і його офіційні піддомени (напр. us.meest.com, ua.meest.com)
         if host != canonical_domain and not host.endswith(f'.{canonical_domain}'):
             continue
 
@@ -534,6 +580,15 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
             return 'pr_and_media_inbox'
         return 'brand_webmail_general_inbox'
 
+    # П.10: Influencer / Gifting Team inbox (напр. gteam@glossier.com)
+    if (
+        normalized_local.startswith(INFLUENCER_PREFIXES)
+        or local.startswith(INFLUENCER_PREFIXES)
+        or first_token in INFLUENCER_PREFIXES
+    ):
+        return 'influencer_gifting_inbox'
+
+    # П.7: B2B Partnerships (включаючи enterprise@)
     if (
         normalized_local.startswith(B2B_PARTNERSHIP_PREFIXES)
         or local.startswith(B2B_PARTNERSHIP_PREFIXES)
@@ -724,10 +779,42 @@ async def verify_email_deliverability_deep(
     return f'{err_code} (lookup_failed)'
 
 
+def reject_external_domain_pollution(
+    valid: dict[str, str],
+    base_domain: str
+) -> tuple[dict[str, str], bool]:
+    """
+    П.1: Відсікає чужі брендові адреси на маркетплейсах (напр. baronfilou.com на answear.ua).
+    Повертає (очищений словник, прапорець чи було відфільтровано external pollution).
+    """
+    if not valid:
+        return valid, False
+    base_brand = base_domain.split('.')[0].lower() if base_domain else ''
+
+    def is_native_or_brand_alias(addr: str) -> bool:
+        local, dom = addr.split('@', 1)
+        dom_root = dom.split('.')[0]
+        norm_local = re.sub(r'[._+-]', '', local.lower())
+        if dom == base_domain or dom.endswith(f'.{base_domain}'):
+            return True
+        if base_brand and len(base_brand) >= 3 and (dom_root == base_brand or base_brand in dom_root or dom_root in base_brand):
+            return True
+        if dom in PUBLIC_WEBMAIL_DOMAINS and base_brand and base_brand in norm_local:
+            return True
+        return False
+
+    native_subset = {addr: src for addr, src in valid.items() if is_native_or_brand_alias(addr)}
+    if native_subset:
+        return native_subset, len(native_subset) < len(valid)
+
+    # Якщо жоден email не належить домену/бренду і це зовнішні корпоративні домени — відхиляємо отруту
+    return {}, True
+
+
 def rank_and_clean_emails(
     email_sources: dict[str, str],
     base_domain: str
-) -> list[tuple[str, str]]:
+) -> tuple[list[tuple[str, str]], bool]:
     valid: dict[str, str] = {}
     base_brand = base_domain.split('.')[0].lower() if base_domain else ''
 
@@ -742,6 +829,10 @@ def rank_and_clean_emails(
 
         local_part, domain_part = email.split('@', 1)
         if not local_part or not domain_part or '.' not in domain_part:
+            continue
+
+        # Відсікаємо технічні sentry-домени та довгі hex-хеші
+        if 'sentry.' in domain_part or HEX_HASH_LOCAL_REGEX.match(local_part):
             continue
 
         tld = domain_part.rsplit('.', 1)[-1].lower()
@@ -761,30 +852,7 @@ def rank_and_clean_emails(
         if 6 <= len(email) <= 60 and email not in valid:
             valid[email] = clean_url_port(source_url) or source_url
 
-    has_native_brand_email = any(
-        base_brand and (
-            dom == base_domain
-            or dom.endswith(f'.{base_domain}')
-            or dom.split('.')[0] == base_brand
-        )
-        for addr in valid
-        for _, dom in [addr.split('@', 1)]
-    )
-
-    if has_native_brand_email:
-        filtered_valid = {}
-        for addr, src in valid.items():
-            _, dom = addr.split('@', 1)
-            is_native = (
-                dom == base_domain
-                or dom.endswith(f'.{base_domain}')
-                or dom.split('.')[0] == base_brand
-                or dom in PUBLIC_WEBMAIL_DOMAINS
-            )
-            if is_native:
-                filtered_valid[addr] = src
-        if filtered_valid:
-            valid = filtered_valid
+    valid, had_external_pollution = reject_external_domain_pollution(valid, base_domain)
 
     type_weights = {
         'marketing_or_exec_role': 35,
@@ -796,6 +864,7 @@ def rank_and_clean_emails(
         'department_or_general_inbox': 15,
         'regional_branch_inbox': 14,
         'brand_webmail_support_inbox': 12,
+        'influencer_gifting_inbox': 11,
         'admissions_or_department_inbox': 10,
         'customer_support_inbox': 8,
         'pr_and_media_inbox': 5,
@@ -814,7 +883,27 @@ def rank_and_clean_emails(
         return (-score, addr)
 
     sorted_addrs = sorted(valid.keys(), key=email_score)
-    return [(addr, valid[addr]) for addr in sorted_addrs]
+    return [(addr, valid[addr]) for addr in sorted_addrs], had_external_pollution
+
+
+def extract_named_email_owner_hint(
+    best_email: str | None,
+    best_email_type: str | None,
+    pages_with_urls: list[tuple[str, str, str]]
+) -> str | None:
+    """П.14: Шукає підказку про власника/роль іменного інбоксу (напр. a.glazyrina@inweb.ua) поруч у тексті."""
+    if not best_email or best_email_type != 'personal_or_named_inbox':
+        return None
+    em_low = best_email.lower()
+    for _, _, text in pages_with_urls:
+        idx = text.lower().find(em_low)
+        if idx != -1:
+            start = max(0, idx - 120)
+            end = min(len(text), idx + len(best_email) + 120)
+            snippet = ' '.join(text[start:end].split())
+            return textwrap.shorten(snippet, width=140, placeholder='…')
+    local_part = best_email.split('@', 1)[0]
+    return f'Named staff inbox ({local_part}) — verify exact title on LinkedIn'
 
 
 def clean_and_validate_social_url(platform: str, href: str) -> str | None:
@@ -1029,12 +1118,15 @@ def detect_tech_with_evidence(
     html: str,
     gtm_js: str,
     gtm_ids: list[str],
-    page_url: str
+    page_url: str,
+    scan_completeness: str = 'full'
 ) -> dict:
+    """П.5: Якщо scan_completeness != 'full' (напр. PW timeout), непідтверджені теги отримують None замість False."""
     clean_gtm = gtm_js.replace('\\/', '/')
     html_lower = html.lower().replace('\\/', '/')
     gtm_lower = clean_gtm.lower()
     clean_page_url = clean_url_port(page_url) or page_url
+    is_partial = (scan_completeness != 'full')
 
     detected = []
     evidence_items = []
@@ -1147,16 +1239,21 @@ def detect_tech_with_evidence(
 
     all_ga4_list = ga4_in_html[:3] if ga4_in_html else ga4_in_gtm[:5]
 
+    def flag_or_none(val: bool) -> bool | None:
+        if val:
+            return True
+        return None if is_partial else False
+
     return {
-        'has_meta_pixel': 'Meta Pixel' in detected,
-        'has_tiktok_pixel': 'TikTok Pixel' in detected,
-        'has_google_ads': has_google_ads,
-        'has_linkedin_pixel': 'LinkedIn Insight Tag' in detected,
-        'has_pinterest_tag': 'Pinterest Tag' in detected,
-        'has_hubspot': 'HubSpot' in detected,
-        'has_klaviyo': 'Klaviyo' in detected,
-        'has_ga4': has_ga4,
-        'has_gtm': has_gtm,
+        'has_meta_pixel': flag_or_none('Meta Pixel' in detected),
+        'has_tiktok_pixel': flag_or_none('TikTok Pixel' in detected),
+        'has_google_ads': flag_or_none(has_google_ads),
+        'has_linkedin_pixel': flag_or_none('LinkedIn Insight Tag' in detected),
+        'has_pinterest_tag': flag_or_none('Pinterest Tag' in detected),
+        'has_hubspot': flag_or_none('HubSpot' in detected),
+        'has_klaviyo': flag_or_none('Klaviyo' in detected),
+        'has_ga4': flag_or_none(has_ga4),
+        'has_gtm': flag_or_none(has_gtm),
         'all_ga4_ids': '; '.join(all_ga4_list) if all_ga4_list else None,
         'ga4_detection_confidence': ga4_confidence,
         'detected_cms_list': detected_cms,
@@ -1164,7 +1261,8 @@ def detect_tech_with_evidence(
         'has_cookie_banner': has_cookie_banner,
         'detected_technologies_list': detected,
         'technology_evidence': ev_summary,
-        'technology_evidence_summary': short_summary
+        'technology_evidence_summary': short_summary,
+        'tech_scan_completeness': scan_completeness
     }
 
 
@@ -1174,45 +1272,80 @@ def classify_company_category(
     meta_desc: str,
     detected_tech: list[str],
     html_sample: str = ''
-) -> str:
+) -> tuple[str, str]:
+    """
+    П.2: Повертає (company_category, category_confidence) із Hard Override для комерційного стеку (Ringostat тощо)
+    та розширеними маркерами E-commerce для українських маркетплейсів (Kasta, Liki24).
+    """
     text = f'{domain} {page_title} {meta_desc}'.lower()
     html_low = html_sample[:15000].lower()
-
-    if domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua')) or any(
-        w in text for w in (
-            'університет', 'university', 'college', 'академія', 'інститут',
-            'благодійний фонд', 'charitable', 'foundation', 'ngo', 'громадська організація'
-        )
-    ):
-        return 'Non-Profit / Education / Institution'
 
     agency_keywords = (
         'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
         'онлайн-маркетинг', 'маркетингова агенція', 'seo agency', 'ppc agency',
         'web studio', 'веб-студія', 'розробка сайтів', 'software development',
-        'медіа про інтернет-маркетинг', 'performance marketing agency'
+        'медіа про інтернет-маркетинг', 'performance marketing agency', 'агентство інтернет-маркетингу'
     )
     if any(k in text for k in agency_keywords):
-        return 'B2B Agency / Marketing Media'
+        return 'B2B Agency / Marketing Media', 'high'
 
     ecom_keywords = (
         'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
-        'shop', 'купити', 'купить', 'доставка по', 'колекція', 'бренд одягу',
+        'shop', 'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
         'бренд взуття', 'жіночого одягу', 'женского белья', 'каталог товарів',
-        'checkout', 'add to cart', 'кошик', 'shoes', 'apparel', 'clothing'
+        'checkout', 'add to cart', 'кошик', 'shoes', 'apparel', 'clothing',
+        'млн товарів', 'знижки до', 'кешбек', 'доставка ліків', 'замовити ліки'
     )
-    has_product_schema = '"@type":"product"' in html_low or '"@type": "product"' in html_low or 'og:type" content="product"' in html_low
-    if any(cms in detected_tech for cms in ('Shopify', 'WooCommerce')) or has_product_schema or any(k in text for k in ecom_keywords):
-        return 'E-commerce / Retail Brand'
+    has_product_schema = (
+        '"@type":"product"' in html_low
+        or '"@type": "product"' in html_low
+        or 'og:type" content="product"' in html_low
+    )
+    if (
+        domain.lower() in KNOWN_MARKETPLACE_DOMAINS
+        or any(cms in detected_tech for cms in ('Shopify', 'WooCommerce'))
+        or has_product_schema
+        or any(k in text for k in ecom_keywords)
+    ):
+        return 'E-commerce / Retail Brand', 'high'
 
     saas_keywords = (
         'saas', 'cloud platform', 'crm', 'api', 'b2b software', 'automation platform',
-        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app'
+        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app',
+        'call tracking', 'колтрекінг', 'business phone', 'virtual pbx', 'telephony',
+        'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
+        'email service', 'automation service', 'chatbot'
     )
     if any(k in text for k in saas_keywords):
-        return 'SaaS / Marketplace / Tech Platform'
+        return 'SaaS / Marketplace / Tech Platform', 'high'
 
-    return 'General Business / Corporate'
+    # П.2: HARD OVERRIDE — комерційний стек + не explicit NPO (.edu/.gov/.org) ніколи не стає NGO
+    has_commercial_stack = (
+        'AW-' in html_sample
+        or 'snap.licdn.com' in html_low
+        or 'googleadservices.com' in html_low
+        or any(t in detected_tech for t in ('Google Ads Conversion', 'LinkedIn Insight Tag', 'Meta Pixel', 'TikTok Pixel', 'Intercom'))
+    )
+    is_explicit_npo = (
+        domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua'))
+        or 'благодійний фонд' in text
+        or 'charitable foundation' in text
+        or 'громадська організація' in text
+    )
+
+    if is_explicit_npo or (
+        not has_commercial_stack and any(
+            w in text for w in ('університет', 'university', 'college', 'академія', 'інститут', 'ngo')
+        )
+    ):
+        return 'Non-Profit / Education / Institution', 'high' if is_explicit_npo else 'medium'
+
+    if has_commercial_stack:
+        if any(k in text for k in ('platform', 'software', 'app', 'apps', 'cloud', 'security system', 'analytics')):
+            return 'SaaS / Marketplace / Tech Platform', 'medium'
+        return 'General Business / Corporate', 'high'
+
+    return 'General Business / Corporate', 'medium'
 
 
 def strip_role_tokens_from_name(candidate: str) -> str:
@@ -1252,6 +1385,40 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
     return ROLE_NORMALIZATION_MAP.get(clean.lower(), clean)
 
 
+def strip_testimonial_elements_and_get_clean_text(soup: BeautifulSoup) -> str:
+    """
+    П.6: Видаляє з копії DOM-дерева всі блоки відгуків/цитат клієнтів (blockquote, cite, класи testimonial/review),
+    щоб автори клієнтських відгуків (як Дієго Сільва на SendPulse) не потрапляли в decision_maker_name.
+    """
+    for tag in soup.find_all(['blockquote', 'cite', 'q']):
+        tag.decompose()
+
+    for el in list(soup.find_all(True)):
+        if el.attrs is None:
+            continue
+        cls_list = el.get('class') or []
+        cls_str = ' '.join(cls_list) if isinstance(cls_list, list) else str(cls_list)
+        id_str = str(el.get('id') or '')
+        if TESTIMONIAL_ATTR_REGEX.search(f'{cls_str} {id_str}'):
+            el.decompose()
+
+    return soup.get_text(' ', strip=True)
+
+
+def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: int) -> bool:
+    """П.6: Додаткова текстова перевірка оточення знайденого імені на маркери відгуку/цитати."""
+    win_start = max(0, match_start - 220)
+    win_end = min(len(text), match_end + 160)
+    window = text[win_start:win_end]
+    win_low = window.lower()
+    if any(m in win_low for m in TESTIMONIAL_TEXT_MARKERS):
+        return True
+    before_slice = text[max(0, match_start - 90):match_start]
+    if any(q in before_slice for q in ('«', '»', '“', '”', '„')):
+        return True
+    return False
+
+
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool]:
@@ -1281,6 +1448,8 @@ def extract_decision_maker_deep(
                 for item in items:
                     if not isinstance(item, dict):
                         continue
+                    if str(item.get('@type', '')).lower() in ('review', 'claimreview', 'quotation'):
+                        continue
                     for key, default_role in (('founder', 'Founder'), ('founders', 'Founder'), ('employee', 'Executive')):
                         val = item.get(key)
                         if isinstance(val, dict) and val.get('name'):
@@ -1302,19 +1471,26 @@ def extract_decision_maker_deep(
             except Exception:
                 continue
 
-    for page_url, _, page_text in pages_with_urls:
+    for page_url, html, _ in pages_with_urls:
         if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
             continue
         is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
 
-        for m in NAME_BEFORE_ROLE_PATTERN.finditer(page_text):
+        clean_soup = BeautifulSoup(html, 'lxml')
+        dm_clean_text = strip_testimonial_elements_and_get_clean_text(clean_soup)
+
+        for m in NAME_BEFORE_ROLE_PATTERN.finditer(dm_clean_text):
+            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end()):
+                continue
             cand_name = strip_role_tokens_from_name(m.group(1))
             cand_role = normalize_executive_role(m.group(2))
             if is_valid_person_name(cand_name):
                 matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
                 return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
 
-        for m in ROLE_BEFORE_NAME_PATTERN.finditer(page_text):
+        for m in ROLE_BEFORE_NAME_PATTERN.finditer(dm_clean_text):
+            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end()):
+                continue
             cand_role = normalize_executive_role(m.group(1))
             cand_name = strip_role_tokens_from_name(m.group(2))
             if is_valid_person_name(cand_name):
@@ -1348,7 +1524,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v150(
+def evaluate_qualification_v160(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1358,7 +1534,8 @@ def evaluate_qualification_v150(
     dm_role: str | None,
     dm_linkedin_url: str | None,
     dm_source_is_legal: bool,
-    linkedin_url: str | None
+    linkedin_url: str | None,
+    had_marketplace_pollution: bool = False
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
     ad_tags = []
     if tech_info.get('has_meta_pixel'):
@@ -1386,6 +1563,7 @@ def evaluate_qualification_v150(
     all_signals = ad_tags + analytics_tags
     detected_cms = tech_info.get('detected_cms_list', [])
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
+    scan_comp = tech_info.get('tech_scan_completeness', 'full')
 
     if all_signals:
         detected_signals_str = ', '.join(all_signals)
@@ -1414,10 +1592,8 @@ def evaluate_qualification_v150(
             "(Verified in HTML/GTM; confirms tracking infrastructure, not current ad spend)"
         )
     elif len(ad_tags) == 1:
-        tech_signal = (
-            f"Moderate Stack Maturity: Single ad pixel ({ad_tags[0]}) detected "
-            "(Secondary tags not found in static HTML/GTM or gated by Cookie Consent)"
-        )
+        partial_note = ' (Partial scan due to browser timeout — GA4/GTM unverified)' if scan_comp != 'full' else ' (Secondary tags not found in static HTML/GTM or gated by Cookie Consent)'
+        tech_signal = f"Moderate Stack Maturity: Single ad pixel ({ad_tags[0]}) detected{partial_note}"
     elif analytics_tags:
         tech_signal = (
             f"Basic Analytics Only ({', '.join(analytics_tags)}) — "
@@ -1477,7 +1653,7 @@ def evaluate_qualification_v150(
             f'Warning: Email {best_email} belongs to a different person than '
             f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.{legal_note}'
         )
-    elif dm_name and best_email_type in ('legal_or_hr_inbox', 'customer_support_inbox', 'pr_and_media_inbox'):
+    elif dm_name and best_email_type in ('legal_or_hr_inbox', 'customer_support_inbox', 'pr_and_media_inbox', 'influencer_gifting_inbox'):
         contact_quality = (
             f'Tier C- (Executive {dm_name} Identified on Site, '
             f'but Email {best_email} is {best_email_type} — Do Not Cold Pitch Email)'
@@ -1516,6 +1692,10 @@ def evaluate_qualification_v150(
         contact_quality = f'Tier C (Primary Brand Webmail Inbox: {best_email} — Suitable for Initial Routing)'
         enrichment_status = 'brand_webmail_only_needs_linkedin_dm'
         confidence_warning = 'Note: Brand uses a single Gmail/Webmail inbox for inquiries; request forwarding to marketing/management.'
+    elif best_email_type == 'influencer_gifting_inbox':
+        contact_quality = f'Tier C- (influencer_gifting_inbox: {best_email} — Creator/PR Gifting Channel)'
+        enrichment_status = 'influencer_gifting_inbox_needs_linkedin_dm'
+        confidence_warning = 'Warning: Email is for creator/influencer gifting (gteam/collabs), not B2B tech/analytics procurement.'
     elif best_email_type in ('wholesale_or_sales_inbox', 'regional_branch_inbox', 'department_or_general_inbox', 'admissions_or_department_inbox'):
         contact_quality = f'Tier C- ({best_email_type} — Non-Marketing Department Channel)'
         enrichment_status = 'non_marketing_department_inbox_needs_linkedin_dm'
@@ -1530,8 +1710,11 @@ def evaluate_qualification_v150(
         confidence_warning = 'Warning: No public email found; phone routing or LinkedIn required.'
     else:
         contact_quality = 'Tier F (No Actionable Contacts Found on Website)'
-        enrichment_status = 'no_public_contacts_found'
-        confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
+        enrichment_status = 'marketplace_external_emails_filtered_needs_linkedin_dm' if had_marketplace_pollution else 'no_public_contacts_found'
+        if had_marketplace_pollution:
+            confidence_warning = 'Warning: External third-party brand emails filtered out (marketplace_pollution); locate internal DM via LinkedIn.'
+        else:
+            confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
     # 4. Sales Readiness Verdict
     if company_category == 'Non-Profit / Education / Institution':
@@ -1599,7 +1782,7 @@ def evaluate_qualification_v150(
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
         'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox',
-        'department_or_general_inbox'
+        'department_or_general_inbox', 'influencer_gifting_inbox'
     ):
         dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
@@ -1826,15 +2009,16 @@ async def close_shared_playwright_browser():
             _PW_INSTANCE = None
 
 
-async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str]:
+async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
+    """П.5: Повертає 4-tuple (rendered_html, final_url, status_str, is_incomplete_timeout)."""
     if not PLAYWRIGHT_INSTALLED:
-        return '', url, 'disabled'
+        return '', url, 'disabled', False
 
     async with PW_SEMAPHORE:
         try:
             browser = await get_shared_playwright_browser()
             if browser is None:
-                return '', url, 'disabled'
+                return '', url, 'disabled', False
 
             ctx_kwargs = {
                 'locale': 'uk-UA',
@@ -1855,7 +2039,7 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 page = await context.new_page()
                 resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
                 if resp and resp.status >= 400:
-                    return '', url, f'launched_blocked (HTTP {resp.status})'
+                    return '', url, f'launched_blocked (HTTP {resp.status})', True
 
                 await page.wait_for_timeout(1200)
 
@@ -1890,13 +2074,13 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
                 rendered_html = await page.content()
                 final_u = clean_url_port(page.url) or url
                 if not rendered_html or len(rendered_html) <= 500:
-                    return '', final_u, 'launched_empty'
-                return rendered_html, final_u, 'rendered'
+                    return '', final_u, 'launched_empty', True
+                return rendered_html, final_u, 'rendered', False
             finally:
                 await context.close()
         except Exception as e:
             err_short = str(e).splitlines()[0][:60] if str(e) else 'error'
-            return '', url, f'launched_blocked ({err_short})'
+            return '', url, f'launched_blocked ({err_short})', True
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
@@ -2103,11 +2287,13 @@ async def process_domain(
     pw_status_str = 'not_needed' if PLAYWRIGHT_INSTALLED else 'disabled'
     pw_attempts_count = 0
     pw_attempted_paths: list[str] = []
+    pw_had_timeout_or_block = False
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
             client, root_url, proxy_config=proxy_config
         )
+        short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
         parsed_final = urlparse(final_url)
         scheme = parsed_final.scheme or 'https'
@@ -2118,11 +2304,21 @@ async def process_domain(
         evergreen_kv_key = f'evergreen_{canonical_kv_key}'
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
 
+        # П.9: Прозорість редіректів
+        was_redirected = (domain_key != canonical_domain)
+        redirect_chain_str = f'{domain_key} → {canonical_domain}' if was_redirected else None
+
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
-            # П.2 & П.3: Перевірка кешу з підтримкою TTL EVERGREEN_MAX_AGE_DAYS та полів cached_snapshot_source / age_days
+            # П.15: Для Tier-1 маркетплейсів спочатку перевіряємо evergreen_kv_key
+            is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
+            cache_keys_order = (
+                (evergreen_kv_key, canonical_kv_key, input_kv_key)
+                if is_tier1_marketplace
+                else (canonical_kv_key, input_kv_key, evergreen_kv_key)
+            )
             if cache_store is not None:
-                for candidate_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
+                for candidate_key in cache_keys_order:
                     try:
                         cached_record = await cache_store.get_value(candidate_key)
                         is_evergreen = (candidate_key == evergreen_kv_key)
@@ -2140,14 +2336,17 @@ async def process_domain(
 
                         cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
                         cached_copy['input_domain'] = domain_key
+                        cached_copy['aliases'] = domain_key
+                        cached_copy['input_was_redirected'] = was_redirected
+                        cached_copy['redirect_chain'] = redirect_chain_str
                         cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
                         cached_copy['cached_snapshot_source'] = 'evergreen_cache' if is_evergreen else 'versioned_cache'
                         cached_copy['cached_snapshot_age_days'] = age_days if age_days is not None else 0
-                        cached_copy['error_message'] = (
-                            f'Live request returned {err_msg}; preserved verified snapshot from {prev_time or "prior run"}'
+                        cached_copy['error_message'] = truncate_error_msg(
+                            f'Live {short_err_msg}; snapshot from {prev_time or "prior run"}'
                         )
                         cached_copy['data_confidence_warning'] = (
-                            f'Note: Live scan encountered {err_msg}; returning cached snapshot '
+                            f'Note: Live scan encountered {short_err_msg}; returning cached snapshot '
                             f'({cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d) from {prev_time}.'
                         )
                         cached_copy.setdefault('playwright_available', PLAYWRIGHT_INSTALLED)
@@ -2155,32 +2354,47 @@ async def process_domain(
                         cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
                         cached_copy['playwright_attempts_count'] = 0
                         cached_copy['playwright_paths_attempted'] = None
-                        cached_copy.setdefault(
-                            'phone_availability',
-                            'public' if cached_copy.get('primary_phone') else 'not_public'
-                        )
+                        # П.13: Гарантоване заповнення phone_availability у cached fallback
+                        cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
                         cached_copy.setdefault('ga4_detection_confidence', None)
+                        cached_copy.setdefault('tech_scan_completeness', 'full')
+                        cached_copy.setdefault('category_confidence', 'high')
+                        cached_copy.setdefault(
+                            'marketplace_platform',
+                            is_marketplace_platform(
+                                canonical_domain,
+                                cached_copy.get('page_title') or '',
+                                cached_copy.get('meta_description') or ''
+                            )
+                        )
+                        cached_copy.setdefault('named_email_owner_role_hint', None)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                         return cached_copy
                     except Exception:
                         pass
 
-            cat = classify_company_category(domain_key, '', '', [])
+            cat, cat_conf = classify_company_category(domain_key, '', '', [])
             return {
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
+                'aliases': domain_key,
+                'input_was_redirected': was_redirected,
+                'redirect_chain': redirect_chain_str,
                 'website_url': clean_website_url,
                 'final_redirect_url': normalized_final_redirect,
                 'status': fail_status,
                 'cached_snapshot_source': 'none (live_blocked)',
                 'cached_snapshot_age_days': None,
-                'error_message': err_msg,
+                'error_message': short_err_msg,
                 'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
                 'company_category': cat,
+                'category_confidence': cat_conf,
+                'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
                 'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
                 'technical_signal_strength': None,
+                'tech_scan_completeness': 'partial_blocked',
                 'contact_quality_tier': 'Tier F (Site Blocked)',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
@@ -2190,11 +2404,12 @@ async def process_domain(
                 'playwright_status': 'not_attempted_site_blocked',
                 'playwright_attempts_count': 0,
                 'playwright_paths_attempted': None,
-                'page_title': f'[Site blocked: {err_msg}]',
+                'page_title': f'[Site blocked: {short_err_msg}]',
                 'meta_description': None,
                 'best_email': None,
                 'email_domain': None,
                 'best_email_type': None,
+                'named_email_owner_role_hint': None,
                 'email_deliverability_check': None,
                 'email_source_url': None,
                 'primary_phone': None,
@@ -2217,7 +2432,7 @@ async def process_domain(
                 'detected_cms': None,
                 'consent_mode_likely': None,
                 'ga4_detection_confidence': None,
-                'sales_opportunity': f'Scan {fail_status} ({err_msg}) — cannot verify stack without access',
+                'sales_opportunity': f'Scan {fail_status} ({short_err_msg}) — cannot verify stack without access',
                 'next_best_action': 'Retry with residential proxy or run decision_maker_search_query on LinkedIn',
                 'technology_evidence_summary': None,
                 'technology_evidence': None,
@@ -2263,7 +2478,7 @@ async def process_domain(
             })
             gtm_js = ''
 
-        tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect)
+        tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, 'full')
 
         phone_map: dict[str, tuple[int, str]] = {}
         for p, sc, src in phones_with_source:
@@ -2310,18 +2525,22 @@ async def process_domain(
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
 
-        has_initial_contacts = bool(email_sources or phone_map or socials_with_source)
+        # П.4: Соцмережі не вважаються actionable-контактами! Перевіряємо чистий список email/phone
+        prelim_clean_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
+        has_actionable_contacts = bool(prelim_clean_emails or phone_map)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
 
-        if PLAYWRIGHT_INSTALLED and (not has_initial_contacts or needs_pw_tech or needs_pw_empty_shell):
+        if PLAYWRIGHT_INSTALLED and (not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell):
             Actor.log.info(
                 f'Playwright triggered for {canonical_domain} '
-                f'(no_contacts={not has_initial_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
+                f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(normalized_final_redirect)
-            pw_html, pw_url, pw_status_str = await fetch_html_playwright_fallback(normalized_final_redirect)
+            pw_html, pw_url, pw_status_str, pw_incomplete = await fetch_html_playwright_fallback(normalized_final_redirect)
+            if pw_incomplete:
+                pw_had_timeout_or_block = True
             Actor.log.info(
                 f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
             )
@@ -2344,10 +2563,10 @@ async def process_domain(
                     socials_with_source.setdefault(k, v)
                 if needs_pw_tech or needs_pw_empty_shell:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
-                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url)
+                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, 'full')
 
-                # П.1 & П.4: Семантичний витяг контактних посилань із PW DOM (за текстом анкорів <a> та піддоменами)
-                if scan_contacts and not (email_sources or phone_map):
+                after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
+                if scan_contacts and not (after_pw_emails or phone_map):
                     semantic_pw_links = await loop.run_in_executor(
                         thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
                     )
@@ -2366,7 +2585,7 @@ async def process_domain(
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                             pw_attempts_count += 1
                             pw_attempted_paths.append(pw_sub_u)
-                            sub_pw_html, sub_pw_final, sub_pw_st = await fetch_html_playwright_fallback(pw_sub_u)
+                            sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(pw_sub_u)
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
                                     thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, default_region
@@ -2384,10 +2603,16 @@ async def process_domain(
                                             phone_map[p] = (sc, src)
                                     for k, v in s_s.items():
                                         socials_with_source.setdefault(k, v)
-                                    if email_sources or phone_map:
+                                    chk_em, _ = rank_and_clean_emails(email_sources, canonical_domain)
+                                    if chk_em or phone_map:
                                         break
 
-        ranked_emails_with_src = rank_and_clean_emails(email_sources, canonical_domain)
+        # П.5: Якщо PW зазнав таймауту, а в статичному HTML не знайшли GA4/GTM, позначаємо partial_timeout і ставимо None замість False
+        if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm']):
+            scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
+            tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
+
+        ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
         sorted_phones_with_src = sorted(
             phone_map.items(),
@@ -2398,6 +2623,7 @@ async def process_domain(
         best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email, brand_token)
+        owner_role_hint = extract_named_email_owner_hint(best_email, best_email_type, pages_with_urls)
 
         email_domain = None
         if best_email and '@' in best_email:
@@ -2410,7 +2636,7 @@ async def process_domain(
                     email_domain = f'{raw_em_dom} (brand_webmail)'
                 else:
                     email_domain = f'{raw_em_dom} (public_webmail)'
-            elif brand_token and raw_em_dom.split('.')[0] == brand_token:
+            elif brand_token and (raw_em_dom.split('.')[0] == brand_token or brand_token in raw_em_dom.split('.')[0]):
                 email_domain = f'{raw_em_dom} (brand_alias_domain)'
             else:
                 email_domain = f'{raw_em_dom} (external_domain)'
@@ -2432,9 +2658,10 @@ async def process_domain(
                 break
 
         detected_tech_list = tech_info['detected_technologies_list']
-        company_category = classify_company_category(
-            domain_key, page_title, meta_desc, detected_tech_list, html
+        company_category, category_confidence = classify_company_category(
+            canonical_domain, page_title, meta_desc, detected_tech_list, html
         )
+        is_mp_platform = is_marketplace_platform(canonical_domain, page_title, meta_desc)
 
         dm_name, dm_role, dm_linkedin_url, dm_source_url, dm_source_is_legal = await loop.run_in_executor(
             thread_pool, extract_decision_maker_deep, pages_with_urls
@@ -2453,7 +2680,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v150(
+        ) = evaluate_qualification_v160(
             company_category,
             tech_info,
             best_email,
@@ -2463,11 +2690,13 @@ async def process_domain(
             dm_role,
             dm_linkedin_url,
             dm_source_is_legal,
-            linkedin_url
+            linkedin_url,
+            had_marketplace_pollution
         )
 
-        has_any_contact = bool(best_email or primary_phone or socials_with_source)
-        final_status = 'success' if has_any_contact else 'no_contacts_found'
+        # Статус базується на actionable контактах (email або телефон), щоб сайти без пошти/телефону чесно отримували no_contacts_found
+        has_actionable_final = bool(best_email or primary_phone)
+        final_status = 'success' if has_actionable_final else 'no_contacts_found'
 
         non_legal_emails = [
             em for em, _ in ranked_emails_with_src
@@ -2479,6 +2708,9 @@ async def process_domain(
         result_record = {
             'input_domain': domain_key,
             'canonical_domain': canonical_domain,
+            'aliases': domain_key,
+            'input_was_redirected': was_redirected,
+            'redirect_chain': redirect_chain_str,
             'website_url': clean_website_url,
             'final_redirect_url': normalized_final_redirect,
             'status': final_status,
@@ -2487,8 +2719,11 @@ async def process_domain(
             'error_message': '',
             'sales_readiness_verdict': sales_readiness_verdict,
             'company_category': company_category,
+            'category_confidence': category_confidence,
+            'marketplace_platform': is_mp_platform,
             'icp_fit_tier': icp_fit_tier,
             'technical_signal_strength': technical_signal_strength,
+            'tech_scan_completeness': tech_info['tech_scan_completeness'],
             'contact_quality_tier': contact_quality_tier,
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
@@ -2503,6 +2738,7 @@ async def process_domain(
             'best_email': best_email,
             'email_domain': email_domain,
             'best_email_type': best_email_type,
+            'named_email_owner_role_hint': owner_role_hint,
             'email_deliverability_check': deliverability_check,
             'email_source_url': email_source_url,
             'primary_phone': primary_phone,
@@ -2607,8 +2843,7 @@ async def main() -> None:
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
 
-        batch = []
-        batch_size = 5
+        seen_canonical_records: dict[str, dict] = {}
         metrics_counter = Counter()
 
         try:
@@ -2636,7 +2871,32 @@ async def main() -> None:
 
                 for coro in asyncio.as_completed(tasks):
                     result = await coro
-                    batch.append(result)
+                    cd = result.get('canonical_domain') or result.get('input_domain')
+                    inp_dom = result.get('input_domain', '')
+
+                    # П.3 & П.12: Дедуплікація за canonical_domain на рівні всього рану зі збереженням aliases
+                    if cd in seen_canonical_records:
+                        existing = seen_canonical_records[cd]
+                        existing_aliases = [a.strip() for a in (existing.get('aliases') or '').split(';') if a.strip()]
+                        if inp_dom and inp_dom not in existing_aliases:
+                            existing_aliases.append(inp_dom)
+                        if cd not in existing_aliases:
+                            existing_aliases.append(cd)
+                        existing['aliases'] = '; '.join(existing_aliases)
+                        if inp_dom != cd:
+                            existing['input_was_redirected'] = True
+                            existing['redirect_chain'] = f'{inp_dom} → {cd}'
+                        metrics_counter['deduped_canonical_aliases'] += 1
+                        Actor.log.info(f'[DEDUPED] {inp_dom} merged into canonical {cd} (aliases: {existing["aliases"]})')
+                        continue
+
+                    # Якщо сам домен редіректнувся (напр. chubbies.com -> chubbiesshorts.com), записуємо обидва в aliases
+                    if inp_dom and cd and inp_dom != cd:
+                        result['aliases'] = f'{inp_dom}; {cd}'
+                    else:
+                        result['aliases'] = inp_dom or cd
+
+                    seen_canonical_records[cd] = result
 
                     st = result['status']
                     metrics_counter[f'status_{st}'] += 1
@@ -2653,15 +2913,14 @@ async def main() -> None:
                         f"Email: {result['best_email'] or '-'}"
                     )
 
-                    if len(batch) >= batch_size:
-                        await Actor.push_data(batch)
-                        batch.clear()
-
-                if batch:
-                    await Actor.push_data(batch)
+                deduped_results = list(seen_canonical_records.values())
+                for i in range(0, len(deduped_results), 5):
+                    await Actor.push_data(deduped_results[i:i + 5])
 
             run_telemetry = {
-                'total_domains': total_domains,
+                'total_input_domains': total_domains,
+                'unique_canonical_domains_pushed': len(seen_canonical_records),
+                'deduped_aliases_merged': metrics_counter['deduped_canonical_aliases'],
                 'live_success_count': metrics_counter['status_success'],
                 'cached_fallback_count': metrics_counter['cache_fallbacks'],
                 'playwright_rendered_count': metrics_counter['playwright_rendered'],
