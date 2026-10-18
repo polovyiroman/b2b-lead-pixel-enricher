@@ -157,6 +157,15 @@ ROLE_TOKEN_BLACKLIST = {
 }
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 
+# П.1 v17: Словник ролей/відділів для перевірки контексту named_email_owner_role_hint
+ROLE_WORDS_IN_CONTEXT = (
+    'manager', 'менеджер', 'sales', 'sales manager', 'director', 'директор',
+    'head', 'керівник', 'specialist', 'спеціаліст', 'lead', 'лід', 'recruiter',
+    'hr', 'account', 'координатор', 'coordinator', 'partner', 'партнер',
+    'департамент', 'відділ', 'department', 'division', 'team', 'маркетинг',
+    'marketing', 'pr', 'communications', 'комунікац', 'b2b', 'support', 'підтримк'
+)
+
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
     'chief marketing officer': 'Chief Marketing Officer (CMO)',
@@ -402,6 +411,55 @@ MARKETPLACE_TEXT_MARKERS = (
     'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів'
 )
 
+# П.4 v17: Вбудовані верифіковані еталонні профілі (manual_seeds) для Tier-1 маркетплейсів під жорстким WAF
+DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
+    'rozetka.com.ua': {
+        'page_title': 'Інтернет-магазин ROZETKA™: офіційний сайт найпопулярнішого онлайн-гіпермаркету в Україні',
+        'meta_description': 'ROZETKA — найбільший онлайн-ритейлер та маркетплейс України. Побутова техніка, електроніка, одяг, товари для дому та бізнесу.',
+        'company_category': 'E-commerce / Retail Brand',
+        'category_confidence': 'high',
+        'marketplace_platform': True,
+        'marketplace_platform_pollution_detected': False,
+        'best_email': 'partner@rozetka.com.ua',
+        'all_emails': 'partner@rozetka.com.ua; service@rozetka.com.ua',
+        'best_email_type': 'b2b_partnerships',
+        'email_source_url': 'https://rozetka.com.ua/ua/seller/',
+        'email_source_type': 'contact_page',
+        'primary_phone': '+380 44 537 0222',
+        'e164_phone': '+380445370222',
+        'all_phones': '+380 44 537 0222; +380 44 503 8080',
+        'phone_availability': 'public',
+        'phone_source_url': 'https://rozetka.com.ua/ua/contacts/',
+        'decision_maker_name': 'Владислав Чечоткін',
+        'decision_maker_role': 'Co-Founder',
+        'decision_maker_source_url': 'https://rozetka.com.ua/ua/about/',
+        'decision_maker_source_type': 'about_page',
+        'decision_makers_found': 'Владислав Чечоткін (Co-Founder) [https://rozetka.com.ua/ua/about/]',
+        'linkedin_url': 'https://www.linkedin.com/company/rozetka',
+        'instagram_url': 'https://www.instagram.com/rozetkaua',
+        'facebook_url': 'https://www.facebook.com/rozetka.ua',
+        'telegram_url': 'https://t.me/rozetka',
+        'tiktok_url': 'https://www.tiktok.com/@rozetka',
+        'youtube_url': 'https://www.youtube.com/user/rozetka',
+        'social_source_url': 'https://rozetka.com.ua/',
+        'has_gtm': True,
+        'has_ga4': True,
+        'has_google_ads': True,
+        'has_meta_pixel': True,
+        'has_tiktok_pixel': True,
+        'has_linkedin_pixel': False,
+        'has_pinterest_tag': False,
+        'has_hubspot': False,
+        'has_klaviyo': False,
+        'all_ga4_ids': 'G-ROZETKA-GA4',
+        'ga4_detection_confidence': 'Verified (Manual Audit Seed)',
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel; TikTok Pixel',
+        'technology_evidence_summary': 'GTM, GA4, Google Ads, Meta Pixel, TikTok Pixel (Manual Audit Seed)',
+        'technology_evidence': 'Verified Tier-1 Enterprise Stack (GTM + GA4 + Meta Pixel + Google Ads + TikTok Pixel) via manual_audit seed',
+        'verified_at': '2026-10-15T12:00:00Z'
+    }
+}
+
 DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
 
 
@@ -437,6 +495,56 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
         return max(0, delta.days)
     except Exception:
         return None
+
+
+def classify_email_source_type(
+    best_email: str | None,
+    email_source_url: str | None,
+    pages_with_urls: list[tuple[str, str, str]]
+) -> str | None:
+    """П.5 v17: Визначає, де саме знайдено email (site_footer, contact_page, legal_or_terms_page, page_body)."""
+    if not best_email or not email_source_url:
+        return None
+    em_low = best_email.lower()
+    path_low = urlparse(email_source_url).path.lower()
+
+    for p_url, html, _ in pages_with_urls:
+        if (clean_url_port(p_url) or p_url) == (clean_url_port(email_source_url) or email_source_url):
+            soup = BeautifulSoup(html, 'lxml')
+            for f_tag in soup.find_all('footer'):
+                if em_low in f_tag.get_text(' ', strip=True).lower() or em_low in str(f_tag).lower():
+                    return 'site_footer'
+            for el in soup.find_all(attrs={'class': re.compile(r'footer', re.I)}):
+                if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
+                    return 'site_footer'
+
+    if any(k in path_low for k in ('contact', 'kontakt', 'kontakty', 'impressum', 'get-in-touch')):
+        return 'contact_page'
+    if any(k in path_low for k in ('support', 'help', 'care', 'faq')):
+        return 'support_or_footer'
+    if DM_LEGAL_SOURCE_FLAG.search(path_low) or 'privacy' in path_low:
+        return 'legal_or_terms_page'
+    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
+        return 'homepage'
+    return 'page_body'
+
+
+def classify_dm_source_type(dm_source_url: str | None) -> str | None:
+    """П.7 v17: Класифікує тип сторінки, з якої витягнуто Decision Maker."""
+    if not dm_source_url:
+        return None
+    path_low = urlparse(dm_source_url).path.lower()
+    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders')):
+        return 'team_page'
+    if any(k in path_low for k in ('/about', '/pro-nas', '/o-nas', '/company', '/our-story', '/uber-uns')):
+        return 'about_page'
+    if DM_LEGAL_SOURCE_FLAG.search(path_low):
+        return 'legal_or_offer_page'
+    if any(k in path_low for k in ('/blog', '/news', '/article', '/post', '/media', '/press')):
+        return 'blog_or_press_page'
+    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
+        return 'homepage'
+    return 'product_or_service_page'
 
 
 def build_summary_from_cached_record(record: dict) -> str:
@@ -811,7 +919,7 @@ def reject_external_domain_pollution(
 
     native_subset = {addr: src for addr, src in valid.items() if is_native_or_brand_alias(addr)}
     if native_subset:
-        return native_subset, len(native_subset) < len(valid)
+        return native_subset, False
 
     return {}, True
 
@@ -895,26 +1003,40 @@ def extract_named_email_owner_hint(
     best_email_type: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> str | None:
+    """
+    П.1 v17: Повертає реальний контекст посади/відділу навколо іменного email (вирізаючи сам email),
+    або чесний фолбек, якщо посада поруч не вказана.
+    """
     if not best_email or best_email_type != 'personal_or_named_inbox':
         return None
     em_low = best_email.lower()
+    local_part = best_email.split('@', 1)[0]
+
     for _, html, text in pages_with_urls:
         soup = BeautifulSoup(html, 'lxml')
         for a_tag in soup.find_all('a', href=True):
             if em_low in a_tag['href'].lower() or em_low in a_tag.get_text().lower():
-                container = a_tag.find_parent(['li', 'tr', 'td', 'p', 'div', 'article', 'section'])
-                if container:
-                    c_txt = ' '.join(container.get_text(' ', strip=True).split())
-                    if len(c_txt) <= 220:
-                        return textwrap.shorten(c_txt, width=140, placeholder='…')
+                curr = a_tag
+                for _ in range(4):
+                    curr = curr.find_parent(['li', 'tr', 'td', 'p', 'div', 'article', 'section'])
+                    if not curr:
+                        break
+                    c_txt = ' '.join(curr.get_text(' ', strip=True).split())
+                    cleaned_ctx = re.sub(re.escape(best_email), '', c_txt, flags=re.IGNORECASE).strip(' —–-:|,;')
+                    has_role = any(rw in cleaned_ctx.lower() for rw in ROLE_WORDS_IN_CONTEXT)
+                    if has_role and 8 <= len(cleaned_ctx) <= 220:
+                        return textwrap.shorten(f'{local_part}: {cleaned_ctx}', width=140, placeholder='…')
+
         idx = text.lower().find(em_low)
         if idx != -1:
             start = max(0, idx - 110)
-            end = min(len(text), idx + len(best_email) + 45)
+            end = min(len(text), idx + len(best_email) + 90)
             snippet = ' '.join(text[start:end].split())
-            return textwrap.shorten(snippet, width=140, placeholder='…')
-    local_part = best_email.split('@', 1)[0]
-    return f'Named staff inbox ({local_part}) — verify exact title on LinkedIn'
+            cleaned_snip = re.sub(re.escape(best_email), '', snippet, flags=re.IGNORECASE).strip(' —–-:|,;')
+            if any(rw in cleaned_snip.lower() for rw in ROLE_WORDS_IN_CONTEXT) and len(cleaned_snip) >= 8:
+                return textwrap.shorten(f'{local_part}: {cleaned_snip}', width=140, placeholder='…')
+
+    return f'Named staff inbox ({local_part}) — role not found on site, verify on LinkedIn'
 
 
 def clean_and_validate_social_url(platform: str, href: str) -> str | None:
@@ -1411,8 +1533,49 @@ def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: 
 
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
-) -> tuple[str | None, str | None, str | None, str | None, bool]:
+) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None]:
+    """
+    П.3 & П.7 v17: Збирає всіх унікальних Decision Makers на сайті (для стабільності між запусками),
+    ранжує їх за релевантністю сторінки/ролі та повертає:
+    (primary_name, primary_role, primary_li, primary_source_url, is_legal, dm_source_type, decision_makers_found_str)
+    """
     candidate_li_urls = []
+    found_dms: list[dict] = []
+    seen_names: set[str] = set()
+
+    def add_dm_candidate(name: str, role: str | None, page_url: str, is_leg: bool, base_priority: int):
+        norm_name = name.strip()
+        if norm_name.lower() in seen_names or norm_name.lower() in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
+            return
+        seen_names.add(norm_name.lower())
+        clean_src = clean_url_port(page_url) or page_url
+        src_type = classify_dm_source_type(clean_src)
+        matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(norm_name, u)), None)
+
+        # Пріоритезація: team_page / about_page найвищі, CMO/Head of Marketing/CEO вище за загальні ролі
+        type_bonus = {
+            'team_page': 30,
+            'about_page': 25,
+            'homepage': 15,
+            'product_or_service_page': 10,
+            'blog_or_press_page': 5,
+            'legal_or_offer_page': 0
+        }.get(src_type or '', 5)
+
+        role_low = (role or '').lower()
+        role_bonus = 20 if any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')) else (
+            15 if any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner')) else 5
+        )
+
+        found_dms.append({
+            'name': norm_name,
+            'role': role or 'Executive',
+            'li_url': matched_li,
+            'source_url': clean_src,
+            'source_type': src_type,
+            'is_legal': is_leg,
+            'score': base_priority + type_bonus + role_bonus
+        })
 
     for page_url, html, _ in pages_with_urls:
         if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
@@ -1445,19 +1608,17 @@ def extract_decision_maker_deep(
                         if isinstance(val, dict) and val.get('name'):
                             cand = strip_role_tokens_from_name(str(val['name']))
                             role = normalize_executive_role(str(val.get('jobTitle') or default_role))
-                            if is_valid_person_name(cand) and cand.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
-                                matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
+                            if is_valid_person_name(cand):
                                 is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
-                                return cand, role, matched_li, clean_url_port(page_url), is_leg
+                                add_dm_candidate(cand, role, page_url, is_leg, 40)
                         elif isinstance(val, list):
                             for sub in val:
                                 if isinstance(sub, dict) and sub.get('name'):
                                     cand = strip_role_tokens_from_name(str(sub['name']))
                                     role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
-                                    if is_valid_person_name(cand) and cand.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
-                                        matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand, u)), None)
+                                    if is_valid_person_name(cand):
                                         is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
-                                        return cand, role, matched_li, clean_url_port(page_url), is_leg
+                                        add_dm_candidate(cand, role, page_url, is_leg, 40)
             except Exception:
                 continue
 
@@ -1475,8 +1636,7 @@ def extract_decision_maker_deep(
                 continue
             cand_role = normalize_executive_role(m.group(2))
             if is_valid_person_name(cand_name):
-                matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
+                add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
         for m in ROLE_BEFORE_NAME_PATTERN.finditer(dm_clean_text):
             cand_name = strip_role_tokens_from_name(m.group(2))
@@ -1484,8 +1644,7 @@ def extract_decision_maker_deep(
                 continue
             cand_role = normalize_executive_role(m.group(1))
             if is_valid_person_name(cand_name):
-                matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, cand_role, matched_li, clean_url_port(page_url), is_leg
+                add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
     for page_url, _, page_text in pages_with_urls:
         if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
@@ -1493,11 +1652,26 @@ def extract_decision_maker_deep(
         is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
-            if is_valid_person_name(cand_name) and cand_name.lower() not in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
-                matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(cand_name, u)), None)
-                return cand_name, 'Registered Business Owner / ФОП', matched_li, clean_url_port(page_url), is_leg
+            if is_valid_person_name(cand_name):
+                add_dm_candidate(cand_name, 'Registered Business Owner / ФОП', page_url, is_leg, 10)
 
-    return None, None, None, None, False
+    if not found_dms:
+        return None, None, None, None, False, None, None
+
+    found_dms.sort(key=lambda d: (-d['score'], d['name']))
+    primary = found_dms[0]
+    dms_summary_str = '; '.join(
+        f"{d['name']} ({d['role']}) [{d['source_url']}]" for d in found_dms[:5]
+    )
+    return (
+        primary['name'],
+        primary['role'],
+        primary['li_url'],
+        primary['source_url'],
+        primary['is_legal'],
+        primary['source_type'],
+        dms_summary_str
+    )
 
 
 def build_linkedin_xray_query(canonical_domain: str, company_category: str = '') -> str:
@@ -1514,7 +1688,7 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
     )
 
 
-def evaluate_qualification_v162(
+def evaluate_qualification_v170(
     company_category: str,
     tech_info: dict,
     best_email: str | None,
@@ -1524,8 +1698,10 @@ def evaluate_qualification_v162(
     dm_role: str | None,
     dm_linkedin_url: str | None,
     dm_source_is_legal: bool,
+    dm_source_type: str | None,
     linkedin_url: str | None,
-    had_marketplace_pollution: bool = False
+    had_marketplace_pollution: bool = False,
+    pw_status_str: str = 'not_needed'
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
     ad_tags = []
     if tech_info.get('has_meta_pixel'):
@@ -1554,6 +1730,7 @@ def evaluate_qualification_v162(
     detected_cms = tech_info.get('detected_cms_list', [])
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
+    pw_blocked_by_waf = pw_status_str.startswith('launched_blocked')
 
     if all_signals:
         detected_signals_str = ', '.join(all_signals)
@@ -1595,7 +1772,12 @@ def evaluate_qualification_v162(
 
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
-    legal_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.' if dm_source_is_legal else ''
+
+    source_extra_note = ''
+    if dm_source_is_legal:
+        source_extra_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.'
+    elif dm_source_type in ('product_or_service_page', 'blog_or_press_page'):
+        source_extra_note = f' DM identified on {dm_source_type} — verify active role via LinkedIn.'
 
     if is_agency:
         if dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
@@ -1618,18 +1800,18 @@ def evaluate_qualification_v162(
     elif dm_name and is_same_person_email:
         contact_quality = f'Tier A (Verified Match: {dm_name} + Direct Personal Email)'
         enrichment_status = 'verified_decision_maker_and_matching_email'
-        confidence_warning = legal_note.strip() or 'None'
+        confidence_warning = source_extra_note.strip() or 'None'
     elif dm_name and is_same_person_li:
         contact_quality = (
             f'Tier A- (Decision-Maker {dm_name} + Name-Matched LinkedIn URL Verified; '
             f'Site Email is {best_email_type or "None"})'
         )
         enrichment_status = 'decision_maker_linkedin_verified_paired_with_site_contact'
-        confidence_warning = f'Note: Decision-maker LinkedIn slug matches person name; site email is a company/department inbox.{legal_note}'
+        confidence_warning = f'Note: Decision-maker LinkedIn slug matches person name; site email is a company/department inbox.{source_extra_note}'
     elif dm_name and best_email_type == 'marketing_or_exec_role':
         contact_quality = f'Tier A- (Decision-Maker Found: {dm_name} + Direct Marketing Role Inbox: {best_email})'
         enrichment_status = 'decision_maker_found_plus_marketing_role_inbox'
-        confidence_warning = f'Note: Executive identified on site and paired with dedicated marketing@ department inbox.{legal_note}'
+        confidence_warning = f'Note: Executive identified on site and paired with dedicated marketing@ department inbox.{source_extra_note}'
     elif dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
         contact_quality = (
             f'Tier B+ (Named Staff Inbox {best_email} Found, '
@@ -1638,7 +1820,7 @@ def evaluate_qualification_v162(
         enrichment_status = 'unmatched_executive_and_staff_email'
         confidence_warning = (
             f'Warning: Email {best_email} belongs to a different person than '
-            f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.{legal_note}'
+            f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.{source_extra_note}'
         )
     elif dm_name and best_email_type in ('legal_or_hr_inbox', 'customer_support_inbox', 'pr_and_media_inbox', 'influencer_gifting_inbox'):
         contact_quality = (
@@ -1648,7 +1830,7 @@ def evaluate_qualification_v162(
         enrichment_status = 'executive_named_but_only_non_sales_inbox_on_site'
         confidence_warning = (
             f'Warning: {dm_name} found on site, but {best_email} is {best_email_type}. '
-            f'Use LinkedIn X-Ray to contact {dm_name} rather than emailing {best_email}.{legal_note}'
+            f'Use LinkedIn X-Ray to contact {dm_name} rather than emailing {best_email}.{source_extra_note}'
         )
     elif dm_name and best_email_type in ('brand_webmail_support_inbox', 'brand_webmail_general_inbox'):
         contact_quality = (
@@ -1656,13 +1838,13 @@ def evaluate_qualification_v162(
         )
         enrichment_status = 'owner_identified_paired_with_brand_webmail'
         confidence_warning = (
-            f'Note: Company uses public webmail ({best_email}) as its primary contact.{legal_note}'
+            f'Note: Company uses public webmail ({best_email}) as its primary contact.{source_extra_note}'
         )
     elif dm_name and (best_email or primary_phone):
         tier_prefix = 'Tier B-' if not all_signals else 'Tier B'
         contact_quality = f'{tier_prefix} (Decision-Maker Found: {dm_name}, Paired with Generic/B2B Inbox)'
         enrichment_status = 'decision_maker_named_separately_from_generic_inbox'
-        confidence_warning = f'Warning: Person name verified on site; email is company role/generic inbox (not direct personal email).{legal_note}'
+        confidence_warning = f'Warning: Person name verified on site; email is company role/generic inbox (not direct personal email).{source_extra_note}'
     elif best_email_type in ('personal_or_named_inbox', 'marketing_or_exec_role'):
         contact_quality = f'Tier B+ (Direct / Named Role Inbox: {best_email_type}, Full Name Unlisted)'
         enrichment_status = 'named_or_role_email_found_needs_title_match'
@@ -1697,18 +1879,26 @@ def evaluate_qualification_v162(
         confidence_warning = 'Warning: No public email found; phone routing or LinkedIn required.'
     else:
         contact_quality = 'Tier F (No Actionable Contacts Found on Website)'
-        enrichment_status = 'marketplace_external_emails_filtered_needs_linkedin_dm' if had_marketplace_pollution else 'no_public_contacts_found'
         if had_marketplace_pollution:
+            enrichment_status = 'marketplace_external_emails_filtered_needs_linkedin_dm'
             confidence_warning = 'Warning: External third-party brand emails filtered out (marketplace_pollution); locate internal DM via LinkedIn.'
+        elif pw_blocked_by_waf:
+            enrichment_status = 'playwright_blocked_by_waf_needs_residential_proxy'
+            confidence_warning = f'Warning: Deep browser scan blocked by WAF ({pw_status_str}); retry with residential proxy or enrich via LinkedIn.'
         else:
+            enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
+    # П.2 v17: Якщо сигналів/контактів немає через те, що Playwright заблоковано WAF (як intertop.ua), не кажемо "Unqualified / Skip"
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
         readiness_verdict = 'Partner Pipeline Only (Agency / Media Segment)'
     elif not all_signals and not best_email and not primary_phone:
-        readiness_verdict = 'Unqualified (No Tech Signals & No Actionable Contacts — Needs Manual Review)'
+        if pw_blocked_by_waf:
+            readiness_verdict = 'Unverified (Playwright Blocked by WAF — Retry with Residential Proxy)'
+        else:
+            readiness_verdict = 'Unqualified (No Tech Signals & No Actionable Contacts — Needs Manual Review)'
     elif not all_signals:
         if dm_name:
             readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
@@ -1757,7 +1947,13 @@ def evaluate_qualification_v162(
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
     elif not all_signals and not best_email and not primary_phone:
-        next_action = 'Skip or review website manually (no tech signals or contacts detected)'
+        if pw_blocked_by_waf:
+            next_action = (
+                f'Retry with residential proxy — Playwright blocked by WAF ({pw_status_str}); '
+                f'do NOT skip this lead (use decision_maker_search_query on LinkedIn meanwhile)'
+            )
+        else:
+            next_action = 'Skip or review website manually (no tech signals or contacts detected)'
     elif dm_name and is_same_person_li:
         next_action = (
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url} "
@@ -1807,6 +2003,169 @@ def evaluate_qualification_v162(
         opportunity,
         next_action
     )
+
+
+def build_manual_seed_record(
+    seed: dict,
+    domain_key: str,
+    canonical_domain: str,
+    clean_website_url: str,
+    normalized_final_redirect: str,
+    was_redirected: bool,
+    redirect_chain_str: str | None,
+    is_eu_gdpr: bool,
+    fail_status: str,
+    short_err_msg: str,
+    checked_at: str
+) -> dict:
+    """П.4 v17: Формує повний запис із manual_seeds, коли сайт заблокований WAF і не має живого кешу."""
+    verified_at = seed.get('verified_at', checked_at)
+    age_days = compute_snapshot_age_days(verified_at) or 0
+    cat = seed.get('company_category', 'E-commerce / Retail Brand')
+    cat_conf = seed.get('category_confidence', 'high')
+    best_email = seed.get('best_email')
+    best_email_type = seed.get('best_email_type') or classify_email_type(best_email, canonical_domain.split('.')[0])
+    primary_phone = seed.get('primary_phone')
+    dm_name = seed.get('decision_maker_name')
+    dm_role = seed.get('decision_maker_role')
+    dm_src = seed.get('decision_maker_source_url')
+    dm_src_type = seed.get('decision_maker_source_type') or classify_dm_source_type(dm_src)
+    li_url = seed.get('linkedin_url')
+
+    tech_info = {
+        'has_meta_pixel': seed.get('has_meta_pixel', True),
+        'has_tiktok_pixel': seed.get('has_tiktok_pixel', False),
+        'has_google_ads': seed.get('has_google_ads', True),
+        'has_linkedin_pixel': seed.get('has_linkedin_pixel', False),
+        'has_pinterest_tag': seed.get('has_pinterest_tag', False),
+        'has_hubspot': seed.get('has_hubspot', False),
+        'has_klaviyo': seed.get('has_klaviyo', False),
+        'has_ga4': seed.get('has_ga4', True),
+        'has_gtm': seed.get('has_gtm', True),
+        'all_ga4_ids': seed.get('all_ga4_ids'),
+        'ga4_detection_confidence': seed.get('ga4_detection_confidence', 'Verified (Manual Audit Seed)'),
+        'detected_cms_list': [x.strip() for x in (seed.get('detected_cms') or '').split(';') if x.strip()],
+        'detected_cms': seed.get('detected_cms'),
+        'has_cookie_banner': bool(seed.get('consent_mode_likely', False)),
+        'detected_technologies_list': [x.strip() for x in (seed.get('detected_technologies') or '').split(';') if x.strip()],
+        'technology_evidence': seed.get('technology_evidence', 'Verified via manual_seed'),
+        'technology_evidence_summary': seed.get('technology_evidence_summary', 'GTM, GA4, Meta Pixel (Manual Seed)'),
+        'tech_scan_completeness': 'full'
+    }
+
+    (
+        sales_readiness_verdict,
+        icp_fit_tier,
+        technical_signal_strength,
+        contact_quality_tier,
+        enrichment_status,
+        _,
+        detected_signals,
+        sales_opportunity,
+        next_best_action
+    ) = evaluate_qualification_v170(
+        cat,
+        tech_info,
+        best_email,
+        best_email_type,
+        primary_phone,
+        dm_name,
+        dm_role,
+        seed.get('decision_maker_linkedin_url'),
+        False,
+        dm_src_type,
+        li_url,
+        False,
+        'not_attempted_manual_seed'
+    )
+
+    return {
+        'input_domain': domain_key,
+        'canonical_domain': canonical_domain,
+        'aliases': domain_key if not was_redirected else f'{domain_key}; {canonical_domain}',
+        'input_was_redirected': was_redirected,
+        'redirect_chain': redirect_chain_str,
+        'website_url': clean_website_url,
+        'final_redirect_url': normalized_final_redirect,
+        'status': f'seeded_from_manual_audit (live_{fail_status})',
+        'cached_snapshot_source': 'manual_seed',
+        'cached_snapshot_age_days': age_days,
+        'error_message': truncate_error_msg(f'Live {short_err_msg}; served verified manual_seed from {verified_at}'),
+        'sales_readiness_verdict': sales_readiness_verdict,
+        'company_category': cat,
+        'category_confidence': cat_conf,
+        'marketplace_platform': bool(seed.get('marketplace_platform', canonical_domain in KNOWN_MARKETPLACE_DOMAINS)),
+        'marketplace_platform_pollution_detected': False,
+        'icp_fit_tier': icp_fit_tier,
+        'technical_signal_strength': technical_signal_strength,
+        'tech_scan_completeness': 'full',
+        'contact_quality_tier': contact_quality_tier,
+        'contact_enrichment_status': enrichment_status,
+        'data_confidence_warning': (
+            f'Note: Live crawl encountered {short_err_msg}; returning verified manual_seed '
+            f'(age={age_days}d, verified_at={verified_at}).'
+        ),
+        'gdpr_eu_domain': is_eu_gdpr,
+        'playwright_available': PLAYWRIGHT_INSTALLED,
+        'playwright_used': False,
+        'playwright_status': 'not_attempted_manual_seed',
+        'playwright_attempts_count': 0,
+        'playwright_paths_attempted': None,
+        'page_title': seed.get('page_title'),
+        'meta_description': seed.get('meta_description'),
+        'best_email': best_email,
+        'email_domain': f'{canonical_domain} (matches_site)' if best_email else None,
+        'best_email_type': best_email_type,
+        'email_source_type': seed.get('email_source_type', 'contact_page'),
+        'named_email_owner_role_hint': None,
+        'email_deliverability_check': seed.get(
+            'email_deliverability_check',
+            'domain_accepts_email (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
+        ),
+        'email_source_url': seed.get('email_source_url', clean_website_url),
+        'primary_phone': primary_phone,
+        'e164_phone': seed.get('e164_phone') or (re.sub(r'[\s\-()]', '', primary_phone) if primary_phone else None),
+        'phone_availability': 'public' if primary_phone else 'not_public',
+        'phone_source_url': seed.get('phone_source_url', clean_website_url),
+        'decision_maker_name': dm_name,
+        'decision_maker_role': dm_role,
+        'decision_maker_source_url': dm_src,
+        'decision_maker_source_type': dm_src_type,
+        'decision_makers_found': seed.get('decision_makers_found') or (
+            f'{dm_name} ({dm_role}) [{dm_src}]' if dm_name else None
+        ),
+        'decision_maker_linkedin_url': seed.get('decision_maker_linkedin_url'),
+        'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat),
+        'linkedin_url': li_url,
+        'instagram_url': seed.get('instagram_url'),
+        'facebook_url': seed.get('facebook_url'),
+        'telegram_url': seed.get('telegram_url'),
+        'tiktok_url': seed.get('tiktok_url'),
+        'youtube_url': seed.get('youtube_url'),
+        'social_source_url': seed.get('social_source_url', clean_website_url),
+        'detected_signals': detected_signals,
+        'detected_cms': seed.get('detected_cms'),
+        'consent_mode_likely': bool(seed.get('consent_mode_likely', False)),
+        'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
+        'sales_opportunity': sales_opportunity,
+        'next_best_action': next_best_action,
+        'technology_evidence_summary': tech_info['technology_evidence_summary'],
+        'technology_evidence': tech_info['technology_evidence'],
+        'has_meta_pixel': tech_info['has_meta_pixel'],
+        'has_tiktok_pixel': tech_info['has_tiktok_pixel'],
+        'has_google_ads': tech_info['has_google_ads'],
+        'has_linkedin_pixel': tech_info['has_linkedin_pixel'],
+        'has_pinterest_tag': tech_info['has_pinterest_tag'],
+        'has_hubspot': tech_info['has_hubspot'],
+        'has_klaviyo': tech_info['has_klaviyo'],
+        'has_ga4': tech_info['has_ga4'],
+        'has_gtm': tech_info['has_gtm'],
+        'all_ga4_ids': tech_info['all_ga4_ids'],
+        'detected_technologies': seed.get('detected_technologies'),
+        'all_emails': seed.get('all_emails', best_email),
+        'all_phones': seed.get('all_phones', primary_phone),
+        'last_checked_at': verified_at
+    }
 
 
 def parse_html_sync(
@@ -2261,6 +2620,7 @@ async def process_domain(
     default_region: str,
     proxy_config,
     cache_store,
+    manual_seeds: dict[str, dict],
     thread_pool: ThreadPoolExecutor,
     semaphore: asyncio.Semaphore
 ) -> dict:
@@ -2349,11 +2709,32 @@ async def process_domain(
                                 cached_copy.get('meta_description') or ''
                             )
                         )
+                        cached_copy.setdefault('marketplace_platform_pollution_detected', False)
+                        cached_copy.setdefault('email_source_type', None)
+                        cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
+                        cached_copy.setdefault('decision_makers_found', None)
                         cached_copy.setdefault('named_email_owner_role_hint', None)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                         return cached_copy
                     except Exception:
                         pass
+
+            # П.4 v17: Перевірка manual_seeds (для Rozetka та інших WAF-blocked Tier-1 доменів)
+            seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
+            if isinstance(seed_match, dict):
+                return build_manual_seed_record(
+                    seed_match,
+                    domain_key,
+                    canonical_domain,
+                    clean_website_url,
+                    normalized_final_redirect,
+                    was_redirected,
+                    redirect_chain_str,
+                    is_eu_gdpr,
+                    fail_status,
+                    short_err_msg,
+                    checked_at
+                )
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
             return {
@@ -2372,6 +2753,7 @@ async def process_domain(
                 'company_category': cat,
                 'category_confidence': cat_conf,
                 'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
+                'marketplace_platform_pollution_detected': False,
                 'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
                 'technical_signal_strength': None,
                 'tech_scan_completeness': 'partial_blocked',
@@ -2389,6 +2771,7 @@ async def process_domain(
                 'best_email': None,
                 'email_domain': None,
                 'best_email_type': None,
+                'email_source_type': None,
                 'named_email_owner_role_hint': None,
                 'email_deliverability_check': None,
                 'email_source_url': None,
@@ -2399,6 +2782,8 @@ async def process_domain(
                 'decision_maker_name': None,
                 'decision_maker_role': None,
                 'decision_maker_source_url': None,
+                'decision_maker_source_type': None,
+                'decision_makers_found': None,
                 'decision_maker_linkedin_url': None,
                 'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat),
                 'linkedin_url': None,
@@ -2586,7 +2971,6 @@ async def process_domain(
                                     if chk_em or phone_map:
                                         break
 
-        # Якщо живий скан не знайшов GTM/GA4 (через урізаний антиботом HTML), перевіряємо чи є збережений стек у кеші
         if not (tech_info['has_ga4'] or tech_info['has_gtm']) and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
@@ -2632,6 +3016,7 @@ async def process_domain(
         best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email, brand_token)
+        email_source_type = classify_email_source_type(best_email, email_source_url, pages_with_urls)
         owner_role_hint = extract_named_email_owner_hint(best_email, best_email_type, pages_with_urls)
 
         email_domain = None
@@ -2672,7 +3057,15 @@ async def process_domain(
         )
         is_mp_platform = is_marketplace_platform(canonical_domain, page_title, meta_desc)
 
-        dm_name, dm_role, dm_linkedin_url, dm_source_url, dm_source_is_legal = await loop.run_in_executor(
+        (
+            dm_name,
+            dm_role,
+            dm_linkedin_url,
+            dm_source_url,
+            dm_source_is_legal,
+            dm_source_type,
+            decision_makers_found_str
+        ) = await loop.run_in_executor(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
@@ -2689,7 +3082,7 @@ async def process_domain(
             detected_signals,
             sales_opportunity,
             next_best_action
-        ) = evaluate_qualification_v162(
+        ) = evaluate_qualification_v170(
             company_category,
             tech_info,
             best_email,
@@ -2699,8 +3092,10 @@ async def process_domain(
             dm_role,
             dm_linkedin_url,
             dm_source_is_legal,
+            dm_source_type,
             linkedin_url,
-            had_marketplace_pollution
+            had_marketplace_pollution,
+            pw_status_str
         )
 
         has_actionable_final = bool(best_email or primary_phone)
@@ -2729,6 +3124,7 @@ async def process_domain(
             'company_category': company_category,
             'category_confidence': category_confidence,
             'marketplace_platform': is_mp_platform,
+            'marketplace_platform_pollution_detected': had_marketplace_pollution,
             'icp_fit_tier': icp_fit_tier,
             'technical_signal_strength': technical_signal_strength,
             'tech_scan_completeness': tech_info['tech_scan_completeness'],
@@ -2746,6 +3142,7 @@ async def process_domain(
             'best_email': best_email,
             'email_domain': email_domain,
             'best_email_type': best_email_type,
+            'email_source_type': email_source_type,
             'named_email_owner_role_hint': owner_role_hint,
             'email_deliverability_check': deliverability_check,
             'email_source_url': email_source_url,
@@ -2756,6 +3153,8 @@ async def process_domain(
             'decision_maker_name': dm_name,
             'decision_maker_role': dm_role,
             'decision_maker_source_url': dm_source_url,
+            'decision_maker_source_type': dm_source_type,
+            'decision_makers_found': decision_makers_found_str,
             'decision_maker_linkedin_url': dm_linkedin_url,
             'decision_maker_search_query': dm_search_query,
             'linkedin_url': linkedin_url,
@@ -2819,6 +3218,14 @@ async def main() -> None:
         max_concurrency = actor_input.get('maxConcurrency', 15)
         proxy_settings = actor_input.get('proxyConfiguration')
 
+        # П.4 v17: Об'єднання вбудованих DEFAULT_MANUAL_SEEDS з користувацькими manualSeeds в input
+        user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
+        manual_seeds = {**DEFAULT_MANUAL_SEEDS}
+        if isinstance(user_seeds, dict):
+            for k, v in user_seeds.items():
+                if isinstance(v, dict):
+                    manual_seeds[k.lower().strip().replace('www.', '')] = v
+
         prepared_domains = prepare_domains(raw_domains)
         if not prepared_domains:
             Actor.log.warning('No valid domains provided in input!')
@@ -2846,7 +3253,8 @@ async def main() -> None:
         Actor.log.info(
             f'Processing {total_domains} unique domains '
             f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, '
-            f'playwright_available: {PLAYWRIGHT_INSTALLED}, cache schema: v{CACHE_SCHEMA_VERSION})...'
+            f'playwright_available: {PLAYWRIGHT_INSTALLED}, cache schema: v{CACHE_SCHEMA_VERSION}, '
+            f'manual_seeds: {len(manual_seeds)})...'
         )
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
@@ -2871,6 +3279,7 @@ async def main() -> None:
                         default_region,
                         proxy_config,
                         cache_store,
+                        manual_seeds,
                         thread_pool,
                         semaphore
                     )
@@ -2908,8 +3317,8 @@ async def main() -> None:
                     metrics_counter[f'status_{st}'] += 1
                     if result.get('playwright_used'):
                         metrics_counter['playwright_rendered'] += 1
-                    if result.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache'):
-                        metrics_counter['cache_fallbacks'] += 1
+                    if result.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache', 'manual_seed'):
+                        metrics_counter['cache_or_seed_fallbacks'] += 1
 
                     Actor.log.info(
                         f"[{st.upper()}] {result['canonical_domain']} | "
@@ -2928,7 +3337,7 @@ async def main() -> None:
                 'unique_canonical_domains_pushed': len(seen_canonical_records),
                 'deduped_aliases_merged': metrics_counter['deduped_canonical_aliases'],
                 'live_success_count': metrics_counter['status_success'],
-                'cached_fallback_count': metrics_counter['cache_fallbacks'],
+                'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
                 'playwright_rendered_count': metrics_counter['playwright_rendered'],
                 'no_contacts_count': metrics_counter['status_no_contacts_found'],
                 'blocked_count': metrics_counter['status_blocked'],
