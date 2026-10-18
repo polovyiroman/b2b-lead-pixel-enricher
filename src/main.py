@@ -23,7 +23,7 @@ CACHE_SCHEMA_VERSION = 16
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
-PW_SEMAPHORE = asyncio.Semaphore(2)
+PW_SEMAPHORE = asyncio.Semaphore(3)
 _PW_INIT_LOCK = asyncio.Lock()
 _PW_INSTANCE = None
 _PW_BROWSER = None
@@ -143,7 +143,8 @@ UI_ACTION_WORDS_BLACKLIST = {
     'читати', 'детальніше', 'дивитися', 'дивитись', 'переглянути', 'написати',
     'зв’язатися', 'звязатися', 'автор', 'спікер', 'експерт', 'блог', 'стаття',
     'команда', 'кейс', 'відгук', 'клієнт', 'партнер', 'модератор', 'ведучий',
-    'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article', 'client'
+    'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article',
+    'client', 'building', 'link', 'seo', 'ppc', 'smm', 'growth', 'team', 'about'
 }
 
 ROLE_TOKEN_BLACKLIST = {
@@ -157,7 +158,6 @@ ROLE_TOKEN_BLACKLIST = {
 }
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 
-# П.1 v17: Словник ролей/відділів для перевірки контексту named_email_owner_role_hint
 ROLE_WORDS_IN_CONTEXT = (
     'manager', 'менеджер', 'sales', 'sales manager', 'director', 'директор',
     'head', 'керівник', 'specialist', 'спеціаліст', 'lead', 'лід', 'recruiter',
@@ -207,7 +207,8 @@ STOP_NAME_WORDS = {
     'LinkedIn', 'Profile', 'View', 'Український', 'Перший', 'Жіночий', 'Official',
     'Наші', 'Ваші', 'Нова', 'Повна', 'Більше', 'Меню', 'Головна', 'Сторінка',
     'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права',
-    'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт'
+    'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт',
+    'Building', 'Link', ' کیس', 'Кейс', 'Відгук', 'Стаття'
 }
 
 UA_TO_LATIN = {
@@ -406,12 +407,15 @@ KNOWN_MARKETPLACE_DOMAINS = {
     'prom.ua', 'shafa.ua', 'liki24.com', 'makeup.com.ua', 'eva.ua'
 }
 
+KNOWN_DOMAIN_REDIRECT_ALIASES = {
+    'modnakasta.ua': 'kasta.ua'
+}
+
 MARKETPLACE_TEXT_MARKERS = (
     'більше 500 брендів', 'понад 9 млн товарів', 'мільйони товарів', 'маркетплейс',
     'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів'
 )
 
-# П.4 v17: Вбудовані верифіковані еталонні профілі (manual_seeds) для Tier-1 маркетплейсів під жорстким WAF
 DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
     'rozetka.com.ua': {
         'page_title': 'Інтернет-магазин ROZETKA™: офіційний сайт найпопулярнішого онлайн-гіпермаркету в Україні',
@@ -502,7 +506,6 @@ def classify_email_source_type(
     email_source_url: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> str | None:
-    """П.5 v17: Визначає, де саме знайдено email (site_footer, contact_page, legal_or_terms_page, page_body)."""
     if not best_email or not email_source_url:
         return None
     em_low = best_email.lower()
@@ -530,7 +533,6 @@ def classify_email_source_type(
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
-    """П.7 v17: Класифікує тип сторінки, з якої витягнуто Decision Maker."""
     if not dm_source_url:
         return None
     path_low = urlparse(dm_source_url).path.lower()
@@ -618,9 +620,13 @@ def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical
     return found
 
 
-def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
-    seen = set()
-    prepared = []
+def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
+    """
+    Нормалізує та попередньо дедуплікує відомі аліаси (напр. modnakasta.ua + kasta.ua),
+    щоб не запускати подвійне мережеве сканування одного й того ж сайту.
+    Повертає список кортежів: (primary_domain_key, root_url, aliases_list).
+    """
+    grouped: dict[str, dict] = {}
     for item in raw_domains:
         if not item or not isinstance(item, str):
             continue
@@ -634,11 +640,25 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str]]:
         if not netloc or '.' not in netloc:
             continue
         domain_key = netloc.replace('www.', '')
-        if domain_key not in seen:
-            seen.add(domain_key)
-            root_url = f'{parsed.scheme}://{netloc}'
-            prepared.append((domain_key, root_url))
-    return prepared
+        target_canon = KNOWN_DOMAIN_REDIRECT_ALIASES.get(domain_key, domain_key)
+
+        if target_canon not in grouped:
+            grouped[target_canon] = {
+                'first_input': domain_key,
+                'root_url': f'{parsed.scheme}://{target_canon}',
+                'aliases': [domain_key]
+            }
+        else:
+            if domain_key not in grouped[target_canon]['aliases']:
+                grouped[target_canon]['aliases'].append(domain_key)
+
+    result = []
+    for target_canon, info in grouped.items():
+        aliases = info['aliases']
+        if target_canon not in aliases:
+            aliases.append(target_canon)
+        result.append((info['first_input'], info['root_url'], aliases))
+    return result
 
 
 def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
@@ -1003,10 +1023,6 @@ def extract_named_email_owner_hint(
     best_email_type: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> str | None:
-    """
-    П.1 v17: Повертає реальний контекст посади/відділу навколо іменного email (вирізаючи сам email),
-    або чесний фолбек, якщо посада поруч не вказана.
-    """
     if not best_email or best_email_type != 'personal_or_named_inbox':
         return None
     em_low = best_email.lower()
@@ -1487,6 +1503,11 @@ def strip_role_tokens_from_name(candidate: str) -> str:
         or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
     ):
         words.pop(-1)
+    # Якщо ім'я містить кирилицю, відрізаємо випадкові латинські слова спереду (напр. "Building Михайло Щербачов")
+    has_cyrillic = any(re.search(r'[а-яіїєґА-ЯІЇЄҐ]', w) for w in words)
+    if has_cyrillic:
+        while words and re.fullmatch(r'[A-Za-z\'-]+', words[0]):
+            words.pop(0)
     return ' '.join(words)
 
 
@@ -1534,11 +1555,6 @@ def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: 
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None]:
-    """
-    П.3 & П.7 v17: Збирає всіх унікальних Decision Makers на сайті (для стабільності між запусками),
-    ранжує їх за релевантністю сторінки/ролі та повертає:
-    (primary_name, primary_role, primary_li, primary_source_url, is_legal, dm_source_type, decision_makers_found_str)
-    """
     candidate_li_urls = []
     found_dms: list[dict] = []
     seen_names: set[str] = set()
@@ -1552,7 +1568,6 @@ def extract_decision_maker_deep(
         src_type = classify_dm_source_type(clean_src)
         matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(norm_name, u)), None)
 
-        # Пріоритезація: team_page / about_page найвищі, CMO/Head of Marketing/CEO вище за загальні ролі
         type_bonus = {
             'team_page': 30,
             'about_page': 25,
@@ -1889,7 +1904,6 @@ def evaluate_qualification_v170(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # П.2 v17: Якщо сигналів/контактів немає через те, що Playwright заблоковано WAF (як intertop.ua), не кажемо "Unqualified / Skip"
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -2009,6 +2023,7 @@ def build_manual_seed_record(
     seed: dict,
     domain_key: str,
     canonical_domain: str,
+    aliases_str: str,
     clean_website_url: str,
     normalized_final_redirect: str,
     was_redirected: bool,
@@ -2018,7 +2033,6 @@ def build_manual_seed_record(
     short_err_msg: str,
     checked_at: str
 ) -> dict:
-    """П.4 v17: Формує повний запис із manual_seeds, коли сайт заблокований WAF і не має живого кешу."""
     verified_at = seed.get('verified_at', checked_at)
     age_days = compute_snapshot_age_days(verified_at) or 0
     cat = seed.get('company_category', 'E-commerce / Retail Brand')
@@ -2082,7 +2096,7 @@ def build_manual_seed_record(
     return {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
-        'aliases': domain_key if not was_redirected else f'{domain_key}; {canonical_domain}',
+        'aliases': aliases_str,
         'input_was_redirected': was_redirected,
         'redirect_chain': redirect_chain_str,
         'website_url': clean_website_url,
@@ -2352,74 +2366,78 @@ async def close_shared_playwright_browser():
             _PW_INSTANCE = None
 
 
+async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
+    browser = await get_shared_playwright_browser()
+    if browser is None:
+        return '', url, 'disabled', False
+
+    ctx_kwargs = {
+        'locale': 'uk-UA',
+        'ignore_https_errors': True,
+        'user_agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        )
+    }
+    if proxy_url:
+        ctx_kwargs['proxy'] = {'server': proxy_url}
+
+    context = await browser.new_context(**ctx_kwargs)
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    try:
+        page = await context.new_page()
+        resp = await page.goto(url, wait_until='domcontentloaded', timeout=12000)
+        if resp and resp.status >= 400:
+            return '', url, f'launched_blocked (HTTP {resp.status})', True
+
+        await page.wait_for_timeout(900)
+
+        consent_selectors = [
+            '#shopify-pc__banner__btn-accept',
+            '#onetrust-accept-btn-handler',
+            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+            '[data-testid="cookie-accept"]',
+            'button:has-text("Accept all")',
+            'button:has-text("Accept")',
+            'button:has-text("Прийняти")'
+        ]
+        for sel in consent_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=200):
+                    await loc.click(timeout=500)
+                    await page.wait_for_timeout(800)
+                    break
+            except Exception:
+                continue
+
+        try:
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        rendered_html = await page.content()
+        final_u = clean_url_port(page.url) or url
+        if not rendered_html or len(rendered_html) <= 500:
+            return '', final_u, 'launched_empty', True
+        return rendered_html, final_u, 'rendered', False
+    finally:
+        await context.close()
+
+
 async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
+    """Жорстко обмежений за часом (20с) виклик Playwright, щоб жоден SPA не вішав увесь ран."""
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled', False
 
     async with PW_SEMAPHORE:
         try:
-            browser = await get_shared_playwright_browser()
-            if browser is None:
-                return '', url, 'disabled', False
-
-            ctx_kwargs = {
-                'locale': 'uk-UA',
-                'ignore_https_errors': True,
-                'user_agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-                )
-            }
-            if proxy_url:
-                ctx_kwargs['proxy'] = {'server': proxy_url}
-
-            context = await browser.new_context(**ctx_kwargs)
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            try:
-                page = await context.new_page()
-                resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
-                if resp and resp.status >= 400:
-                    return '', url, f'launched_blocked (HTTP {resp.status})', True
-
-                await page.wait_for_timeout(1200)
-
-                consent_selectors = [
-                    '#shopify-pc__banner__btn-accept',
-                    '[id^="shopify-pc__banner__btn-accept"]',
-                    '#onetrust-accept-btn-handler',
-                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-                    '[data-testid="cookie-accept"]',
-                    'button:has-text("Accept all")',
-                    'button:has-text("Accept")',
-                    'button:has-text("Прийняти")',
-                    'button:has-text("Погоджуюсь")',
-                    '[aria-label="Accept cookies"]'
-                ]
-                for sel in consent_selectors:
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=300):
-                            await loc.click(timeout=800)
-                            await page.wait_for_timeout(1200)
-                            break
-                    except Exception:
-                        continue
-
-                try:
-                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                    await page.wait_for_timeout(600)
-                except Exception:
-                    pass
-
-                rendered_html = await page.content()
-                final_u = clean_url_port(page.url) or url
-                if not rendered_html or len(rendered_html) <= 500:
-                    return '', final_u, 'launched_empty', True
-                return rendered_html, final_u, 'rendered', False
-            finally:
-                await context.close()
+            return await asyncio.wait_for(_fetch_pw_inner(url, proxy_url), timeout=20.0)
+        except asyncio.TimeoutError:
+            return '', url, 'launched_blocked (Page.goto: Timeout 20000ms exceeded.)', True
         except Exception as e:
             err_short = str(e).splitlines()[0][:60] if str(e) else 'error'
             return '', url, f'launched_blocked ({err_short})', True
@@ -2429,7 +2447,7 @@ async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[
     disallowed: list[str] = []
     crawl_delay = 0.25
     try:
-        resp = await client.get(f'{base_root}/robots.txt', impersonate='chrome', timeout=3.5)
+        resp = await client.get(f'{base_root}/robots.txt', impersonate='chrome', timeout=3.0)
         if resp.status_code == 200 and resp.text:
             active_for_all = False
             for raw_line in resp.text.splitlines():
@@ -2445,7 +2463,7 @@ async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[
                         disallowed.append(val)
                 elif active_for_all and k_low == 'crawl-delay':
                     try:
-                        crawl_delay = min(max(float(val), 0.25), 2.0)
+                        crawl_delay = min(max(float(val), 0.25), 1.5)
                     except ValueError:
                         pass
     except Exception:
@@ -2464,7 +2482,7 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
     found_urls = []
     sitemap_url = f'{base_root}/sitemap.xml'
     try:
-        resp = await client.get(sitemap_url, impersonate='chrome', timeout=5.0)
+        resp = await client.get(sitemap_url, impersonate='chrome', timeout=4.5)
         if resp.status_code == 200 and resp.text:
             locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', resp.text, re.I)
             for url in locs:
@@ -2494,11 +2512,11 @@ async def fetch_html_safely(
     client: AsyncSession,
     url: str,
     proxy_config=None,
-    timeout: float = 15.0,
-    retries: int = 5
+    timeout: float = 12.0,
+    retries: int = 4
 ) -> tuple[int, str, str, str]:
     last_error = ''
-    impersonations = ['chrome', 'safari', 'chrome110', 'edge99', 'chrome']
+    impersonations = ['chrome', 'safari', 'chrome110', 'edge99']
     current_target_url = url
 
     for attempt in range(retries):
@@ -2536,7 +2554,7 @@ async def fetch_html_safely(
                     continue
 
                 if status in (403, 429, 502, 503, 504) and attempt < retries - 1:
-                    await asyncio.sleep(1.5 * (1.6 ** attempt))
+                    await asyncio.sleep(1.2 * (1.5 ** attempt))
                     continue
 
                 if status >= 400:
@@ -2566,14 +2584,14 @@ async def fetch_html_safely(
                     html = raw_bytes.decode('utf-8', errors='replace')
 
                 if ('<title>' not in html.lower() or len(html) < 800) and attempt < retries - 1:
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(1.0)
                     continue
 
                 return status, html, final_url, ''
         except Exception as e:
             last_error = str(e)
             if attempt < retries - 1:
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.0)
 
     return 0, '', current_target_url, last_error or 'Connection failed'
 
@@ -2593,7 +2611,7 @@ async def fetch_gtm_scripts(
     for gtm_id in gtm_ids[:5]:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gtm_id}'
         try:
-            resp = await client.get(gtm_url, impersonate='chrome', timeout=10.0)
+            resp = await client.get(gtm_url, impersonate='chrome', timeout=8.0)
             if resp.status_code == 200 and resp.text:
                 gtm_contents.append(resp.text)
         except Exception:
@@ -2615,6 +2633,7 @@ async def process_domain(
     client: AsyncSession,
     domain_key: str,
     root_url: str,
+    initial_aliases: list[str],
     scan_contacts: bool,
     unpack_gtm: bool,
     default_region: str,
@@ -2647,8 +2666,13 @@ async def process_domain(
         evergreen_kv_key = f'evergreen_{canonical_kv_key}'
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
 
-        was_redirected = (domain_key != canonical_domain)
-        redirect_chain_str = f'{domain_key} → {canonical_domain}' if was_redirected else None
+        all_alias_items = list(initial_aliases)
+        if canonical_domain not in all_alias_items:
+            all_alias_items.append(canonical_domain)
+        aliases_str = '; '.join(all_alias_items)
+
+        was_redirected = (domain_key != canonical_domain) or (len(all_alias_items) > 1)
+        redirect_chain_str = f'{all_alias_items[0]} → {canonical_domain}' if was_redirected else None
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
@@ -2677,7 +2701,7 @@ async def process_domain(
 
                         cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
                         cached_copy['input_domain'] = domain_key
-                        cached_copy['aliases'] = domain_key
+                        cached_copy['aliases'] = aliases_str
                         cached_copy['input_was_redirected'] = was_redirected
                         cached_copy['redirect_chain'] = redirect_chain_str
                         cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
@@ -2719,13 +2743,13 @@ async def process_domain(
                     except Exception:
                         pass
 
-            # П.4 v17: Перевірка manual_seeds (для Rozetka та інших WAF-blocked Tier-1 доменів)
             seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
             if isinstance(seed_match, dict):
                 return build_manual_seed_record(
                     seed_match,
                     domain_key,
                     canonical_domain,
+                    aliases_str,
                     clean_website_url,
                     normalized_final_redirect,
                     was_redirected,
@@ -2740,7 +2764,7 @@ async def process_domain(
             return {
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
-                'aliases': domain_key,
+                'aliases': aliases_str,
                 'input_was_redirected': was_redirected,
                 'redirect_chain': redirect_chain_str,
                 'website_url': clean_website_url,
@@ -2863,10 +2887,10 @@ async def process_domain(
                 u for u in contact_links
                 if is_allowed_by_robots(u, disallowed_paths) and not DM_SOURCE_BLACKLIST.search(urlparse(u).path)
             ]
-            for sub_url in allowed_sub_links[:5]:
+            for sub_url in allowed_sub_links[:4]:
                 await asyncio.sleep(crawl_delay)
                 sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
-                    client, sub_url, proxy_config=proxy_config, timeout=10.0, retries=2
+                    client, sub_url, proxy_config=proxy_config, timeout=8.0, retries=2
                 )
                 if 200 <= sub_status < 400 and sub_html:
                     sub_title, sub_desc, sub_text, sub_e, sub_p, sub_s, _ = await loop.run_in_executor(
@@ -2945,7 +2969,8 @@ async def process_domain(
                         if u not in combined_pw_subs and u != normalized_final_redirect:
                             combined_pw_subs.append(u)
 
-                    for pw_sub_u in combined_pw_subs[:3]:
+                    # Перевіряємо максимум 2 підсторінки у PW із суворим контролем часу
+                    for pw_sub_u in combined_pw_subs[:2]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                             pw_attempts_count += 1
                             pw_attempted_paths.append(pw_sub_u)
@@ -2971,11 +2996,12 @@ async def process_domain(
                                     if chk_em or phone_map:
                                         break
 
-        if not (tech_info['has_ga4'] or tech_info['has_gtm']) and cache_store is not None:
+        # Якщо під час живого скану не розпакувався GA4 (напр. GTM скрипт таймаутнув), підтягуємо підтверджений стек із кешу
+        if not tech_info['has_ga4'] and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and (c_rec.get('has_gtm') or c_rec.get('has_ga4')):
+                    if isinstance(c_rec, dict) and c_rec.get('has_ga4'):
                         raw_t = c_rec.get('detected_technologies') or ''
                         tech_info = {
                             'has_meta_pixel': bool(c_rec.get('has_meta_pixel')),
@@ -2985,8 +3011,8 @@ async def process_domain(
                             'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag')),
                             'has_hubspot': bool(c_rec.get('has_hubspot')),
                             'has_klaviyo': bool(c_rec.get('has_klaviyo')),
-                            'has_ga4': bool(c_rec.get('has_ga4')),
-                            'has_gtm': bool(c_rec.get('has_gtm')),
+                            'has_ga4': True,
+                            'has_gtm': bool(c_rec.get('has_gtm') or tech_info['has_gtm']),
                             'all_ga4_ids': c_rec.get('all_ga4_ids'),
                             'ga4_detection_confidence': c_rec.get('ga4_detection_confidence'),
                             'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()],
@@ -3111,7 +3137,7 @@ async def process_domain(
         result_record = {
             'input_domain': domain_key,
             'canonical_domain': canonical_domain,
-            'aliases': domain_key,
+            'aliases': aliases_str,
             'input_was_redirected': was_redirected,
             'redirect_chain': redirect_chain_str,
             'website_url': clean_website_url,
@@ -3218,7 +3244,6 @@ async def main() -> None:
         max_concurrency = actor_input.get('maxConcurrency', 15)
         proxy_settings = actor_input.get('proxyConfiguration')
 
-        # П.4 v17: Об'єднання вбудованих DEFAULT_MANUAL_SEEDS з користувацькими manualSeeds в input
         user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
         manual_seeds = {**DEFAULT_MANUAL_SEEDS}
         if isinstance(user_seeds, dict):
@@ -3251,7 +3276,7 @@ async def main() -> None:
 
         total_domains = len(prepared_domains)
         Actor.log.info(
-            f'Processing {total_domains} unique domains '
+            f'Processing {total_domains} pre-deduped canonical targets '
             f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, '
             f'playwright_available: {PLAYWRIGHT_INSTALLED}, cache schema: v{CACHE_SCHEMA_VERSION}, '
             f'manual_seeds: {len(manual_seeds)})...'
@@ -3259,7 +3284,7 @@ async def main() -> None:
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
 
-        seen_canonical_records: dict[str, dict] = {}
+        pushed_canonical_set: set[str] = set()
         metrics_counter = Counter()
 
         try:
@@ -3274,6 +3299,7 @@ async def main() -> None:
                         client,
                         domain_key,
                         root_url,
+                        initial_aliases,
                         scan_contacts,
                         unpack_gtm,
                         default_region,
@@ -3283,7 +3309,7 @@ async def main() -> None:
                         thread_pool,
                         semaphore
                     )
-                    for domain_key, root_url in prepared_domains
+                    for domain_key, root_url, initial_aliases in prepared_domains
                 ]
 
                 for coro in asyncio.as_completed(tasks):
@@ -3291,27 +3317,15 @@ async def main() -> None:
                     cd = result.get('canonical_domain') or result.get('input_domain')
                     inp_dom = result.get('input_domain', '')
 
-                    if cd in seen_canonical_records:
-                        existing = seen_canonical_records[cd]
-                        existing_aliases = [a.strip() for a in (existing.get('aliases') or '').split(';') if a.strip()]
-                        if inp_dom and inp_dom not in existing_aliases:
-                            existing_aliases.append(inp_dom)
-                        if cd not in existing_aliases:
-                            existing_aliases.append(cd)
-                        existing['aliases'] = '; '.join(existing_aliases)
-                        if inp_dom != cd:
-                            existing['input_was_redirected'] = True
-                            existing['redirect_chain'] = f'{inp_dom} → {cd}'
+                    if cd in pushed_canonical_set:
                         metrics_counter['deduped_canonical_aliases'] += 1
-                        Actor.log.info(f'[DEDUPED] {inp_dom} merged into canonical {cd} (aliases: {existing["aliases"]})')
+                        Actor.log.info(f'[DEDUPED LATE REDIRECT] {inp_dom} skipped because {cd} already pushed.')
                         continue
 
-                    if inp_dom and cd and inp_dom != cd:
-                        result['aliases'] = f'{inp_dom}; {cd}'
-                    else:
-                        result['aliases'] = inp_dom or cd
+                    pushed_canonical_set.add(cd)
 
-                    seen_canonical_records[cd] = result
+                    # МИТТЄВИЙ ПУШ У DATASET (щоб жоден запис не губився при таймауті контейнера!)
+                    await Actor.push_data(result)
 
                     st = result['status']
                     metrics_counter[f'status_{st}'] += 1
@@ -3321,21 +3335,16 @@ async def main() -> None:
                         metrics_counter['cache_or_seed_fallbacks'] += 1
 
                     Actor.log.info(
-                        f"[{st.upper()}] {result['canonical_domain']} | "
+                        f"[{st.upper()}] {result['canonical_domain']} (aliases={result['aliases']}) | "
                         f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
                     )
 
-                deduped_results = list(seen_canonical_records.values())
-                for i in range(0, len(deduped_results), 5):
-                    await Actor.push_data(deduped_results[i:i + 5])
-
             run_telemetry = {
-                'total_input_domains': total_domains,
-                'unique_canonical_domains_pushed': len(seen_canonical_records),
-                'deduped_aliases_merged': metrics_counter['deduped_canonical_aliases'],
+                'total_targets': total_domains,
+                'unique_canonical_domains_pushed': len(pushed_canonical_set),
                 'live_success_count': metrics_counter['status_success'],
                 'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
                 'playwright_rendered_count': metrics_counter['playwright_rendered'],
