@@ -81,17 +81,62 @@ AD_PIXEL_LABELS = {
     'Pinterest Tag',
 }
 
+COMPLIANCE_DEFAULT_NOTE = (
+    'Enriched for legitimate B2B interest; public site data; deletion on request via support'
+)
+
+
+def _derive_gdpr_jurisdiction(canonical_domain: str) -> str:
+    dom_low = (canonical_domain or '').lower()
+    if dom_low.endswith(('.uk', '.co.uk')):
+        return 'UK_GDPR'
+    if dom_low.endswith('.ch'):
+        return 'CH_FADP'
+    if dom_low.endswith(EU_GDPR_TLDS):
+        return 'EU_EEA_GDPR'
+    if dom_low.endswith('.ua'):
+        return 'UA_PDP'
+    return 'NON_EU_GLOBAL'
+
+
+def _derive_pii_fields(
+    best_email: str | None,
+    best_email_type: str | None,
+    dm_name: str | None,
+    primary_phone: str | None,
+    dm_linkedin_url: str | None
+) -> str:
+    fields = []
+    if dm_name:
+        fields.append('decision_maker_name')
+    if dm_linkedin_url:
+        fields.append('decision_maker_linkedin_url')
+    if best_email and best_email_type == 'personal_or_named_inbox':
+        fields.append('best_email (named_staff)')
+    if primary_phone:
+        fields.append('primary_phone (public_b2b)')
+    return '; '.join(fields) if fields else 'none (corporate_role_contacts_only)'
+
+
+def _derive_human_contact_tier(contact_quality_tier: str | None) -> str:
+    if not contact_quality_tier:
+        return 'No Contact'
+    t_str = contact_quality_tier
+    if 'Tier A' in t_str:
+        return 'Hot'
+    if 'Tier B' in t_str:
+        return 'Warm'
+    if 'Tier C' in t_str:
+        return 'Cold'
+    if 'Tier D' in t_str:
+        return 'Do Not Contact'
+    return 'No Contact'
+
 
 def compute_google_ads_confidence(
     has_ads: bool | None,
     scan_completeness: str
 ) -> str:
-    """
-    Bug 2 (CRITICAL) Fix: Однозначна семантика впевненості для Google Ads:
-    - 'verified_present': тег Google Ads знайдено (has_google_ads is True)
-    - 'verified_absent': повний скан (scan_completeness == 'full'), тег відсутній (has_google_ads is False)
-    - 'unknown': скан неповний/кешований (partial_*) або значення None
-    """
     if has_ads is True:
         return 'verified_present'
     if has_ads is None:
@@ -109,8 +154,8 @@ def detect_country_hint(
     html_sample: str = ''
 ) -> str:
     """
-    Bug 5 Fix: Визначає локаль/країну бренду за контентом, телефоном та lang-атрибутом,
-    щоб бренди на .com (напр. cher17.com) отримували локалізовані LinkedIn X-Ray запити.
+    Bug 7 Fix: Строгий порядок пріоритетів (TLD -> телефон -> специфічний алфавіт -> ТІЛЬКИ <html lang="XX">).
+    Ігнорує альтернативні <link hreflang="de">, щоб macpaw.com та grammarly.com не отримували DE-локаль.
     """
     dom_low = canonical_domain.lower()
     if dom_low.endswith('.ua'):
@@ -127,6 +172,10 @@ def detect_country_hint(
         return 'IT'
     if dom_low.endswith(('.nl', '.be')):
         return 'NL'
+    if dom_low.endswith('.pt'):
+        return 'PT'
+    if dom_low.endswith(('.se', '.no', '.dk', '.fi')):
+        return 'SE'
 
     phone_str = primary_phone or ''
     if phone_str.startswith('+380'):
@@ -137,6 +186,12 @@ def detect_country_hint(
         return 'PL'
     if phone_str.startswith('+33'):
         return 'FR'
+    if phone_str.startswith('+34'):
+        return 'ES'
+    if phone_str.startswith('+39'):
+        return 'IT'
+    if phone_str.startswith(('+31', '+32')):
+        return 'NL'
 
     text_combined = f'{page_title} {meta_desc}'
     if re.search(r'[іїєґІЇЄҐ]', text_combined):
@@ -144,26 +199,33 @@ def detect_country_hint(
     if re.search(r'[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', text_combined):
         return 'PL'
 
-    html_head = html_sample[:3000].lower()
-    if 'lang="uk' in html_head or "lang='uk" in html_head:
-        return 'UA'
-    if 'lang="de' in html_head or "lang='de" in html_head:
-        return 'DE'
-    if 'lang="pl' in html_head or "lang='pl" in html_head:
-        return 'PL'
-    if 'lang="fr' in html_head or "lang='fr" in html_head:
-        return 'FR'
+    html_head = html_sample[:2000].lower()
+    lang_match = re.search(r'<html[^>]+lang=["\']([a-z]{2})', html_head)
+    if lang_match:
+        lang = lang_match.group(1).upper()
+        if lang in ('UK', 'UA'):
+            return 'UA'
+        if lang == 'DE':
+            return 'DE'
+        if lang == 'PL':
+            return 'PL'
+        if lang == 'FR':
+            return 'FR'
+        if lang == 'ES':
+            return 'ES'
+        if lang == 'IT':
+            return 'IT'
+        if lang == 'NL':
+            return 'NL'
+        if lang == 'PT':
+            return 'PT'
+        if lang in ('SV', 'NO', 'NB', 'NN', 'DA', 'FI'):
+            return 'SE'
 
     return ''
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
-    """
-    Синхронізує всі булеві прапорці has_* із detected_technologies_list.
-    Bug 4 Fix: Статус 'partial_gtm' виставляється лише тоді, коли GTM мав одиночний макрос GA4
-    І не виявлено жодного рекламного пікселя (як на answear.ua). Якщо рекламні пікселі
-    знайдено (macpaw.com, cher17.com), скан вважається 'full'.
-    """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
@@ -199,9 +261,6 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
 
 
 def normalize_cached_record_booleans(cached_copy: dict) -> None:
-    """
-    Синхронізує булеві прапорці has_*, tech_scan_completeness та has_google_ads_confidence у кеш-фолбеку.
-    """
     raw_tech_str = cached_copy.get('detected_technologies') or ''
     techs_list = [x.strip() for x in raw_tech_str.split(';') if x.strip()]
     techs_set = set(techs_list)
@@ -298,6 +357,7 @@ async def process_domain(
         input_kv_key = sanitize_kv_key(domain_key)
         evergreen_kv_key = f'evergreen_{canonical_kv_key}'
         is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
+        gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain)
 
         all_alias_items = list(initial_aliases)
         if canonical_domain not in all_alias_items:
@@ -388,7 +448,6 @@ async def process_domain(
                         normalize_cached_record_booleans(cached_copy)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
 
-                        # Bug 1 (CRITICAL) Fix: Гарантоване обчислення all_emails_classification та all_emails_deliverability для кешу
                         _cached_all_emails = (
                             cached_copy.get('all_emails') or cached_copy.get('best_email') or ''
                         ).split(';')
@@ -413,15 +472,34 @@ async def process_domain(
                         has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
                         cached_copy['tech_rescan_needed'] = not has_cached_tech
 
-                        # Bug 6 Fix: Якщо для кешу потрібен tech_rescan_needed, змінюємо completeness на 'partial_cached'
                         if cached_copy['tech_rescan_needed'] and cached_copy.get('tech_scan_completeness') == 'full':
                             cached_copy['tech_scan_completeness'] = 'partial_cached'
 
-                        # Bug 2 Fix: Перераховуємо has_google_ads_confidence після фіналізації tech_scan_completeness
                         cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
                             cached_copy.get('has_google_ads'),
                             cached_copy.get('tech_scan_completeness', 'full')
                         )
+
+                        # Синхронізація Human Tier та 6 GDPR полів для кешу
+                        cached_copy['contact_quality_tier_human'] = _derive_human_contact_tier(
+                            cached_copy.get('contact_quality_tier')
+                        )
+                        cached_copy['gdpr_jurisdiction'] = gdpr_jurisdiction
+                        cached_copy['legal_basis_for_processing'] = (
+                            'legitimate_interest_b2b'
+                            if (cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone'))
+                            else None
+                        )
+                        cached_copy['data_subject_can_request_deletion'] = True
+                        cached_copy['data_retention_policy_days'] = 365
+                        cached_copy['personal_data_fields_in_record'] = _derive_pii_fields(
+                            cached_copy.get('best_email'),
+                            cached_copy.get('best_email_type'),
+                            cached_copy.get('decision_maker_name'),
+                            cached_copy.get('primary_phone'),
+                            cached_copy.get('decision_maker_linkedin_url')
+                        )
+                        cached_copy['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
 
                         if not has_cached_tech and (cached_copy.get('best_email') or cached_copy.get('primary_phone')):
                             c_contact = cached_copy.get('best_email') or cached_copy.get('primary_phone')
@@ -454,6 +532,25 @@ async def process_domain(
                     seeded_rec.get('has_google_ads'),
                     seeded_rec.get('tech_scan_completeness', 'full')
                 )
+                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
+                    seeded_rec.get('contact_quality_tier')
+                )
+                seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
+                seeded_rec['legal_basis_for_processing'] = (
+                    'legitimate_interest_b2b'
+                    if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
+                    else None
+                )
+                seeded_rec['data_subject_can_request_deletion'] = True
+                seeded_rec['data_retention_policy_days'] = 365
+                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
+                    seeded_rec.get('best_email'),
+                    seeded_rec.get('best_email_type'),
+                    seeded_rec.get('decision_maker_name'),
+                    seeded_rec.get('primary_phone'),
+                    seeded_rec.get('decision_maker_linkedin_url')
+                )
+                seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
                 return seeded_rec
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
@@ -480,9 +577,16 @@ async def process_domain(
                 'tech_scan_completeness': 'partial_blocked',
                 'tech_rescan_needed': True,
                 'contact_quality_tier': 'Tier F (Site Blocked)',
+                'contact_quality_tier_human': 'No Contact',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
+                'gdpr_jurisdiction': gdpr_jurisdiction,
+                'legal_basis_for_processing': None,
+                'data_subject_can_request_deletion': True,
+                'data_retention_policy_days': 365,
+                'personal_data_fields_in_record': 'none (site_blocked)',
+                'compliance_note': COMPLIANCE_DEFAULT_NOTE,
                 'playwright_available': is_playwright_available(),
                 'playwright_used': False,
                 'playwright_status': pw_status_str if pw_attempts_count > 0 else 'not_attempted_site_blocked',
@@ -823,7 +927,6 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
-        # Bug 5 Fix: Передаємо визначений country_hint у build_linkedin_xray_query
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
@@ -854,7 +957,6 @@ async def process_domain(
             pw_status_str
         )
 
-        # Bug 3 (HIGH) Fix: Якщо для best_email сталася помилка DNS/DoH, явно виводимо попередження у data_confidence_warning
         if best_email and deliverability_check and any(
             err_tok in deliverability_check.lower()
             for err_tok in ('dns_error', 'lookup_failed', 'dns_timeout', 'invalid_no_mx')
@@ -876,6 +978,11 @@ async def process_domain(
         )
 
         all_phones_list = [p for p, _ in sorted_phones_with_src]
+        human_tier = _derive_human_contact_tier(contact_quality_tier)
+        legal_basis = 'legitimate_interest_b2b' if (best_email or dm_name or primary_phone) else None
+        pii_fields_str = _derive_pii_fields(
+            best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url
+        )
 
         result_record = {
             'input_domain': domain_key,
@@ -899,9 +1006,16 @@ async def process_domain(
             'tech_scan_completeness': tech_info['tech_scan_completeness'],
             'tech_rescan_needed': needs_rescan,
             'contact_quality_tier': contact_quality_tier,
+            'contact_quality_tier_human': human_tier,
             'contact_enrichment_status': enrichment_status,
             'data_confidence_warning': confidence_warning,
             'gdpr_eu_domain': is_eu_gdpr,
+            'gdpr_jurisdiction': gdpr_jurisdiction,
+            'legal_basis_for_processing': legal_basis,
+            'data_subject_can_request_deletion': True,
+            'data_retention_policy_days': 365,
+            'personal_data_fields_in_record': pii_fields_str,
+            'compliance_note': COMPLIANCE_DEFAULT_NOTE,
             'playwright_available': is_playwright_available(),
             'playwright_used': pw_used_flag,
             'playwright_status': pw_status_str,
@@ -1082,6 +1196,7 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{st.upper()}] {result['canonical_domain']} (aliases={result['aliases']}) | "
+                        f"Tier: {result['contact_quality_tier_human']} | "
                         f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
                         f"DM: {result['decision_maker_name'] or '-'} | "
