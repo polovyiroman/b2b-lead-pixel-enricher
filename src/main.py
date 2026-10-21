@@ -76,12 +76,19 @@ TECH_FLAG_TO_NAME_MAP = (
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
     """
-    P0 Fix (Bug 3): Примусово синхронізує всі булеві прапорці has_* із detected_technologies_list,
-    щоб унеможливити розбіжності після підтягування старого кешу (напр. readdle.com / ajax.systems).
+    P0 Fix: Примусово синхронізує всі булеві прапорці has_* із detected_technologies_list
+    та встановлює tech_scan_completeness = 'partial_gtm' при неповному розпакуванні GTM (Bug 2 P0.5).
     """
+    if tech_info.get('ga4_detection_confidence') in (
+        'Medium (GTM Single Macro)',
+        'Low (Script Endpoint Only — ID Dynamic)',
+    ) and tech_info.get('tech_scan_completeness') == 'full':
+        tech_info['tech_scan_completeness'] = 'partial_gtm'
+
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
-    is_partial = (tech_info.get('tech_scan_completeness', 'full') != 'full')
+    scan_comp = tech_info.get('tech_scan_completeness', 'full')
+    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(tech_info.get(flag_key))
@@ -90,19 +97,47 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
         if is_found and tech_label not in techs_set:
             techs_list.append(tech_label)
             techs_set.add(tech_label)
-        tech_info[flag_key] = True if is_found else (None if is_partial else False)
+        tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     tech_info['detected_technologies_list'] = techs_list
 
 
+def compute_google_ads_confidence(
+    tech_info: dict,
+    html_len: int,
+    unpack_gtm: bool
+) -> str:
+    """
+    Bug 4 (P1): Визначає рівень впевненості для прапорця has_google_ads:
+    'verified' | 'suspected_absent' | 'unknown'.
+    """
+    if tech_info.get('has_google_ads') is True:
+        return 'verified'
+    scan_comp = tech_info.get('tech_scan_completeness', 'full')
+    if scan_comp != 'full' or tech_info.get('has_cookie_banner'):
+        return 'unknown'
+    if unpack_gtm and tech_info.get('has_gtm') and html_len >= 50_000:
+        return 'verified'
+    if tech_info.get('has_gtm') or tech_info.get('has_ga4'):
+        return 'suspected_absent'
+    return 'unknown'
+
+
 def normalize_cached_record_booleans(cached_copy: dict) -> None:
     """
-    P0 Fix (Bug 3): Синхронізує булеві прапорці has_* та detected_technologies у повному кеш-фолбеку.
+    P0 Fix: Синхронізує булеві прапорці has_* та detected_technologies у повному кеш-фолбеку.
     """
+    if cached_copy.get('ga4_detection_confidence') in (
+        'Medium (GTM Single Macro)',
+        'Low (Script Endpoint Only — ID Dynamic)',
+    ) and cached_copy.get('tech_scan_completeness', 'full') == 'full':
+        cached_copy['tech_scan_completeness'] = 'partial_gtm'
+
     raw_tech_str = cached_copy.get('detected_technologies') or ''
     techs_list = [x.strip() for x in raw_tech_str.split(';') if x.strip()]
     techs_set = set(techs_list)
-    is_partial = (cached_copy.get('tech_scan_completeness', 'full') != 'full')
+    scan_comp = cached_copy.get('tech_scan_completeness', 'full')
+    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
@@ -111,9 +146,17 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
         if is_found and tech_label not in techs_set:
             techs_list.append(tech_label)
             techs_set.add(tech_label)
-        cached_copy[flag_key] = True if is_found else (None if is_partial else False)
+        cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
+    if cached_copy.get('has_google_ads') is True:
+        cached_copy.setdefault('has_google_ads_confidence', 'verified')
+    elif scan_comp != 'full' or cached_copy.get('consent_mode_likely'):
+        cached_copy.setdefault('has_google_ads_confidence', 'unknown')
+    elif cached_copy.get('has_gtm') or cached_copy.get('has_ga4'):
+        cached_copy.setdefault('has_google_ads_confidence', 'suspected_absent')
+    else:
+        cached_copy.setdefault('has_google_ads_confidence', 'unknown')
 
 
 async def process_domain(
@@ -144,6 +187,33 @@ async def process_domain(
         )
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+
+        # Bug 3 (P0.5): Якщо curl впав через помилку проксі-тунелю/мережі (status == 0, як на uhi.ua),
+        # пробуємо відкрити сайт через Playwright перед тим, як списувати домен у failed.
+        if status == 0 and is_playwright_available():
+            rescue_url = clean_url_port(root_url) or root_url
+            Actor.log.info(
+                f'Curl tunnel/connection failed for {canonical_domain} ({short_err_msg}); '
+                f'attempting Playwright rescue on {rescue_url}'
+            )
+            pw_attempts_count += 1
+            pw_attempted_paths.append(rescue_url)
+            pw_rescue_html, pw_rescue_url, pw_rescue_status, pw_rescue_inc = await fetch_html_playwright_fallback(rescue_url)
+            if pw_rescue_status == 'rendered' and pw_rescue_html:
+                Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
+                status = 200
+                html = pw_rescue_html
+                final_url = pw_rescue_url
+                err_msg = ''
+                short_err_msg = ''
+                pw_used_flag = True
+                pw_status_str = 'rendered'
+                canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+            else:
+                pw_status_str = pw_rescue_status
+                if pw_rescue_inc:
+                    pw_had_timeout_or_block = True
+
         parsed_final = urlparse(final_url)
         scheme = parsed_final.scheme or 'https'
         clean_website_url = f'{scheme}://{canonical_domain}/'
@@ -209,12 +279,15 @@ async def process_domain(
                             f'Note: Live scan encountered {short_err_msg}; returning cached snapshot '
                             f'({cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d) from {prev_time}.'
                         )
-                        # P0 Fix (Bug 1): завжди беремо свіжий статус is_playwright_available()
                         cached_copy['playwright_available'] = is_playwright_available()
                         cached_copy['playwright_used'] = False
-                        cached_copy['playwright_status'] = 'not_attempted_cached_fallback'
-                        cached_copy['playwright_attempts_count'] = 0
-                        cached_copy['playwright_paths_attempted'] = None
+                        cached_copy['playwright_status'] = (
+                            pw_status_str if pw_attempts_count > 0 else 'not_attempted_cached_fallback'
+                        )
+                        cached_copy['playwright_attempts_count'] = pw_attempts_count
+                        cached_copy['playwright_paths_attempted'] = (
+                            '; '.join(pw_attempted_paths) if pw_attempted_paths else None
+                        )
                         cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
@@ -232,11 +305,12 @@ async def process_domain(
                         cached_copy.setdefault('marketplace_platform_pollution_detected', False)
                         cached_copy.setdefault('email_source_type', None)
                         cached_copy.setdefault('email_source_note', None)
+                        cached_copy.setdefault('all_emails_deliverability', cached_copy.get('email_deliverability_check'))
+                        cached_copy.setdefault('all_emails_classification', None)
                         cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
                         cached_copy.setdefault('decision_makers_found', None)
                         cached_copy.setdefault('named_email_owner_role_hint', None)
 
-                        # P0 Fix (Bug 3): синхронізація всіх булевих прапорців із detected_technologies
                         normalize_cached_record_booleans(cached_copy)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
 
@@ -254,7 +328,7 @@ async def process_domain(
 
             seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
             if isinstance(seed_match, dict):
-                return build_manual_seed_record(
+                seeded_rec = build_manual_seed_record(
                     seed_match,
                     domain_key,
                     canonical_domain,
@@ -269,6 +343,13 @@ async def process_domain(
                     checked_at,
                     is_playwright_available()
                 )
+                seeded_rec.setdefault('has_google_ads_confidence', 'verified')
+                seeded_rec.setdefault('all_emails_deliverability', seeded_rec.get('email_deliverability_check'))
+                seeded_rec.setdefault(
+                    'all_emails_classification',
+                    f"{seeded_rec.get('best_email')} ({seeded_rec.get('best_email_type')})" if seeded_rec.get('best_email') else None
+                )
+                return seeded_rec
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
             return {
@@ -296,12 +377,11 @@ async def process_domain(
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
                 'gdpr_eu_domain': is_eu_gdpr,
-                # P0 Fix (Bug 1): свіжий виклик is_playwright_available()
                 'playwright_available': is_playwright_available(),
                 'playwright_used': False,
-                'playwright_status': 'not_attempted_site_blocked',
-                'playwright_attempts_count': 0,
-                'playwright_paths_attempted': None,
+                'playwright_status': pw_status_str if pw_attempts_count > 0 else 'not_attempted_site_blocked',
+                'playwright_attempts_count': pw_attempts_count,
+                'playwright_paths_attempted': '; '.join(pw_attempted_paths) if pw_attempted_paths else None,
                 'page_title': f'[Site blocked: {short_err_msg}]',
                 'meta_description': None,
                 'best_email': None,
@@ -311,6 +391,8 @@ async def process_domain(
                 'email_source_note': None,
                 'named_email_owner_role_hint': None,
                 'email_deliverability_check': None,
+                'all_emails_deliverability': None,
+                'all_emails_classification': None,
                 'email_source_url': None,
                 'primary_phone': None,
                 'e164_phone': None,
@@ -334,6 +416,7 @@ async def process_domain(
                 'detected_cms': None,
                 'consent_mode_likely': None,
                 'ga4_detection_confidence': None,
+                'has_google_ads_confidence': 'unknown',
                 'sales_opportunity': f'Scan {fail_status} ({short_err_msg}) — cannot verify stack without access',
                 'next_best_action': 'Retry with residential proxy or run decision_maker_search_query on LinkedIn',
                 'technology_evidence_summary': None,
@@ -432,7 +515,7 @@ async def process_domain(
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
 
-        if is_playwright_available() and (not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell):
+        if is_playwright_available() and not pw_used_flag and (not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell):
             Actor.log.info(
                 f'Playwright triggered for {canonical_domain} '
                 f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
@@ -542,8 +625,9 @@ async def process_domain(
             scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
 
-        # P0 Fix (Bug 3): фінальна нормалізація всіх булевих прапорців has_* перед кваліфікацією та записом
+        # Нормалізація булевих прапорців та перевірка partial_gtm (Bug 2 P0.5)
         normalize_tech_info_booleans(tech_info)
+        google_ads_conf = compute_google_ads_confidence(tech_info, len(html), unpack_gtm)
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
@@ -577,9 +661,30 @@ async def process_domain(
             else:
                 email_domain = f'{raw_em_dom} (external_domain)'
 
-        deliverability_check = (
-            await verify_email_deliverability_deep(client, best_email, email_source_url)
-            if best_email else None
+        non_legal_pairs = [
+            (em, src) for em, src in ranked_emails_with_src
+            if classify_email_type(em, brand_token) != 'legal_or_hr_inbox'
+        ]
+        selected_email_pairs = (non_legal_pairs or ranked_emails_with_src)[:5]
+        all_emails_list = [em for em, _ in selected_email_pairs]
+
+        # Bug 5 (P1): Паралельна перевірка deliverability (MX/SPF) для топ-3 email та класифікація всіх знайдених пошт
+        top3_pairs = selected_email_pairs[:3]
+        if top3_pairs:
+            top3_checks = await asyncio.gather(
+                *(verify_email_deliverability_deep(client, em, src) for em, src in top3_pairs)
+            )
+            deliverability_check = top3_checks[0]
+            all_emails_deliverability_str = '; '.join(
+                f'{em}: {chk}' for (em, _), chk in zip(top3_pairs, top3_checks) if chk
+            )
+        else:
+            deliverability_check = None
+            all_emails_deliverability_str = None
+
+        all_emails_classification_str = (
+            '; '.join(f'{em} ({classify_email_type(em, brand_token)})' for em in all_emails_list)
+            if all_emails_list else None
         )
 
         primary_phone = sorted_phones_with_src[0][0] if sorted_phones_with_src else None
@@ -642,13 +747,11 @@ async def process_domain(
 
         has_actionable_final = bool(best_email or primary_phone)
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
-        needs_rescan = bool(tech_info['tech_scan_completeness'] != 'full' or (not tech_info['has_gtm'] and not tech_info['has_ga4'] and pw_had_timeout_or_block))
+        needs_rescan = bool(
+            tech_info['tech_scan_completeness'] != 'full'
+            or (not tech_info['has_gtm'] and not tech_info['has_ga4'] and pw_had_timeout_or_block)
+        )
 
-        non_legal_emails = [
-            em for em, _ in ranked_emails_with_src
-            if classify_email_type(em, brand_token) != 'legal_or_hr_inbox'
-        ]
-        all_emails_list = (non_legal_emails or [em for em, _ in ranked_emails_with_src])[:5]
         all_phones_list = [p for p, _ in sorted_phones_with_src]
 
         result_record = {
@@ -690,6 +793,8 @@ async def process_domain(
             'email_source_note': email_source_note,
             'named_email_owner_role_hint': owner_role_hint,
             'email_deliverability_check': deliverability_check,
+            'all_emails_deliverability': all_emails_deliverability_str,
+            'all_emails_classification': all_emails_classification_str,
             'email_source_url': email_source_url,
             'primary_phone': primary_phone,
             'e164_phone': e164_phone,
@@ -713,6 +818,7 @@ async def process_domain(
             'detected_cms': tech_info['detected_cms'],
             'consent_mode_likely': tech_info['has_cookie_banner'],
             'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
+            'has_google_ads_confidence': google_ads_conf,
             'sales_opportunity': sales_opportunity,
             'next_best_action': next_best_action,
             'technology_evidence_summary': tech_info['technology_evidence_summary'],
@@ -739,7 +845,8 @@ async def process_domain(
                 await cache_store.set_value(canonical_kv_key, cache_payload)
                 if input_kv_key != canonical_kv_key:
                     await cache_store.set_value(input_kv_key, cache_payload)
-                if final_status == 'success':
+                # Bug 1 (P0.5): Записуємо в evergreen_kv_key ТІЛЬКИ якщо є і контакти (success), і непорожній тех-стек
+                if final_status == 'success' and tech_info['detected_technologies_list']:
                     await cache_store.set_value(evergreen_kv_key, cache_payload)
             except Exception:
                 pass
