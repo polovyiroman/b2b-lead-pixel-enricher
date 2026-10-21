@@ -73,22 +73,99 @@ TECH_FLAG_TO_NAME_MAP = (
     ('has_gtm', 'Google Tag Manager'),
 )
 
+AD_PIXEL_LABELS = {
+    'Meta Pixel',
+    'TikTok Pixel',
+    'Google Ads Conversion',
+    'LinkedIn Insight Tag',
+    'Pinterest Tag',
+}
+
+
+def compute_google_ads_confidence(
+    has_ads: bool | None,
+    scan_completeness: str
+) -> str:
+    """
+    Bug 2 (CRITICAL) Fix: Однозначна семантика впевненості для Google Ads:
+    - 'verified_present': тег Google Ads знайдено (has_google_ads is True)
+    - 'verified_absent': повний скан (scan_completeness == 'full'), тег відсутній (has_google_ads is False)
+    - 'unknown': скан неповний/кешований (partial_*) або значення None
+    """
+    if has_ads is True:
+        return 'verified_present'
+    if has_ads is None:
+        return 'unknown'
+    if scan_completeness == 'full':
+        return 'verified_absent'
+    return 'unknown'
+
+
+def detect_country_hint(
+    canonical_domain: str,
+    page_title: str,
+    meta_desc: str,
+    primary_phone: str | None,
+    html_sample: str = ''
+) -> str:
+    """
+    Bug 5 Fix: Визначає локаль/країну бренду за контентом, телефоном та lang-атрибутом,
+    щоб бренди на .com (напр. cher17.com) отримували локалізовані LinkedIn X-Ray запити.
+    """
+    dom_low = canonical_domain.lower()
+    if dom_low.endswith('.ua'):
+        return 'UA'
+    if dom_low.endswith(('.de', '.at', '.ch')):
+        return 'DE'
+    if dom_low.endswith('.pl'):
+        return 'PL'
+    if dom_low.endswith('.fr'):
+        return 'FR'
+    if dom_low.endswith('.es'):
+        return 'ES'
+    if dom_low.endswith('.it'):
+        return 'IT'
+    if dom_low.endswith(('.nl', '.be')):
+        return 'NL'
+
+    phone_str = primary_phone or ''
+    if phone_str.startswith('+380'):
+        return 'UA'
+    if phone_str.startswith(('+49', '+43', '+41')):
+        return 'DE'
+    if phone_str.startswith('+48'):
+        return 'PL'
+    if phone_str.startswith('+33'):
+        return 'FR'
+
+    text_combined = f'{page_title} {meta_desc}'
+    if re.search(r'[іїєґІЇЄҐ]', text_combined):
+        return 'UA'
+    if re.search(r'[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', text_combined):
+        return 'PL'
+
+    html_head = html_sample[:3000].lower()
+    if 'lang="uk' in html_head or "lang='uk" in html_head:
+        return 'UA'
+    if 'lang="de' in html_head or "lang='de" in html_head:
+        return 'DE'
+    if 'lang="pl' in html_head or "lang='pl" in html_head:
+        return 'PL'
+    if 'lang="fr' in html_head or "lang='fr" in html_head:
+        return 'FR'
+
+    return ''
+
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
     """
-    P0 Fix: Примусово синхронізує всі булеві прапорці has_* із detected_technologies_list
-    та встановлює tech_scan_completeness = 'partial_gtm' при неповному розпакуванні GTM (Bug 2 P0.5).
+    Синхронізує всі булеві прапорці has_* із detected_technologies_list.
+    Bug 4 Fix: Статус 'partial_gtm' виставляється лише тоді, коли GTM мав одиночний макрос GA4
+    І не виявлено жодного рекламного пікселя (як на answear.ua). Якщо рекламні пікселі
+    знайдено (macpaw.com, cher17.com), скан вважається 'full'.
     """
-    if tech_info.get('ga4_detection_confidence') in (
-        'Medium (GTM Single Macro)',
-        'Low (Script Endpoint Only — ID Dynamic)',
-    ) and tech_info.get('tech_scan_completeness') == 'full':
-        tech_info['tech_scan_completeness'] = 'partial_gtm'
-
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
-    scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(tech_info.get(flag_key))
@@ -97,47 +174,37 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
         if is_found and tech_label not in techs_set:
             techs_list.append(tech_label)
             techs_set.add(tech_label)
+
+    has_any_ad_pixel = bool(techs_set & AD_PIXEL_LABELS)
+    if (
+        tech_info.get('ga4_detection_confidence') in (
+            'Medium (GTM Single Macro)',
+            'Low (Script Endpoint Only — ID Dynamic)',
+        )
+        and tech_info.get('tech_scan_completeness') == 'full'
+        and not has_any_ad_pixel
+    ):
+        tech_info['tech_scan_completeness'] = 'partial_gtm'
+    elif tech_info.get('tech_scan_completeness') == 'partial_gtm' and has_any_ad_pixel:
+        tech_info['tech_scan_completeness'] = 'full'
+
+    scan_comp = tech_info.get('tech_scan_completeness', 'full')
+    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
+
+    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
+        is_found = tech_label in techs_set
         tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     tech_info['detected_technologies_list'] = techs_list
 
 
-def compute_google_ads_confidence(
-    tech_info: dict,
-    html_len: int,
-    unpack_gtm: bool
-) -> str:
-    """
-    Bug 4 (P1): Визначає рівень впевненості для прапорця has_google_ads:
-    'verified' | 'suspected_absent' | 'unknown'.
-    """
-    if tech_info.get('has_google_ads') is True:
-        return 'verified'
-    scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    if scan_comp != 'full' or tech_info.get('has_cookie_banner'):
-        return 'unknown'
-    if unpack_gtm and tech_info.get('has_gtm') and html_len >= 50_000:
-        return 'verified'
-    if tech_info.get('has_gtm') or tech_info.get('has_ga4'):
-        return 'suspected_absent'
-    return 'unknown'
-
-
 def normalize_cached_record_booleans(cached_copy: dict) -> None:
     """
-    P0 Fix: Синхронізує булеві прапорці has_* та detected_technologies у повному кеш-фолбеку.
+    Синхронізує булеві прапорці has_*, tech_scan_completeness та has_google_ads_confidence у кеш-фолбеку.
     """
-    if cached_copy.get('ga4_detection_confidence') in (
-        'Medium (GTM Single Macro)',
-        'Low (Script Endpoint Only — ID Dynamic)',
-    ) and cached_copy.get('tech_scan_completeness', 'full') == 'full':
-        cached_copy['tech_scan_completeness'] = 'partial_gtm'
-
     raw_tech_str = cached_copy.get('detected_technologies') or ''
     techs_list = [x.strip() for x in raw_tech_str.split(';') if x.strip()]
     techs_set = set(techs_list)
-    scan_comp = cached_copy.get('tech_scan_completeness', 'full')
-    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
@@ -146,17 +213,28 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
         if is_found and tech_label not in techs_set:
             techs_list.append(tech_label)
             techs_set.add(tech_label)
+
+    has_any_ad_pixel = bool(techs_set & AD_PIXEL_LABELS)
+    if (
+        cached_copy.get('ga4_detection_confidence') in (
+            'Medium (GTM Single Macro)',
+            'Low (Script Endpoint Only — ID Dynamic)',
+        )
+        and cached_copy.get('tech_scan_completeness', 'full') == 'full'
+        and not has_any_ad_pixel
+    ):
+        cached_copy['tech_scan_completeness'] = 'partial_gtm'
+    elif cached_copy.get('tech_scan_completeness') == 'partial_gtm' and has_any_ad_pixel:
+        cached_copy['tech_scan_completeness'] = 'full'
+
+    scan_comp = cached_copy.get('tech_scan_completeness', 'full')
+    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
+
+    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
+        is_found = tech_label in techs_set
         cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
-    if cached_copy.get('has_google_ads') is True:
-        cached_copy.setdefault('has_google_ads_confidence', 'verified')
-    elif scan_comp != 'full' or cached_copy.get('consent_mode_likely'):
-        cached_copy.setdefault('has_google_ads_confidence', 'unknown')
-    elif cached_copy.get('has_gtm') or cached_copy.get('has_ga4'):
-        cached_copy.setdefault('has_google_ads_confidence', 'suspected_absent')
-    else:
-        cached_copy.setdefault('has_google_ads_confidence', 'unknown')
 
 
 async def process_domain(
@@ -188,8 +266,6 @@ async def process_domain(
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
-        # Bug 3 (P0.5): Якщо curl впав через помилку проксі-тунелю/мережі (status == 0, як на uhi.ua),
-        # пробуємо відкрити сайт через Playwright перед тим, як списувати домен у failed.
         if status == 0 and is_playwright_available():
             rescue_url = clean_url_port(root_url) or root_url
             Actor.log.info(
@@ -305,8 +381,6 @@ async def process_domain(
                         cached_copy.setdefault('marketplace_platform_pollution_detected', False)
                         cached_copy.setdefault('email_source_type', None)
                         cached_copy.setdefault('email_source_note', None)
-                        cached_copy.setdefault('all_emails_deliverability', cached_copy.get('email_deliverability_check'))
-                        cached_copy.setdefault('all_emails_classification', None)
                         cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
                         cached_copy.setdefault('decision_makers_found', None)
                         cached_copy.setdefault('named_email_owner_role_hint', None)
@@ -314,8 +388,41 @@ async def process_domain(
                         normalize_cached_record_booleans(cached_copy)
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
 
+                        # Bug 1 (CRITICAL) Fix: Гарантоване обчислення all_emails_classification та all_emails_deliverability для кешу
+                        _cached_all_emails = (
+                            cached_copy.get('all_emails') or cached_copy.get('best_email') or ''
+                        ).split(';')
+                        _cached_emails_list = [e.strip() for e in _cached_all_emails if e.strip()]
+                        if _cached_emails_list:
+                            _brand = canonical_domain.split('.')[0].lower()
+                            cached_copy['all_emails_classification'] = '; '.join(
+                                f'{em} ({classify_email_type(em, _brand)})' for em in _cached_emails_list
+                            )
+                            _deliv = cached_copy.get('email_deliverability_check') or 'not_checked'
+                            _existing_all_deliv = cached_copy.get('all_emails_deliverability') or ''
+                            if _existing_all_deliv and '@' in _existing_all_deliv and ': ' in _existing_all_deliv:
+                                cached_copy['all_emails_deliverability'] = _existing_all_deliv
+                            else:
+                                cached_copy['all_emails_deliverability'] = '; '.join(
+                                    f'{em}: {_deliv}' for em in _cached_emails_list[:3]
+                                )
+                        else:
+                            cached_copy['all_emails_classification'] = None
+                            cached_copy['all_emails_deliverability'] = None
+
                         has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
                         cached_copy['tech_rescan_needed'] = not has_cached_tech
+
+                        # Bug 6 Fix: Якщо для кешу потрібен tech_rescan_needed, змінюємо completeness на 'partial_cached'
+                        if cached_copy['tech_rescan_needed'] and cached_copy.get('tech_scan_completeness') == 'full':
+                            cached_copy['tech_scan_completeness'] = 'partial_cached'
+
+                        # Bug 2 Fix: Перераховуємо has_google_ads_confidence після фіналізації tech_scan_completeness
+                        cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
+                            cached_copy.get('has_google_ads'),
+                            cached_copy.get('tech_scan_completeness', 'full')
+                        )
+
                         if not has_cached_tech and (cached_copy.get('best_email') or cached_copy.get('primary_phone')):
                             c_contact = cached_copy.get('best_email') or cached_copy.get('primary_phone')
                             cached_copy['next_best_action'] = (
@@ -343,15 +450,14 @@ async def process_domain(
                     checked_at,
                     is_playwright_available()
                 )
-                seeded_rec.setdefault('has_google_ads_confidence', 'verified')
-                seeded_rec.setdefault('all_emails_deliverability', seeded_rec.get('email_deliverability_check'))
-                seeded_rec.setdefault(
-                    'all_emails_classification',
-                    f"{seeded_rec.get('best_email')} ({seeded_rec.get('best_email_type')})" if seeded_rec.get('best_email') else None
+                seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
+                    seeded_rec.get('has_google_ads'),
+                    seeded_rec.get('tech_scan_completeness', 'full')
                 )
                 return seeded_rec
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
+            c_hint = detect_country_hint(canonical_domain, '', '', None, '')
             return {
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
@@ -404,7 +510,7 @@ async def process_domain(
                 'decision_maker_source_type': None,
                 'decision_makers_found': None,
                 'decision_maker_linkedin_url': None,
-                'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat),
+                'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat, c_hint),
                 'linkedin_url': None,
                 'instagram_url': None,
                 'facebook_url': None,
@@ -625,9 +731,11 @@ async def process_domain(
             scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
 
-        # Нормалізація булевих прапорців та перевірка partial_gtm (Bug 2 P0.5)
         normalize_tech_info_booleans(tech_info)
-        google_ads_conf = compute_google_ads_confidence(tech_info, len(html), unpack_gtm)
+        google_ads_conf = compute_google_ads_confidence(
+            tech_info.get('has_google_ads'),
+            tech_info.get('tech_scan_completeness', 'full')
+        )
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
@@ -668,7 +776,6 @@ async def process_domain(
         selected_email_pairs = (non_legal_pairs or ranked_emails_with_src)[:5]
         all_emails_list = [em for em, _ in selected_email_pairs]
 
-        # Bug 5 (P1): Паралельна перевірка deliverability (MX/SPF) для топ-3 email та класифікація всіх знайдених пошт
         top3_pairs = selected_email_pairs[:3]
         if top3_pairs:
             top3_checks = await asyncio.gather(
@@ -716,7 +823,9 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
-        dm_search_query = build_linkedin_xray_query(canonical_domain, company_category)
+        # Bug 5 Fix: Передаємо визначений country_hint у build_linkedin_xray_query
+        country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
+        dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
@@ -744,6 +853,20 @@ async def process_domain(
             had_marketplace_pollution,
             pw_status_str
         )
+
+        # Bug 3 (HIGH) Fix: Якщо для best_email сталася помилка DNS/DoH, явно виводимо попередження у data_confidence_warning
+        if best_email and deliverability_check and any(
+            err_tok in deliverability_check.lower()
+            for err_tok in ('dns_error', 'lookup_failed', 'dns_timeout', 'invalid_no_mx')
+        ):
+            dns_warn = (
+                f'Warning: DNS lookup failed for {best_email} '
+                f'(temporary DoH failure or domain has no MX). Verify manually before outbound.'
+            )
+            if confidence_warning and confidence_warning != 'None':
+                confidence_warning = f'{dns_warn} | {confidence_warning}'
+            else:
+                confidence_warning = dns_warn
 
         has_actionable_final = bool(best_email or primary_phone)
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
@@ -845,7 +968,6 @@ async def process_domain(
                 await cache_store.set_value(canonical_kv_key, cache_payload)
                 if input_kv_key != canonical_kv_key:
                     await cache_store.set_value(input_kv_key, cache_payload)
-                # Bug 1 (P0.5): Записуємо в evergreen_kv_key ТІЛЬКИ якщо є і контакти (success), і непорожній тех-стек
                 if final_status == 'success' and tech_info['detected_technologies_list']:
                     await cache_store.set_value(evergreen_kv_key, cache_payload)
             except Exception:
