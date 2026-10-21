@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 18
+CACHE_SCHEMA_VERSION = 19
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -46,7 +46,8 @@ CHECKOUT_REDIRECT_HOSTS = re.compile(
 
 SOFT_404_TITLE_REGEX = re.compile(
     r'^\s*(?:404|error\s*404|page\s*not\s*found|not\s*found|'
-    r'сторінк[уа]\s+не\s+знайдено|сторінка\s+не\s+знайдена|помилка\s*404)'
+    r'сторінк[уа]\s+не\s+знайдено|сторінка\s+не\s+знайдена|помилка\s*404|'
+    r'seite\s+nicht\s+gefunden|page\s+introuvable|página\s+no\s+encontrada|nie\s+znaleziono\s+strony)'
     r'(?:\s*[\|\-–—:!.]|\s*$)',
     re.IGNORECASE
 )
@@ -56,7 +57,7 @@ DM_SOURCE_BLACKLIST = re.compile(
     re.IGNORECASE
 )
 DM_LEGAL_SOURCE_FLAG = re.compile(
-    r'/(?:oferta|offer|publichna|publichnaja|terms|dogovir|ugoda|conditions)\b',
+    r'/(?:oferta|offer|publichna|publichnaja|terms|dogovir|ugoda|conditions|impressum|agb|mentions-legales|aviso-legal|regulamin)\b',
     re.IGNORECASE
 )
 
@@ -69,17 +70,33 @@ GTM_FALSE_POSITIVES = {
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
+# P1 i18n: Розширений перелік ролей (EN + UA + DE + FR + ES + IT + NL + PL + PT + Nordic)
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
     r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
     r'Head of Digital|Commercial Director|Managing Partner|General Manager|President|'
     r'Засновник|Засновниця|Співзасновник|Співзасновниця|Співзасновники|Власник|Власниця|'
     r'Генеральний директор|Директор з маркетингу|Керівник відділу маркетингу|'
-    r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор)'
+    r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор|'
+    r'Geschäftsführer|Geschäftsführerin|Inhaber|Inhaberin|Mitgründer|Gründer|Gründerin|'
+    r'Marketingleiter|Marketingleiterin|Leiter Marketing|Leiter E-Commerce|Vorstand|'
+    r'Directeur Général|Directrice Générale|PDG|Fondateur|Fondatrice|Co-Fondateur|Co-Fondatrice|'
+    r'Directeur Marketing|Directrice Marketing|Responsable Marketing|Directeur E-commerce|Gérant|'
+    r'Director General|Directora General|Fundador|Fundadora|Cofundador|Cofundadora|'
+    r'Director de Marketing|Directora de Marketing|Director Comercial|Directora Comercial|'
+    r'Amministratore Delegato|Fondatore|Fondatrice|Co-Fondatore|Direttore Marketing|Direttore Commerciale|'
+    r'Algemeen Directeur|Oprichter|Mede-oprichter|Commercieel Directeur|Marketing Directeur|Eigenaar|'
+    r'Prezes Zarządu|Właściciel|Właścicielka|Współwłaściciel|Założyciel|Założycielka|'
+    r'Dyrektor Marketingu|Dyrektor Handlowy|Dyrektor Zarządzający|'
+    r'Diretor Geral|Diretora Geral|Diretor Executivo|Diretor de Marketing|'
+    r'Verkställande Direktör|VD|Grundare|Medgrundare|Marknadschef|'
+    r'Daglig Leder|Gründer|Markedssjef|Administrerende Direktør|Grundlægger|Toimitusjohtaja|Markkinointijohtaja)'
 )
+
+# P1 i18n: Підтримка кирилиці, латиниці та всіх європейських діакритичних символів у ПІБ
 NAME_REGEX_PART = (
-    r'([A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,20}'
-    r'(?:\s+[A-ZА-ЯІЇЄҐ][a-zа-яіїєґ\’\'-]{2,25}){1,2})'
+    r'([A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀ-ŽŁŃŚŹŻ][a-zа-яіїєґà-öø-ÿā-žłńśźż\’\'-]{2,20}'
+    r'(?:\s+[A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀ-ŽŁŃŚŹŻ][a-zа-яіїєґà-öø-ÿā-žłńśźż\’\'-]{2,25}){1,2})'
 )
 
 NAME_BEFORE_ROLE_PATTERN = re.compile(
@@ -87,7 +104,7 @@ NAME_BEFORE_ROLE_PATTERN = re.compile(
     re.UNICODE
 )
 ROLE_BEFORE_NAME_PATTERN = re.compile(
-    rf'\b({ROLES_REGEX_PART})\b(?:\s+[a-zа-яіїєґA-ZА-ЯІЇЄҐ\’\'-]{{2,20}}){{0,3}}[\s,—–\-:|()•]{{1,20}}{NAME_REGEX_PART}\b',
+    rf'\b({ROLES_REGEX_PART})\b(?:\s+[a-zа-яіїєґà-öø-ÿā-žłńśźżA-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀ-ŽŁŃŚŹŻ\’\'-]{{2,20}}){{0,3}}[\s,—–\-:|()•]{{1,20}}{NAME_REGEX_PART}\b',
     re.UNICODE
 )
 FOP_OWNER_PATTERN = re.compile(
@@ -99,7 +116,8 @@ FOP_OWNER_PATTERN = re.compile(
 TESTIMONIAL_TEXT_MARKERS = (
     'відгук', 'відгуки', 'наші клієнти', 'клієнти про нас', 'що кажуть клієнти',
     'testimonial', 'testimonials', 'what our clients say', 'customer stories',
-    'client review', 'case study', 'дякуємо команді', 'користуємося сервісом'
+    'client review', 'case study', 'дякуємо команді', 'користуємося сервісом',
+    'kundenstimmen', 'referenzen', 'témoignages', 'avis clients', 'opinie klientów'
 )
 
 FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
@@ -111,7 +129,8 @@ UI_ACTION_WORDS_BLACKLIST = {
     'зв’язатися', 'звязатися', 'автор', 'спікер', 'експерт', 'блог', 'стаття',
     'команда', 'кейс', 'відгук', 'клієнт', 'партнер', 'модератор', 'ведучий',
     'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article',
-    'client', 'building', 'link', 'seo', 'ppc', 'smm', 'growth', 'team', 'about'
+    'client', 'building', 'link', 'seo', 'ppc', 'smm', 'growth', 'team', 'about',
+    'mehr', 'lesen', 'weiterlesen', 'voir', 'lire', 'więcej', 'czytaj'
 }
 
 ROLE_TOKEN_BLACKLIST = {
@@ -121,7 +140,10 @@ ROLE_TOKEN_BLACKLIST = {
     'ceo', 'cmo', 'cto', 'coo', 'cfo', 'vp', 'svp', 'avp', 'admin', 'editor',
     'директор', 'директорка', 'керівник', 'керівниця', 'начальник', 'президент',
     'засновник', 'засновниця', 'співзасновник', 'співзасновниця', 'власник',
-    'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан'
+    'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан',
+    'geschäftsführer', 'geschäftsführerin', 'inhaber', 'inhaberin', 'vorstand',
+    'directeur', 'directrice', 'fondateur', 'fondatrice', 'prezes', 'właściciel',
+    'dyrektor', 'amministratore', 'direttore', 'oprichter', 'eigenaar', 'vd'
 }
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 
@@ -130,7 +152,8 @@ ROLE_WORDS_IN_CONTEXT = (
     'head', 'керівник', 'specialist', 'спеціаліст', 'lead', 'лід', 'recruiter',
     'hr', 'account', 'координатор', 'coordinator', 'partner', 'партнер',
     'департамент', 'відділ', 'department', 'division', 'team', 'маркетинг',
-    'marketing', 'pr', 'communications', 'комунікац', 'b2b', 'support', 'підтримк'
+    'marketing', 'pr', 'communications', 'комунікац', 'b2b', 'support', 'підтримк',
+    'vertrieb', 'ansprechpartner', 'kontakt', 'dział', 'kierownik', 'responsable'
 )
 
 ROLE_NORMALIZATION_MAP = {
@@ -141,8 +164,25 @@ ROLE_NORMALIZATION_MAP = {
     'керівник відділу маркетингу': 'Head of Marketing',
     'head of marketing': 'Head of Marketing',
     'marketing director': 'Marketing Director',
+    'marketingleiter': 'Head of Marketing',
+    'marketingleiterin': 'Head of Marketing',
+    'leiter marketing': 'Head of Marketing',
+    'directeur marketing': 'Marketing Director',
+    'directrice marketing': 'Marketing Director',
+    'responsable marketing': 'Head of Marketing',
+    'director de marketing': 'Marketing Director',
+    'directora de marketing': 'Marketing Director',
+    'direttore marketing': 'Marketing Director',
+    'marketing directeur': 'Marketing Director',
+    'dyrektor marketingu': 'Marketing Director',
+    'diretor de marketing': 'Marketing Director',
+    'marknadschef': 'Head of Marketing',
+    'markedssjef': 'Head of Marketing',
+    'markkinointijohtaja': 'Marketing Director',
     'head of e-commerce': 'Head of E-commerce',
     'e-commerce director': 'E-commerce Director',
+    'leiter e-commerce': 'Head of E-commerce',
+    'directeur e-commerce': 'E-commerce Director',
     'head of growth': 'Head of Growth',
     'head of digital': 'Head of Digital',
     'ceo': 'Chief Executive Officer (CEO)',
@@ -150,18 +190,70 @@ ROLE_NORMALIZATION_MAP = {
     'директор': 'Managing Director / CEO',
     'директорка': 'Managing Director / CEO',
     'general manager': 'General Manager',
+    'geschäftsführer': 'Managing Director / CEO',
+    'geschäftsführerin': 'Managing Director / CEO',
+    'vorstand': 'Executive Board / CEO',
+    'directeur général': 'Managing Director / CEO',
+    'directrice générale': 'Managing Director / CEO',
+    'pdg': 'Chief Executive Officer (CEO)',
+    'gérant': 'Managing Director / CEO',
+    'director general': 'Managing Director / CEO',
+    'directora general': 'Managing Director / CEO',
+    'amministratore delegato': 'Chief Executive Officer (CEO)',
+    'algemeen directeur': 'Managing Director / CEO',
+    'prezes zarządu': 'Chief Executive Officer (CEO)',
+    'dyrektor zarządzający': 'Managing Director / CEO',
+    'diretor geral': 'Managing Director / CEO',
+    'diretora geral': 'Managing Director / CEO',
+    'diretor executivo': 'Chief Executive Officer (CEO)',
+    'verkställande direktör': 'Chief Executive Officer (CEO)',
+    'vd': 'Chief Executive Officer (CEO)',
+    'daglig leder': 'Managing Director / CEO',
+    'administrerende direktør': 'Chief Executive Officer (CEO)',
+    'toimitusjohtaja': 'Chief Executive Officer (CEO)',
     'founder': 'Founder',
     'засновник': 'Founder',
     'засновниця': 'Founder',
+    'gründer': 'Founder',
+    'gründerin': 'Founder',
+    'fondateur': 'Founder',
+    'fondatrice': 'Founder',
+    'fundador': 'Founder',
+    'fundadora': 'Founder',
+    'fondatore': 'Founder',
+    'oprichter': 'Founder',
+    'założyciel': 'Founder',
+    'założycielka': 'Founder',
+    'grundare': 'Founder',
+    'grundlægger': 'Founder',
     'co-founder': 'Co-Founder',
     'співзасновник': 'Co-Founder',
     'співзасновниця': 'Co-Founder',
     'співзасновники': 'Co-Founder',
+    'mitgründer': 'Co-Founder',
+    'co-fondateur': 'Co-Founder',
+    'co-fondatrice': 'Co-Founder',
+    'cofundador': 'Co-Founder',
+    'cofundadora': 'Co-Founder',
+    'co-fondatore': 'Co-Founder',
+    'mede-oprichter': 'Co-Founder',
+    'medgrundare': 'Co-Founder',
     'owner': 'Owner',
     'власник': 'Owner',
     'власниця': 'Owner',
+    'inhaber': 'Owner',
+    'inhaberin': 'Owner',
+    'eigenaar': 'Owner',
+    'właściciel': 'Owner',
+    'właścicielka': 'Owner',
+    'współwłaściciel': 'Co-Owner',
     'commercial director': 'Commercial Director',
     'комерційний директор': 'Commercial Director',
+    'director comercial': 'Commercial Director',
+    'directora comercial': 'Commercial Director',
+    'direttore commerciale': 'Commercial Director',
+    'commercieel directeur': 'Commercial Director',
+    'dyrektor handlowy': 'Commercial Director',
     'managing partner': 'Managing Partner'
 }
 
@@ -175,7 +267,9 @@ STOP_NAME_WORDS = {
     'Наші', 'Ваші', 'Нова', 'Повна', 'Більше', 'Меню', 'Головна', 'Сторінка',
     'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права',
     'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт',
-    'Building', 'Link', 'Кейс', 'Відгук', 'Стаття'
+    'Building', 'Link', 'Кейс', 'Відгук', 'Стаття', 'Impressum', 'Datenschutz',
+    'Kontakt', 'Über', 'AGB', 'Mentions', 'Légales', 'Política', 'Privacidad',
+    'Regulamin', 'Polityka', 'Prywatności', 'Sklep', 'Biuro', 'Kundenservice'
 }
 
 UA_TO_LATIN = {
@@ -183,7 +277,11 @@ UA_TO_LATIN = {
     'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y',
     'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
     'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
-    'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya', '\'': '', '’': ''
+    'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya', '\'': '', '’': '',
+    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss', 'ł': 'l', 'ń': 'n', 'ś': 's',
+    'ź': 'z', 'ż': 'z', 'ą': 'a', 'ę': 'e', 'ć': 'c', 'é': 'e', 'è': 'e',
+    'ê': 'e', 'á': 'a', 'à': 'a', 'ó': 'o', 'ú': 'u', 'ñ': 'n', 'ç': 'c',
+    'å': 'a', 'ø': 'o', 'æ': 'ae'
 }
 
 JUNK_EMAIL_DOMAINS = {
@@ -208,7 +306,7 @@ INVALID_EMAIL_TLDS = {
 EU_GDPR_TLDS = (
     '.eu', '.de', '.fr', '.it', '.es', '.nl', '.pl', '.at', '.be', '.se',
     '.dk', '.fi', '.ie', '.pt', '.cz', '.ro', '.hu', '.sk', '.bg', '.hr',
-    '.lt', '.lv', '.ee', '.si', '.lu', '.mt', '.cy', '.gr'
+    '.lt', '.lv', '.ee', '.si', '.lu', '.mt', '.cy', '.gr', '.no', '.ch'
 )
 
 JUNK_EMAIL_LOCALS = {
@@ -227,14 +325,19 @@ JUNK_EXTENSIONS = (
 
 MARKETING_EXEC_PREFIXES = (
     'marketing', 'cmo', 'digital', 'growth', 'ecommerce', 'e-commerce',
-    'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner'
+    'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner',
+    'geschaeftsfuehrung', 'geschäftsfuehrung', 'vorstand', 'zarzad', 'direktion'
 )
+# P1 i18n: Розширені локалізовані префікси для B2B, Sales, Office, Support
 B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
-    'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp'
+    'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp',
+    'partenariat', 'kooperation', 'wspolpraca', 'parcerias', 'alliances'
 )
 WHOLESALE_MERCH_PREFIXES = (
-    'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer'
+    'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer',
+    'vertrieb', 'verkauf', 'ventas', 'vendite', 'comercial', 'handlowy', 'sprzedaz',
+    'zakupy', 'inkoop', 'achats', 'einkauf', 'grosshandel', 'hurt'
 )
 INFLUENCER_PREFIXES = (
     'gteam', 'creators', 'influencers', 'influencer', 'gifting', 'collabs', 'ambassador', 'ambassadors'
@@ -242,7 +345,9 @@ INFLUENCER_PREFIXES = (
 GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
     'company', 'general', 'mail', 'kontakt', 'hallo', 'welcome', 'inquiries',
-    'enquiry', 'reception', 'secretariat', 'admin', 'kans', 'kanc', 'manager'
+    'enquiry', 'reception', 'secretariat', 'admin', 'kans', 'kanc', 'manager',
+    'biuro', 'sekretariat', 'kantoor', 'algemeen', 'bonjour', 'hola', 'ciao',
+    'centrala', 'post', 'firmapost', 'kontak'
 )
 DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
@@ -251,20 +356,24 @@ DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
 )
 SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
-    'customercare', 'client', 'clients', 'shop', 'store', 'hotline', 'callcenter'
+    'customercare', 'client', 'clients', 'shop', 'store', 'hotline', 'callcenter',
+    'kundenservice', 'kundendienst', 'serviceclient', 'atencionalcliente',
+    'assistenza', 'klantenservice', 'bok', 'obsluga', 'reklamacje', 'kundservice'
 )
 PR_MEDIA_PREFIXES = (
     'pr', 'press', 'media', 'comms', 'communications', 'ads', 'collab', 'brand',
-    'events', 'insight', 'insights', 'research'
+    'events', 'insight', 'insights', 'research', 'presse', 'prensa', 'stampa', 'prasa'
 )
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
     'gdpr', 'billing', 'invoice', 'invoices', 'accounting', 'finance',
-    'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira'
+    'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira',
+    'karriere', 'rekrutacja', 'praca', 'recrutement', 'buchhaltung', 'rechnung', 'ksiegowosc'
 )
 REGIONAL_BRANCH_LOCALS = {
-    'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw'
+    'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro', 'london', 'ny', 'berlin', 'warsaw',
+    'paris', 'madrid', 'milano', 'amsterdam', 'wien', 'zurich', 'stockholm'
 }
 
 NON_PERSON_TOKENS = (
@@ -284,7 +393,7 @@ NON_PERSON_TOKENS = (
 B2B_PHONE_KEYWORDS = (
     'опт', 'гурт', 'гуртов', 'співпрац', 'партнер', 'корпоратив', 'b2b',
     'wholesale', 'commercial', 'corporate', 'sales', 'business', 'office',
-    'офіс', 'відділ продажу', 'закупів', 'дилер', 'hurt', 'buro'
+    'офіс', 'відділ продажу', 'закупів', 'дилер', 'hurt', 'buro', 'biuro', 'vertrieb'
 )
 RETAIL_PHONE_KEYWORDS = (
     'роздріб', 'роздрібн', 'інтернет-магазин', 'шоурум', 'retail', 'store', 'shop', 'showroom'
@@ -297,12 +406,14 @@ PRIMARY_CONTACT_KEYWORDS = (
 SECONDARY_CONTACT_KEYWORDS = (
     'about', 'uber-uns', 'ueber-uns', 'team', 'komanda', 'company', 'leadership',
     'management', 'founders', 'our-story', 'pro-nas', 'o-nas', 'history', 'brand',
-    'wholesale', 'b2b', 'investors', 'oferta', 'offer', 'terms', 'our-services', 'ugoda'
+    'wholesale', 'b2b', 'investors', 'oferta', 'offer', 'terms', 'our-services', 'ugoda',
+    'a-propos', 'quienes-somos', 'chi-siamo', 'over-ons', 'om-oss'
 )
 
 CONTACT_ANCHOR_TEXT_KEYWORDS = (
     'contact', 'contact us', 'get in touch', 'support', 'customer care',
-    'help center', 'контакти', 'зв\'язатися', 'про нас', 'about us', 'impressum'
+    'help center', 'контакти', 'зв\'язатися', 'про нас', 'about us', 'impressum',
+    'kontakt', 'über uns', 'kontaktieren', 'contactez-nous', 'à propos', 'kontakt z nami'
 )
 
 AD_AND_ANALYTICS_SIGNATURES = {
@@ -365,13 +476,22 @@ REGION_DIALING_PREFIX_MAP = {
     'UK': '+44',
     'PL': '+48',
     'DE': '+49',
-    'FR': '+33'
+    'FR': '+33',
+    'ES': '+34',
+    'IT': '+39',
+    'NL': '+31',
+    'PT': '+351',
+    'SE': '+46',
+    'NO': '+47',
+    'DK': '+45',
+    'FI': '+358'
 }
 
 KNOWN_MARKETPLACE_DOMAINS = {
     'answear.ua', 'answear.com', 'kasta.ua', 'modnakasta.ua', 'rozetka.com.ua',
     'comfy.ua', 'intertop.ua', 'epicentrk.ua', 'allo.ua', 'foxtrot.com.ua',
-    'prom.ua', 'shafa.ua', 'liki24.com', 'makeup.com.ua', 'eva.ua'
+    'prom.ua', 'shafa.ua', 'liki24.com', 'makeup.com.ua', 'eva.ua', 'allegro.pl',
+    'zalando.de', 'zalando.pl', 'bol.com', 'cdiscount.com', 'otto.de'
 }
 
 KNOWN_DOMAIN_REDIRECT_ALIASES = {
@@ -380,13 +500,16 @@ KNOWN_DOMAIN_REDIRECT_ALIASES = {
 
 MARKETPLACE_TEXT_MARKERS = (
     'більше 500 брендів', 'понад 9 млн товарів', 'мільйони товарів', 'маркетплейс',
-    'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів'
+    'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів',
+    'ponad 500 marek', 'tausende marken', 'plus de 500 marques'
 )
 
 DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
     'rozetka.com.ua': {
         'page_title': 'Інтернет-магазин ROZETKA™: офіційний сайт найпопулярнішого онлайн-гіпермаркету в Україні',
         'meta_description': 'ROZETKA — найбільший онлайн-ритейлер та маркетплейс України. Побутова техніка, електроніка, одяг, товари для дому та бізнесу.',
+        'site_language': 'uk-UA',
+        'company_size_bucket': '1000+ (Enterprise / Marketplace)',
         'company_category': 'E-commerce / Retail Brand',
         'category_confidence': 'high',
         'marketplace_platform': True,
@@ -394,9 +517,11 @@ DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
         'best_email': 'partner@rozetka.com.ua',
         'all_emails': 'partner@rozetka.com.ua; service@rozetka.com.ua',
         'best_email_type': 'b2b_partnerships',
+        'all_emails_classification': 'partner@rozetka.com.ua (b2b_partnerships); service@rozetka.com.ua (customer_support_inbox)',
         'email_source_url': 'https://rozetka.com.ua/ua/seller/',
         'email_source_type': 'contact_page',
         'email_source_note': 'Verified B2B seller/partnership channel from official Rozetka Seller portal',
+        'verification_status': 'mx_and_spf_verified',
         'primary_phone': '+380 44 537 0222',
         'e164_phone': '+380445370222',
         'all_phones': '+380 44 537 0222; +380 44 503 8080',
@@ -417,6 +542,8 @@ DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
         'has_gtm': True,
         'has_ga4': True,
         'has_google_ads': True,
+        'has_google_ads_confidence': 'verified_present',
+        'tech_absence_confidence': 'verified_complete_stack',
         'has_meta_pixel': True,
         'has_tiktok_pixel': True,
         'has_linkedin_pixel': False,
