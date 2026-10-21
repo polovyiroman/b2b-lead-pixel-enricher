@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import textwrap
@@ -46,6 +47,12 @@ from .config import (
 )
 
 DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
+_DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
+
+IMPRESSUM_CANONICAL_PATH_REGEX = re.compile(
+    r'/(?:impressum|mentions-legales|aviso-legal)\b',
+    re.IGNORECASE
+)
 
 
 def decode_cf_email(encoded_str: str) -> str:
@@ -198,24 +205,34 @@ def verify_person_linkedin_match(full_name: str | None, linkedin_url: str | None
 
 
 async def query_doh_json(client: AsyncSession, domain: str, record_type: str) -> tuple[dict | None, str]:
+    """
+    Bug 3 Fix: Використовує 3 незалежні DoH-резолвери (Google, Cloudflare, Quad9).
+    Якщо проксі-тунель клієнта блокує запит, виконує резервний прямий запит (proxy=None).
+    """
     endpoints = [
         f'https://dns.google/resolve?name={domain}&type={record_type}',
-        f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}'
+        f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
+        f'https://dns.quad9.net:5053/dns-query?name={domain}&type={record_type}',
     ]
     last_status = 'dns_error'
     for ep in endpoints:
-        try:
-            resp = await client.get(
-                ep,
-                headers={'accept': 'application/dns-json'},
-                timeout=4.5
-            )
-            if resp.status_code == 200:
-                return resp.json(), 'ok'
-        except Exception as e:
-            if 'timeout' in str(e).lower():
-                last_status = 'dns_timeout'
-            continue
+        for use_direct in (False, True):
+            try:
+                kwargs = {
+                    'headers': {'accept': 'application/dns-json'},
+                    'timeout': 4.5,
+                }
+                if use_direct:
+                    kwargs['proxy'] = None
+                resp = await client.get(ep, **kwargs)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data, 'ok'
+            except Exception as e:
+                if 'timeout' in str(e).lower():
+                    last_status = 'dns_timeout'
+                continue
     return None, last_status
 
 
@@ -224,51 +241,60 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None
 ) -> str | None:
+    """
+    Bug 3 Fix: Захищено по-доменним asyncio.Lock, щоб паралельні перевірки 3 пошт на одному домені
+    (напр. enterprise@readdle.com, insight@readdle.com, pr@readdle.com) не дублювали мережеві DoH-запити.
+    Тимчасові мережеві збої (dns_error / dns_timeout) НЕ кешуються назавжди.
+    """
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
     is_public_webmail = domain in PUBLIC_WEBMAIL_DOMAINS
 
-    if domain in DNS_MEMORY_CACHE:
-        provider, has_spf, err_code = DNS_MEMORY_CACHE[domain]
-    else:
-        provider = None
-        has_spf = False
-        mx_data, err_code = await query_doh_json(client, domain, 'MX')
-        if mx_data is not None:
-            answers = mx_data.get('Answer', [])
-            mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type') == 15]
-            if mx_hosts:
-                joined_mx = ' '.join(mx_hosts)
-                if 'google.com' in joined_mx or 'googlemail.com' in joined_mx:
-                    provider = 'Google' if is_public_webmail else 'Google Workspace'
-                elif 'outlook.com' in joined_mx or 'protection.outlook.com' in joined_mx:
-                    provider = 'Microsoft' if is_public_webmail else 'Microsoft 365'
-                elif 'pphosted.com' in joined_mx or 'proofpoint' in joined_mx:
-                    provider = 'Proofpoint Enterprise'
-                elif 'mimecast.com' in joined_mx:
-                    provider = 'Mimecast Enterprise'
-                elif 'barracudanetworks.com' in joined_mx:
-                    provider = 'Barracuda Gateway'
-                elif 'route.mx.cloudflare.net' in joined_mx:
-                    provider = 'Cloudflare Email'
-                elif 'zoho.' in joined_mx:
-                    provider = 'Zoho Mail'
-                elif 'protonmail.' in joined_mx:
-                    provider = 'ProtonMail'
-                elif 'ukr.net' in joined_mx:
-                    provider = 'Ukr.net'
+    dom_lock = _DNS_DOMAIN_LOCKS.setdefault(domain, asyncio.Lock())
+    async with dom_lock:
+        if domain in DNS_MEMORY_CACHE:
+            provider, has_spf, err_code = DNS_MEMORY_CACHE[domain]
+        else:
+            provider = None
+            has_spf = False
+            mx_data, err_code = await query_doh_json(client, domain, 'MX')
+            if mx_data is not None:
+                answers = mx_data.get('Answer', [])
+                mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type') == 15]
+                if mx_hosts:
+                    joined_mx = ' '.join(mx_hosts)
+                    if 'google.com' in joined_mx or 'googlemail.com' in joined_mx:
+                        provider = 'Google' if is_public_webmail else 'Google Workspace'
+                    elif 'outlook.com' in joined_mx or 'protection.outlook.com' in joined_mx:
+                        provider = 'Microsoft' if is_public_webmail else 'Microsoft 365'
+                    elif 'pphosted.com' in joined_mx or 'proofpoint' in joined_mx:
+                        provider = 'Proofpoint Enterprise'
+                    elif 'mimecast.com' in joined_mx:
+                        provider = 'Mimecast Enterprise'
+                    elif 'barracudanetworks.com' in joined_mx:
+                        provider = 'Barracuda Gateway'
+                    elif 'route.mx.cloudflare.net' in joined_mx:
+                        provider = 'Cloudflare Email'
+                    elif 'zoho.' in joined_mx:
+                        provider = 'Zoho Mail'
+                    elif 'protonmail.' in joined_mx:
+                        provider = 'ProtonMail'
+                    elif 'ukr.net' in joined_mx:
+                        provider = 'Ukr.net'
+                    else:
+                        provider = mx_hosts[0].split()[-1].rstrip('.')
                 else:
-                    provider = mx_hosts[0].split()[-1].rstrip('.')
-            else:
-                err_code = 'dns_no_mx_records'
+                    err_code = 'dns_no_mx_records'
 
-            txt_data, _ = await query_doh_json(client, domain, 'TXT')
-            if txt_data is not None:
-                txt_ans = [str(a.get('data', '')).lower() for a in txt_data.get('Answer', [])]
-                has_spf = any('v=spf1' in t for t in txt_ans)
+                txt_data, _ = await query_doh_json(client, domain, 'TXT')
+                if txt_data is not None:
+                    txt_ans = [str(a.get('data', '')).lower() for a in txt_data.get('Answer', [])]
+                    has_spf = any('v=spf1' in t for t in txt_ans)
 
-        DNS_MEMORY_CACHE[domain] = (provider, has_spf, err_code)
+            # Кешуємо лише підтверджені результати (provider знайдено або точно немає MX записів)
+            if provider or err_code == 'dns_no_mx_records':
+                DNS_MEMORY_CACHE[domain] = (provider, has_spf, err_code)
 
     if provider:
         spf_tag = 'SPF_present' if has_spf else 'SPF_missing'
@@ -389,11 +415,6 @@ def classify_email_source_type_and_note(
     email_source_url: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None]:
-    """
-    Визначає email_source_type та детальну примітку email_source_note.
-    Bug 6 (P1) fix: Якщо домен пошти є бренд-аліасом і відрізняється від домену сторінки
-    (напр. support@sendpulse.com на sendpulse.ua), явно вказує це у примітці.
-    """
     if not best_email or not email_source_url:
         return None, None
     em_low = best_email.lower()
@@ -665,18 +686,28 @@ def extract_valid_phones(
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
+    """
+    Класифікує джерело DM. Для європейських Impressum / Mentions Légales повертає
+    канонічний високодовірчий тип 'impressum_page' (окремо від низькопріоритетних оферт/terms).
+    """
     if not dm_source_url:
         return None
     path_low = urlparse(dm_source_url).path.lower()
-    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders')):
+    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders', '/zespol', '/equipe')):
         return 'team_page'
-    if any(k in path_low for k in ('/about', '/pro-nas', '/o-nas', '/company', '/our-story', '/uber-uns')):
+    if IMPRESSUM_CANONICAL_PATH_REGEX.search(path_low):
+        return 'impressum_page'
+    if any(k in path_low for k in (
+        '/about', '/pro-nas', '/o-nas', '/company', '/our-story',
+        '/uber-uns', '/ueber-uns', '/qui-sommes-nous', '/a-propos',
+        '/quienes-somos', '/chi-siamo', '/over-ons', '/o-firmie', '/om-oss'
+    )):
         return 'about_page'
     if DM_LEGAL_SOURCE_FLAG.search(path_low):
         return 'legal_or_offer_page'
     if any(k in path_low for k in ('/blog', '/news', '/article', '/post', '/media', '/press')):
         return 'blog_or_press_page'
-    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
+    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/', '/de/', '/fr/', '/pl/', '/es/', '/it/', '/nl/'):
         return 'homepage'
     return 'product_or_service_page'
 
@@ -741,6 +772,13 @@ def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: 
     return False
 
 
+def is_low_trust_legal_offer_page(path: str) -> bool:
+    """Повертає True лише для оферт/terms/договорів, але НЕ для канонічного європейського Impressum."""
+    if IMPRESSUM_CANONICAL_PATH_REGEX.search(path):
+        return False
+    return bool(DM_LEGAL_SOURCE_FLAG.search(path))
+
+
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None]:
@@ -760,6 +798,7 @@ def extract_decision_maker_deep(
         type_bonus = {
             'team_page': 30,
             'about_page': 25,
+            'impressum_page': 25,
             'homepage': 15,
             'product_or_service_page': 10,
             'blog_or_press_page': 5,
@@ -771,7 +810,7 @@ def extract_decision_maker_deep(
             role_bonus = -10
         elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
             role_bonus = 20
-        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner')):
+        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner', 'managing director')):
             role_bonus = 15
         else:
             role_bonus = 5
@@ -787,7 +826,8 @@ def extract_decision_maker_deep(
         })
 
     for page_url, html, _ in pages_with_urls:
-        if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
+        url_path = urlparse(page_url).path
+        if DM_SOURCE_BLACKLIST.search(url_path):
             continue
 
         soup = BeautifulSoup(html, 'lxml')
@@ -818,7 +858,7 @@ def extract_decision_maker_deep(
                             cand = strip_role_tokens_from_name(str(val['name']))
                             role = normalize_executive_role(str(val.get('jobTitle') or default_role))
                             if is_valid_person_name(cand):
-                                is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
+                                is_leg = is_low_trust_legal_offer_page(url_path)
                                 add_dm_candidate(cand, role, page_url, is_leg, 40)
                         elif isinstance(val, list):
                             for sub in val:
@@ -826,15 +866,16 @@ def extract_decision_maker_deep(
                                     cand = strip_role_tokens_from_name(str(sub['name']))
                                     role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
                                     if is_valid_person_name(cand):
-                                        is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
+                                        is_leg = is_low_trust_legal_offer_page(url_path)
                                         add_dm_candidate(cand, role, page_url, is_leg, 40)
             except Exception:
                 continue
 
     for page_url, html, _ in pages_with_urls:
-        if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
+        url_path = urlparse(page_url).path
+        if DM_SOURCE_BLACKLIST.search(url_path):
             continue
-        is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
+        is_leg = is_low_trust_legal_offer_page(url_path)
 
         clean_soup = BeautifulSoup(html, 'lxml')
         dm_clean_text = strip_testimonial_elements_and_get_clean_text(clean_soup)
@@ -856,9 +897,10 @@ def extract_decision_maker_deep(
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
     for page_url, _, page_text in pages_with_urls:
-        if DM_SOURCE_BLACKLIST.search(urlparse(page_url).path):
+        url_path = urlparse(page_url).path
+        if DM_SOURCE_BLACKLIST.search(url_path):
             continue
-        is_leg = bool(DM_LEGAL_SOURCE_FLAG.search(urlparse(page_url).path))
+        is_leg = is_low_trust_legal_offer_page(url_path)
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             if is_valid_person_name(cand_name):
