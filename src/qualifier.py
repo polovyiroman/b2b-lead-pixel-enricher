@@ -30,21 +30,38 @@ def classify_company_category(
     text = f'{domain} {page_title} {meta_desc}'.lower()
     html_low = html_sample[:15000].lower()
 
+    # P1 Blocker 3: Мультимовні маркери маркетингових та диджитал-агенцій (UA/EN/DE/FR/ES/IT/NL/PL/PT/Nordic)
     agency_keywords = (
         'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
         'онлайн-маркетинг', 'маркетингова агенція', 'seo agency', 'ppc agency',
         'web studio', 'веб-студія', 'розробка сайтів', 'software development',
-        'медіа про інтернет-маркетинг', 'performance marketing agency', 'агентство інтернет-маркетингу'
+        'медіа про інтернет-маркетинг', 'performance marketing agency', 'агентство інтернет-маркетингу',
+        'werbeagentur', 'digitalagentur', 'marketingagentur', 'online-marketing-agentur', 'seo-agentur',
+        'agence digitale', 'agence web', 'agence marketing', 'agence de communication', 'agence seo',
+        'agencia de marketing', 'agencia digital', 'agencia seo', 'agencia de publicidad',
+        'agenzia web', 'agenzia di marketing', 'agenzia digitale', 'agenzia comunicazione',
+        'marketingbureau', 'internetbureau', 'online marketing bureau', 'mediabureau',
+        'agencja marketingowa', 'agencja interaktywna', 'agencja seo', 'agencja reklamowa',
+        'agência digital', 'agência de marketing', 'webbyrå', 'reklambyrå', 'kommunikationsbyrå', 'mediebyrå'
     )
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
 
+    # P1 Blocker 3: Мультимовні маркери E-commerce та ритейлу (UA/EN/DE/FR/ES/IT/NL/PL/PT/Nordic)
     ecom_keywords = (
         'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
         'shop', 'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
         'бренд взуття', 'жіночого одягу', 'женского белья', 'каталог товарів',
         'checkout', 'add to cart', 'кошик', 'shoes', 'apparel', 'clothing',
-        'млн товарів', 'знижки до', 'кешбек', 'доставка ліків', 'замовити ліки'
+        'млн товарів', 'знижки до', 'кешбек', 'доставка ліків', 'замовити ліки',
+        'onlineshop', 'online-shop', 'warenkorb', 'versandkostenfrei', 'jetzt kaufen', 'bestellen',
+        'boutique en ligne', 'livraison gratuite', 'panier', 'acheter en ligne', 'magasin en ligne',
+        'tienda online', 'carrito', 'envío gratis', 'comprar online', 'tienda en línea',
+        'negozio online', 'carrello', 'spedizione gratuita', 'acquista online', 'shopping online',
+        'webwinkel', 'webshop', 'winkelwagen', 'gratis verzending', 'bestel online',
+        'sklep internetowy', 'koszyk', 'darmowa dostawa', 'kup teraz', 'zakupy online',
+        'loja online', 'frete grátis', 'carrinho', 'comprar agora',
+        'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv'
     )
     has_product_schema = (
         '"@type":"product"' in html_low
@@ -64,7 +81,9 @@ def classify_company_category(
         'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app',
         'call tracking', 'колтрекінг', 'business phone', 'virtual pbx', 'telephony',
         'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
-        'email service', 'automation service', 'chatbot'
+        'email service', 'automation service', 'chatbot', 'cloud-lösung', 'softwarelösung',
+        'logiciel saas', 'plateforme cloud', 'software de gestión', 'piattaforma cloud',
+        'oprogramowanie dla firm', 'system crm'
     )
     if any(k in text for k in saas_keywords):
         return 'SaaS / Marketplace / Tech Platform', 'high'
@@ -76,15 +95,24 @@ def classify_company_category(
         or any(t in detected_tech for t in ('Google Ads Conversion', 'LinkedIn Insight Tag', 'Meta Pixel', 'TikTok Pixel', 'Intercom'))
     )
     is_explicit_npo = (
-        domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua'))
-        or 'благодійний фонд' in text
-        or 'charitable foundation' in text
-        or 'громадська організація' in text
+        domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua', '.gob.es', '.gouv.fr'))
+        or any(
+            phrase in text for phrase in (
+                'благодійний фонд', 'charitable foundation', 'громадська організація',
+                'gemeinnützige', 'eingetragener verein', 'association loi 1901',
+                'fundación sin ánimo de lucro', 'fondazione onlus', 'stichting',
+                'fundacja', 'stowarzyszenie', 'allmännyttig stiftelse'
+            )
+        )
     )
 
     if is_explicit_npo or (
         not has_commercial_stack and any(
-            w in text for w in ('університет', 'university', 'college', 'академія', 'інститут', 'ngo')
+            w in text for w in (
+                'університет', 'university', 'college', 'академія', 'інститут', 'ngo',
+                'universität', 'hochschule', 'université', 'universidad', 'università',
+                'universiteit', 'uniwersytet', 'universidade'
+            )
         )
     ):
         return 'Non-Profit / Education / Institution', 'high' if is_explicit_npo else 'medium'
@@ -99,15 +127,40 @@ def classify_company_category(
 
 def build_linkedin_xray_query(canonical_domain: str, company_category: str = '') -> str:
     brand_root = canonical_domain.split('.')[0].capitalize()
+    dom_low = canonical_domain.lower()
+
     if company_category == 'Non-Profit / Education / Institution':
         return (
             f'site:linkedin.com/in ("{canonical_domain}" OR "{brand_root}") '
-            f'("Директор" OR "Голова правління" OR "Ректор" OR "Director" OR "Board Member" OR "Founder")'
+            f'("Директор" OR "Голова правління" OR "Ректор" OR "Director" OR "Board Member" OR "Founder" OR "Vorstand")'
         )
+
+    # Локалізовані пошукові ролі для європейських доменів
+    if dom_low.endswith(('.de', '.at', '.ch')):
+        local_roles = ' OR "Geschäftsführer" OR "Marketingleiter" OR "Inhaber" OR "Gründer"'
+    elif dom_low.endswith('.fr'):
+        local_roles = ' OR "Directeur Marketing" OR "PDG" OR "Directeur Général" OR "Fondateur"'
+    elif dom_low.endswith('.es'):
+        local_roles = ' OR "Director de Marketing" OR "Director General" OR "Fundador"'
+    elif dom_low.endswith('.it'):
+        local_roles = ' OR "Direttore Marketing" OR "Amministratore Delegato" OR "Fondatore"'
+    elif dom_low.endswith(('.nl', '.be')):
+        local_roles = ' OR "Algemeen Directeur" OR "Marketing Directeur" OR "Oprichter" OR "Eigenaar"'
+    elif dom_low.endswith('.pl'):
+        local_roles = ' OR "Prezes Zarządu" OR "Dyrektor Marketingu" OR "Właściciel" OR "Założyciel"'
+    elif dom_low.endswith('.pt'):
+        local_roles = ' OR "Diretor de Marketing" OR "Diretor Geral" OR "Sócio-Gerente"'
+    elif dom_low.endswith(('.se', '.no', '.dk', '.fi')):
+        local_roles = ' OR "Marknadschef" OR "VD" OR "Grundare" OR "Daglig leder"'
+    elif dom_low.endswith('.ua'):
+        local_roles = ' OR "Директор з маркетингу" OR "Засновник" OR "Власник"'
+    else:
+        local_roles = ''
+
     return (
         f'site:linkedin.com/in ("{canonical_domain}" OR "{brand_root}") '
         f'("CMO" OR "Chief Marketing Officer" OR "Head of Marketing" OR "Marketing Director" '
-        f'OR "Head of E-commerce" OR "Founder" OR "CEO")'
+        f'OR "Head of E-commerce" OR "Founder" OR "CEO"{local_roles})'
     )
 
 
@@ -174,7 +227,6 @@ def evaluate_qualification_v180(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # Bug 2 (P0.5): Чітке відображення partial_gtm та partial_timeout у technical_signal_strength
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
@@ -205,7 +257,7 @@ def evaluate_qualification_v180(
 
     source_extra_note = ''
     if dm_source_is_legal:
-        source_extra_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.'
+        source_extra_note = ' DM identified from legal/offer document (ФОП / Impressum) — verify active role via LinkedIn before outbound.'
     elif dm_source_type in ('product_or_service_page', 'blog_or_press_page'):
         source_extra_note = f' DM identified on {dm_source_type} — verify active role via LinkedIn.'
 
