@@ -389,10 +389,25 @@ def classify_email_source_type_and_note(
     email_source_url: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None]:
+    """
+    Визначає email_source_type та детальну примітку email_source_note.
+    Bug 6 (P1) fix: Якщо домен пошти є бренд-аліасом і відрізняється від домену сторінки
+    (напр. support@sendpulse.com на sendpulse.ua), явно вказує це у примітці.
+    """
     if not best_email or not email_source_url:
         return None, None
     em_low = best_email.lower()
-    path_low = urlparse(email_source_url).path.lower()
+    em_dom = em_low.split('@', 1)[1] if '@' in em_low else ''
+    parsed_src = urlparse(email_source_url)
+    src_host = re.sub(r':\d+$', '', parsed_src.netloc.lower().replace('www.', ''))
+    path_low = parsed_src.path.lower()
+
+    alias_suffix = ''
+    if em_dom and src_host and em_dom != src_host and not em_dom.endswith(f'.{src_host}'):
+        if em_dom in PUBLIC_WEBMAIL_DOMAINS:
+            alias_suffix = f', mailbox hosted on public webmail ({em_dom})'
+        else:
+            alias_suffix = f', mailbox on brand alias {em_dom}'
 
     in_footer = False
     for p_url, html, _ in pages_with_urls:
@@ -416,32 +431,34 @@ def classify_email_source_type_and_note(
     if in_footer:
         return (
             'site_footer',
-            f'Found in site footer/navigation on {email_source_url} ({best_email_type})'
+            f'Found in site footer/navigation on {email_source_url} ({best_email_type}){alias_suffix}'
         )
 
     if any(k in path_low for k in ('contact', 'kontakt', 'kontakty', 'impressum', 'get-in-touch')):
-        return 'contact_page', f'Published on dedicated contact page ({email_source_url})'
+        return 'contact_page', f'Published on dedicated contact page ({email_source_url}){alias_suffix}'
 
     if DM_LEGAL_SOURCE_FLAG.search(path_low) or 'privacy' in path_low or 'terms' in path_low:
         if best_email_type in ('general_office_inbox', 'b2b_partnerships', 'wholesale_or_sales_inbox', 'customer_support_inbox'):
             return (
                 'site_footer',
-                f'General/B2B inbox ({best_email}) listed on {path_low} (safe for gatekeeper/routing)'
+                f'General/B2B inbox ({best_email}) listed on {path_low} (safe for gatekeeper/routing){alias_suffix}'
             )
-        return 'legal_or_terms_page', f'Listed on legal/terms page ({path_low})'
+        return 'legal_or_terms_page', f'Listed on legal/terms page ({path_low}){alias_suffix}'
 
     if any(k in path_low for k in ('support', 'help', 'care', 'faq')):
         if best_email_type == 'b2b_partnerships':
             return (
                 'support_or_footer',
-                f'B2B/Corporate partnership email ({best_email}) listed in contact directory on {path_low}'
+                f'B2B/Corporate partnership email ({best_email}) listed in contact directory on {path_low}{alias_suffix}'
             )
-        return 'support_or_footer', f'Listed on support/help directory page ({path_low})'
+        return 'support_or_footer', f'Listed on support/help directory page ({path_low}){alias_suffix}'
 
     if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
+        if alias_suffix:
+            return 'homepage', f'Published on {src_host} homepage{alias_suffix}'
         return 'homepage', 'Published directly on homepage'
 
-    return 'page_body', f'Extracted from page body ({path_low})'
+    return 'page_body', f'Extracted from page body ({path_low}){alias_suffix}'
 
 
 def extract_named_email_owner_hint(
