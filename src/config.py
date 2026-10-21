@@ -74,7 +74,6 @@ GTM_FALSE_POSITIVES = {
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
-# P1 Blocker 1: Мультимовний патерн ролей (EN + UA + DE + FR + ES + IT + NL + PL + PT + Nordic)
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
     r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
@@ -141,7 +140,22 @@ UI_ACTION_WORDS_BLACKLIST = {
     'команда', 'кейс', 'відгук', 'клієнт', 'партнер', 'модератор', 'ведучий',
     'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article',
     'client', 'building', 'link', 'seo', 'ppc', 'smm', 'growth', 'team', 'about',
-    'mehr', 'weiterlesen', 'kontakt', 'impressum', 'lire', 'suite', 'ver', 'más'
+    'mehr', 'weiterlesen', 'kontakt', 'impressum', 'lire', 'suite', 'ver', 'más',
+    'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere'
+}
+
+# Bug 8 Fix: Чорний список префіксів корпоративних департаментів та функцій (EN/DE/FR/IT/NL/PL)
+DEPARTMENT_PREFIX_BLACKLIST = {
+    'compliance', 'sustainability', 'communications', 'communication', 'corporate',
+    'legal', 'finance', 'investor', 'relations', 'human', 'resources', 'public',
+    'affairs', 'customer', 'experience', 'product', 'operations', 'marketing',
+    'sales', 'support', 'service', 'press', 'media', 'group', 'holding', 'retail',
+    'commerce', 'fashion', 'technology', 'innovation', 'governance', 'responsibility',
+    'nachhaltigkeit', 'strategie', 'verantwortung', 'aufsichtsrat', 'vorstand',
+    'beirat', 'presse', 'kommunikation', 'datenschutz', 'unternehmenskommunikation',
+    'recht', 'finanzen', 'personal', 'einkauf', 'vertrieb', 'logistik', 'konzern',
+    'gruppe', 'unternehmen', 'immer', 'durabilité', 'stratégie', 'responsabilité',
+    'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa'
 }
 
 ROLE_TOKEN_BLACKLIST = {
@@ -162,6 +176,7 @@ ROLE_TOKEN_BLACKLIST = {
     'marknadschef', 'stifter', 'ejer'
 }
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
+ROLE_TOKEN_BLACKLIST.update(DEPARTMENT_PREFIX_BLACKLIST)
 
 ROLE_WORDS_IN_CONTEXT = (
     'manager', 'менеджер', 'sales', 'sales manager', 'director', 'директор',
@@ -299,6 +314,7 @@ ROLE_NORMALIZATION_MAP = {
     'managing partner': 'Managing Partner'
 }
 
+# Bug 8 Fix: Розширений словник STOP_NAME_WORDS для відсікання департаментів та заголовків у німецькому/EU Impressum
 STOP_NAME_WORDS = {
     'Інтернет', 'Магазин', 'Онлайн', 'Бренд', 'Компанія', 'Агентство', 'Агенція',
     'Політика', 'Конфіденційності', 'Умови', 'Доставка', 'Оплата', 'Контакти',
@@ -316,7 +332,21 @@ STOP_NAME_WORDS = {
     'Aviso', 'Legal', 'Privacidad', 'Términos', 'Condiciones', 'Sociedad', 'Limitada',
     'Informativa', 'Sulla', 'Partita', 'Regulamin', 'Polityka', 'Prywatności',
     'Spółka', 'ZOO', 'GmbH', 'AG', 'KG', 'OHG', 'GbR', 'UG', 'SARL', 'SAS', 'SASU',
-    'BV', 'NV', 'AB', 'ApS', 'AS', 'Oy', 'SRL', 'SPA', 'SL'
+    'BV', 'NV', 'AB', 'ApS', 'AS', 'Oy', 'SRL', 'SPA', 'SL',
+    # EN corporate functions & generic nouns
+    'Compliance', 'Sustainability', 'Communications', 'Communication', 'Corporate',
+    'Finance', 'Investor', 'Relations', 'Human', 'Resources', 'Public', 'Affairs',
+    'Experience', 'Product', 'Operations', 'Group', 'Holding', 'Retail', 'Commerce',
+    'Fashion', 'Management', 'Board', 'Committee', 'Council', 'Division', 'Solutions',
+    # DE corporate & common Impressum words
+    'Nachhaltigkeit', 'Strategie', 'Verantwortung', 'Aufsichtsrat', 'Vorstand',
+    'Beirat', 'Presse', 'Kommunikation', 'Unternehmenskommunikation', 'Recht',
+    'Finanzen', 'Personal', 'Einkauf', 'Immer', 'Schritt', 'Voraus', 'Konzern',
+    'Gruppe', 'Unternehmen', 'Überblick', 'Themen', 'Karriere', 'Zukunft',
+    # FR
+    'Durabilité', 'Stratégie', 'Responsabilité', 'Presse', 'Groupe', 'Entreprise',
+    # IT
+    'Sostenibilità', 'Strategia', 'Responsabilità', 'Comunicazione', 'Stampa', 'Gruppo'
 }
 
 UA_TO_LATIN = {
@@ -368,7 +398,6 @@ JUNK_EXTENSIONS = (
     '.pdf', '.zip', '.rar', '.xml', '.json', '.docx', '.xlsx'
 )
 
-# P1 Blocker 2: Розширені мультимовні префікси поштових скриньок (EN + UA + DE + FR + ES + IT + NL + PL + PT + Nordic)
 MARKETING_EXEC_PREFIXES = (
     'marketing', 'cmo', 'digital', 'growth', 'ecommerce', 'e-commerce',
     'performance', 'ppc', 'seo', 'analytics', 'ceo', 'founder', 'owner',
@@ -569,7 +598,7 @@ KNOWN_MARKETPLACE_DOMAINS = {
     'answear.ua', 'answear.com', 'answear.pl', 'kasta.ua', 'modnakasta.ua', 'rozetka.com.ua',
     'comfy.ua', 'intertop.ua', 'epicentrk.ua', 'allo.ua', 'foxtrot.com.ua',
     'prom.ua', 'shafa.ua', 'liki24.com', 'makeup.com.ua', 'eva.ua',
-    'allegro.pl', 'zalando.de', 'zalando.fr', 'otto.de', 'bol.com', 'cdiscount.com', 'fnac.com'
+    'allegro.pl', 'zalando.de', 'zalando.fr', 'aboutyou.de', 'otto.de', 'bol.com', 'cdiscount.com', 'fnac.com'
 }
 
 KNOWN_DOMAIN_REDIRECT_ALIASES = {
@@ -579,7 +608,7 @@ KNOWN_DOMAIN_REDIRECT_ALIASES = {
 MARKETPLACE_TEXT_MARKERS = (
     'більше 500 брендів', 'понад 9 млн товарів', 'мільйони товарів', 'маркетплейс',
     'marketplace', 'multi-brand', 'мультибрендовий', 'сотні брендів', 'тисячі брендів',
-    'tausende marken', 'marktplatz', 'plus de 500 marques', 'multimarque',
+    'tausende marken', 'top-marken', 'marktplatz', 'plus de 500 marques', 'multimarque',
     'multimarca', 'ponad 500 marek', 'setki marek'
 )
 
