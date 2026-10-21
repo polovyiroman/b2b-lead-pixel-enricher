@@ -30,7 +30,6 @@ def classify_company_category(
     text = f'{domain} {page_title} {meta_desc}'.lower()
     html_low = html_sample[:15000].lower()
 
-    # P1 Blocker 3: Мультимовні маркери маркетингових та диджитал-агенцій (UA/EN/DE/FR/ES/IT/NL/PL/PT/Nordic)
     agency_keywords = (
         'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
         'онлайн-маркетинг', 'маркетингова агенція', 'seo agency', 'ppc agency',
@@ -47,7 +46,6 @@ def classify_company_category(
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
 
-    # P1 Blocker 3: Мультимовні маркери E-commerce та ритейлу (UA/EN/DE/FR/ES/IT/NL/PL/PT/Nordic)
     ecom_keywords = (
         'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
         'shop', 'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
@@ -125,9 +123,18 @@ def classify_company_category(
     return 'General Business / Corporate', 'medium'
 
 
-def build_linkedin_xray_query(canonical_domain: str, company_category: str = '') -> str:
+def build_linkedin_xray_query(
+    canonical_domain: str,
+    company_category: str = '',
+    country_hint: str = ''
+) -> str:
+    """
+    Bug 5 Fix: Враховує як TLD домену, так і country_hint (визначений за мовою сайту/телефоном),
+    щоб українські та європейські бренди на .com (напр. cher17.com) отримували локалізовані ролі.
+    """
     brand_root = canonical_domain.split('.')[0].capitalize()
     dom_low = canonical_domain.lower()
+    hint_up = (country_hint or '').upper().strip()
 
     if company_category == 'Non-Profit / Education / Institution':
         return (
@@ -135,24 +142,23 @@ def build_linkedin_xray_query(canonical_domain: str, company_category: str = '')
             f'("Директор" OR "Голова правління" OR "Ректор" OR "Director" OR "Board Member" OR "Founder" OR "Vorstand")'
         )
 
-    # Локалізовані пошукові ролі для європейських доменів
-    if dom_low.endswith(('.de', '.at', '.ch')):
+    if dom_low.endswith(('.de', '.at', '.ch')) or hint_up in ('DE', 'AT', 'CH'):
         local_roles = ' OR "Geschäftsführer" OR "Marketingleiter" OR "Inhaber" OR "Gründer"'
-    elif dom_low.endswith('.fr'):
+    elif dom_low.endswith('.fr') or hint_up == 'FR':
         local_roles = ' OR "Directeur Marketing" OR "PDG" OR "Directeur Général" OR "Fondateur"'
-    elif dom_low.endswith('.es'):
+    elif dom_low.endswith('.es') or hint_up == 'ES':
         local_roles = ' OR "Director de Marketing" OR "Director General" OR "Fundador"'
-    elif dom_low.endswith('.it'):
+    elif dom_low.endswith('.it') or hint_up == 'IT':
         local_roles = ' OR "Direttore Marketing" OR "Amministratore Delegato" OR "Fondatore"'
-    elif dom_low.endswith(('.nl', '.be')):
+    elif dom_low.endswith(('.nl', '.be')) or hint_up in ('NL', 'BE'):
         local_roles = ' OR "Algemeen Directeur" OR "Marketing Directeur" OR "Oprichter" OR "Eigenaar"'
-    elif dom_low.endswith('.pl'):
+    elif dom_low.endswith('.pl') or hint_up == 'PL':
         local_roles = ' OR "Prezes Zarządu" OR "Dyrektor Marketingu" OR "Właściciel" OR "Założyciel"'
-    elif dom_low.endswith('.pt'):
+    elif dom_low.endswith('.pt') or hint_up == 'PT':
         local_roles = ' OR "Diretor de Marketing" OR "Diretor Geral" OR "Sócio-Gerente"'
-    elif dom_low.endswith(('.se', '.no', '.dk', '.fi')):
+    elif dom_low.endswith(('.se', '.no', '.dk', '.fi')) or hint_up in ('SE', 'NO', 'DK', 'FI'):
         local_roles = ' OR "Marknadschef" OR "VD" OR "Grundare" OR "Daglig leder"'
-    elif dom_low.endswith('.ua'):
+    elif dom_low.endswith('.ua') or hint_up == 'UA':
         local_roles = ' OR "Директор з маркетингу" OR "Засновник" OR "Власник"'
     else:
         local_roles = ''
@@ -661,7 +667,7 @@ def build_manual_seed_record(
         'detected_cms': seed.get('detected_cms'),
         'consent_mode_likely': bool(seed.get('consent_mode_likely', False)),
         'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
-        'has_google_ads_confidence': 'verified',
+        'has_google_ads_confidence': 'verified_present' if tech_info['has_google_ads'] else 'verified_absent',
         'sales_opportunity': sales_opportunity,
         'next_best_action': next_best_action,
         'technology_evidence_summary': tech_info['technology_evidence_summary'],
