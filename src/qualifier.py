@@ -174,19 +174,26 @@ def evaluate_qualification_v180(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
+    # Bug 2 (P0.5): Чітке відображення partial_gtm та partial_timeout у technical_signal_strength
     if len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
             "(Verified in HTML/GTM; confirms tracking infrastructure, not current ad spend)"
         )
     elif len(ad_tags) == 1:
-        partial_note = ' (Partial scan due to browser timeout — GA4/GTM unverified)' if scan_comp != 'full' else ' (Secondary tags not found in static HTML/GTM or gated by Cookie Consent)'
+        if scan_comp == 'partial_gtm':
+            partial_note = ' (Partial GTM macro unpack — secondary ad tags may be server-side or consent-gated)'
+        elif scan_comp != 'full':
+            partial_note = ' (Partial scan due to browser timeout — GA4/GTM unverified)'
+        else:
+            partial_note = ' (Secondary tags not found in static HTML/GTM or gated by Cookie Consent)'
         tech_signal = f"Moderate Stack Maturity: Single ad pixel ({ad_tags[0]}) detected{partial_note}"
     elif analytics_tags:
-        tech_signal = (
-            f"Basic Analytics Only ({', '.join(analytics_tags)}) — "
-            "ad pixels not found in static HTML/GTM (not proof of absence if server-side/consent-gated)"
-        )
+        if scan_comp == 'partial_gtm':
+            gtm_note = 'partial GTM macro unpack; ad pixels likely server-side (sGTM) or consent-gated'
+        else:
+            gtm_note = 'ad pixels not found in static HTML/GTM (not proof of absence if server-side/consent-gated)'
+        tech_signal = f"Basic Analytics Only ({', '.join(analytics_tags)}) — {gtm_note}"
     else:
         tech_signal = (
             'Low / Unverified Tech Signal: No tracking tags found in static HTML '
@@ -308,6 +315,12 @@ def evaluate_qualification_v180(
         elif pw_blocked_by_waf:
             enrichment_status = 'playwright_blocked_by_waf_needs_residential_proxy'
             confidence_warning = f'Warning: Deep browser scan blocked by WAF ({pw_status_str}); retry with residential proxy or enrich via LinkedIn.'
+        elif pw_status_str == 'rendered':
+            enrichment_status = 'lead_form_only_no_public_contacts'
+            confidence_warning = (
+                'Warning: Zero public emails/phones on site (contact info gated behind interactive lead forms only — '
+                'not scanner failure); requires external B2B enrichment.'
+            )
         else:
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
@@ -453,7 +466,8 @@ def build_manual_seed_record(
     cat = seed.get('company_category', 'E-commerce / Retail Brand')
     cat_conf = seed.get('category_confidence', 'high')
     best_email = seed.get('best_email')
-    best_email_type = seed.get('best_email_type') or classify_email_type(best_email, canonical_domain.split('.')[0])
+    brand_token = canonical_domain.split('.')[0].lower()
+    best_email_type = seed.get('best_email_type') or classify_email_type(best_email, brand_token)
     primary_phone = seed.get('primary_phone')
     dm_name = seed.get('decision_maker_name')
     dm_role = seed.get('decision_maker_role')
@@ -511,6 +525,21 @@ def build_manual_seed_record(
         'not_attempted_manual_seed'
     )
 
+    deliv_str = seed.get(
+        'email_deliverability_check',
+        'domain_accepts_email (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
+    )
+    raw_all_emails = seed.get('all_emails') or best_email or ''
+    seed_emails_list = [e.strip() for e in raw_all_emails.split(';') if e.strip()]
+    all_emails_class_str = (
+        '; '.join(f'{em} ({classify_email_type(em, brand_token)})' for em in seed_emails_list)
+        if seed_emails_list else None
+    )
+    all_emails_deliv_str = (
+        '; '.join(f'{em}: {deliv_str}' for em in seed_emails_list[:3])
+        if seed_emails_list else None
+    )
+
     return {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -552,10 +581,9 @@ def build_manual_seed_record(
         'email_source_type': seed.get('email_source_type', 'contact_page'),
         'email_source_note': seed.get('email_source_note', 'Verified via manual audit seed'),
         'named_email_owner_role_hint': None,
-        'email_deliverability_check': seed.get(
-            'email_deliverability_check',
-            'domain_accepts_email (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
-        ),
+        'email_deliverability_check': deliv_str,
+        'all_emails_deliverability': all_emails_deliv_str,
+        'all_emails_classification': all_emails_class_str,
         'email_source_url': seed.get('email_source_url', clean_website_url),
         'primary_phone': primary_phone,
         'e164_phone': seed.get('e164_phone') or (re.sub(r'[\s\-()]', '', primary_phone) if primary_phone else None),
@@ -581,6 +609,7 @@ def build_manual_seed_record(
         'detected_cms': seed.get('detected_cms'),
         'consent_mode_likely': bool(seed.get('consent_mode_likely', False)),
         'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
+        'has_google_ads_confidence': 'verified',
         'sales_opportunity': sales_opportunity,
         'next_best_action': next_best_action,
         'technology_evidence_summary': tech_info['technology_evidence_summary'],
