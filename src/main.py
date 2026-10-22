@@ -15,6 +15,7 @@ from .config import (
     EU_GDPR_TLDS,
     EVERGREEN_MAX_AGE_DAYS,
     GTM_ID_REGEX,
+    KNOWN_JURISDICTION_HINTS,
     KNOWN_MARKETPLACE_DOMAINS,
     MIN_COMPATIBLE_CACHE_SCHEMA,
     PUBLIC_WEBMAIL_DOMAINS,
@@ -91,16 +92,24 @@ EU_PHONE_PREFIXES = (
     '+30', '+359', '+385', '+370', '+371', '+372', '+386', '+352'
 )
 
+KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
+    'bol.com': 'NL',
+    'coolblue.nl': 'NL',
+    'liki24.com': 'UA',
+    'ringostat.com': 'UA',
+    'cher17.com': 'UA',
+    'ottogroup.com': 'DE',
+    'aboutyou.de': 'DE',
+    'zalando.de': 'DE',
+    'otto.de': 'DE',
+    'docmorris.de': 'DE',
+    'asos.com': 'GB',
+    'laredoute.fr': 'FR',
+    'unicredit.it': 'IT',
+}
+
 
 def _contact_link_priority(url: str) -> tuple[int, int]:
-    """
-    Bug 16 Fix: Пріоритет сортування внутрішніх контактних сторінок:
-    0 - impressum / mentions-legales / aviso-legal (канонічне джерело CEO у ЄС)
-    1 - contact / kontakt / kontakty
-    2 - team / leadership / komanda
-    3 - about / ueber-uns / pro-nas
-    4 - інші шляхи
-    """
     path = urlparse(url).path.lower()
     if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return (0, len(path))
@@ -115,6 +124,8 @@ def _contact_link_priority(url: str) -> tuple[int, int]:
 
 def _guess_region_from_domain(canonical_domain: str, html_sample: str = '') -> str | None:
     dom_low = (canonical_domain or '').lower()
+    if dom_low in KNOWN_DOMAIN_COUNTRY_HINTS:
+        return KNOWN_DOMAIN_COUNTRY_HINTS[dom_low]
     if dom_low.endswith('.ua'):
         return 'UA'
     if dom_low.endswith('.de'):
@@ -202,8 +213,14 @@ def _derive_gdpr_jurisdiction(
     content_lang_hint: str = '',
     html_sample: str = ''
 ) -> str:
+    """
+    Patch D (Issue 19 Fix): Визначає юрисдикцію з підтримкою KNOWN_JURISDICTION_HINTS
+    на першому кроці, щоб bol.com -> EU_EEA_GDPR та liki24.com -> UA_PDP працювали навіть при WAF-блокуванні.
+    """
     dom_low = (canonical_domain or '').lower()
-    if dom_low.endswith(('.uk', '.co.uk')) or dom_low == 'asos.com':
+    if dom_low in KNOWN_JURISDICTION_HINTS:
+        return KNOWN_JURISDICTION_HINTS[dom_low]
+    if dom_low.endswith(('.uk', '.co.uk')):
         return 'UK_GDPR'
     if dom_low.endswith('.ch'):
         return 'CH_FADP'
@@ -300,6 +317,8 @@ def detect_country_hint(
     html_sample: str = ''
 ) -> str:
     dom_low = canonical_domain.lower()
+    if dom_low in KNOWN_DOMAIN_COUNTRY_HINTS:
+        return KNOWN_DOMAIN_COUNTRY_HINTS[dom_low]
     if dom_low.endswith('.ua'):
         return 'UA'
     if dom_low.endswith(('.de', '.at', '.ch')):
@@ -872,7 +891,6 @@ async def process_domain(
         if scan_contacts and not contact_links:
             contact_links = await discover_links_from_sitemap(client, base_root)
 
-        # Bug 16 Fix: Для DACH-доменів завжди гарантуємо наявність /impressum у списку контактних сторінок
         if scan_contacts and effective_region in ('DE', 'AT', 'CH'):
             has_impressum_link = any('impressum' in u.lower() for u in contact_links)
             if not has_impressum_link:
@@ -883,7 +901,6 @@ async def process_domain(
                 u for u in contact_links
                 if is_allowed_by_robots(u, disallowed_paths) and not DM_SOURCE_BLACKLIST.search(urlparse(u).path)
             ]
-            # Bug 16 Fix: Сортуємо allowed_sub_links так, щоб /impressum та /contact завжди йшли першими
             allowed_sub_links = sorted(allowed_sub_links, key=_contact_link_priority)
 
             for sub_url in allowed_sub_links[:4]:
@@ -917,9 +934,6 @@ async def process_domain(
         has_actionable_contacts = bool(prelim_clean_emails or phone_map)
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
-
-        # Bug 15 (HIGH) Fix: Тригеримо Playwright також тоді, коли сайт завантажився (є page_title),
-        # але в статичному HTML виявлено 0 технологій (як ottogroup.com / zalando.de через суворий Consent/SPA)
         needs_pw_no_tech_at_all = bool(
             not tech_info['detected_technologies_list']
             and not tech_info['has_gtm']
