@@ -53,6 +53,26 @@ SECOND_LEVEL_PUBLIC_SUFFIXES = {
     'in', 'kiev', 'kyiv', 'lviv', 'odesa', 'kharkiv', 'dnipro', 'zp'
 }
 
+TRACKING_NETWORK_DOMAINS = (
+    'googletagmanager.com',
+    'google-analytics.com',
+    'analytics.google.com',
+    'googleadservices.com',
+    'doubleclick.net',
+    'connect.facebook.net',
+    'facebook.com/tr',
+    'analytics.tiktok.com',
+    'snap.licdn.com',
+    'licdn.com',
+    'pinimg.com',
+    'clarity.ms',
+    'hotjar.com',
+    'hs-scripts.com',
+    'hs-analytics.net',
+    'klaviyo.com',
+    'intercom.io',
+)
+
 
 def is_playwright_available() -> bool:
     return PLAYWRIGHT_INSTALLED
@@ -95,10 +115,6 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
 
 
 def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
-    """
-    Bug 13 Fix: Очищує мовні та технічні піддомени (напр. en.zalando.de -> zalando.de),
-    зберігаючи при цьому складені національні зони (.com.ua, .co.uk, .lviv.ua).
-    """
     parsed = urlparse(final_url)
     netloc = re.sub(r':\d+$', '', parsed.netloc.lower().replace('www.', ''))
     if not netloc:
@@ -371,13 +387,26 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
     await context.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
     )
+    captured_tracking_urls: list[str] = []
+
+    def _on_request(req):
+        try:
+            r_url = req.url
+            r_low = r_url.lower()
+            if any(td in r_low for td in TRACKING_NETWORK_DOMAINS):
+                if len(captured_tracking_urls) < 60:
+                    captured_tracking_urls.append(r_url)
+        except Exception:
+            pass
+
     try:
         page = await context.new_page()
-        resp = await page.goto(url, wait_until='domcontentloaded', timeout=12000)
+        page.on('request', _on_request)
+        resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
         if resp and resp.status >= 400:
             return '', url, f'launched_blocked (HTTP {resp.status})', True
 
-        await page.wait_for_timeout(900)
+        await page.wait_for_timeout(1000)
 
         consent_selectors = [
             '#shopify-pc__banner__btn-accept',
@@ -386,9 +415,13 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
             '#uc-btn-accept-banner',
             '[data-testid="uc-accept-all-button"]',
             '[data-testid="cookie-accept"]',
+            '#didomi-notice-agree-button',
             'button:has-text("Accept all")',
+            'button:has-text("Allow all")',
             'button:has-text("Accept")',
             'button:has-text("Alle akzeptieren")',
+            'button:has-text("Alles akzeptieren")',
+            'button:has-text("Zustimmen")',
             'button:has-text("Tout accepter")',
             'button:has-text("Accetta tutto")',
             'button:has-text("Alles accepteren")',
@@ -400,14 +433,14 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
                 loc = page.locator(sel).first
                 if await loc.is_visible(timeout=200):
                     await loc.click(timeout=500)
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(1100)
                     break
             except Exception:
                 continue
 
         try:
             await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(500)
         except Exception:
             pass
 
@@ -415,6 +448,11 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
         final_u = clean_url_port(page.url) or url
         if not rendered_html or len(rendered_html) <= 500:
             return '', final_u, 'launched_empty', True
+
+        if captured_tracking_urls:
+            net_dump = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_tracking_urls)
+            rendered_html = f'{rendered_html}\n{net_dump}'
+
         return rendered_html, final_u, 'rendered', False
     finally:
         await context.close()
@@ -426,9 +464,9 @@ async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None)
 
     async with PW_SEMAPHORE:
         try:
-            return await asyncio.wait_for(_fetch_pw_inner(url, proxy_url), timeout=20.0)
+            return await asyncio.wait_for(_fetch_pw_inner(url, proxy_url), timeout=24.0)
         except asyncio.TimeoutError:
-            return '', url, 'launched_blocked (Page.goto: Timeout 20000ms exceeded.)', True
+            return '', url, 'launched_blocked (Page.goto: Timeout 24000ms exceeded.)', True
         except Exception as e:
             err_short = str(e).splitlines()[0][:60] if str(e) else 'error'
             return '', url, f'launched_blocked ({err_short})', True
@@ -476,7 +514,10 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
         resp = await client.get(sitemap_url, impersonate='chrome', timeout=4.5)
         if resp.status_code == 200 and resp.text:
             locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', resp.text, re.I)
+            sub_sitemaps = [u for u in locs if u.lower().endswith('.xml') and ('page' in u.lower() or 'main' in u.lower() or 'static' in u.lower())]
             for url in locs:
+                if url.lower().endswith('.xml'):
+                    continue
                 path_low = urlparse(url).path.lower()
                 if DM_SOURCE_BLACKLIST.search(path_low):
                     continue
@@ -486,6 +527,20 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
                         found_urls.append(clean_u)
                     if len(found_urls) >= 5:
                         break
+            if not found_urls and sub_sitemaps:
+                sub_resp = await client.get(sub_sitemaps[0], impersonate='chrome', timeout=4.0)
+                if sub_resp.status_code == 200 and sub_resp.text:
+                    sub_locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', sub_resp.text, re.I)
+                    for url in sub_locs:
+                        path_low = urlparse(url).path.lower()
+                        if DM_SOURCE_BLACKLIST.search(path_low):
+                            continue
+                        if any(k in path_low for k in PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS):
+                            clean_u = clean_url_port(url) or url
+                            if clean_u not in found_urls:
+                                found_urls.append(clean_u)
+                            if len(found_urls) >= 5:
+                                break
     except Exception:
         pass
 
