@@ -46,6 +46,7 @@ def classify_company_category(
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
 
+    # Bug 10 Fix: Розширений перелік ключових слів для EU/UA/US E-commerce та Fashion-ритейлерів (напр. aboutyou.de)
     ecom_keywords = (
         'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
         'shop', 'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
@@ -59,7 +60,22 @@ def classify_company_category(
         'webwinkel', 'webshop', 'winkelwagen', 'gratis verzending', 'bestel online',
         'sklep internetowy', 'koszyk', 'darmowa dostawa', 'kup teraz', 'zakupy online',
         'loja online', 'frete grátis', 'carrinho', 'comprar agora',
-        'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv'
+        'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv',
+        # EN fashion & retail
+        'fashion', 'fashion online', 'accessories', 'footwear', 'sportswear', 'streetwear',
+        # DE fashion & retail
+        'mode', 'bekleidung', 'kleidung', 'schuhe', 'taschen', 'accessoires',
+        'damenmode', 'herrenmode', 'online-shop für mode', 'top-marken', 'versandapotheke', 'online-apotheke',
+        # FR fashion & retail
+        'prêt-à-porter', 'vêtements', 'chaussures', 'sacs', 'mode en ligne',
+        # IT fashion & retail
+        'moda', 'abbigliamento', 'scarpe', 'borse', 'moda online',
+        # NL fashion & retail
+        'kleding', 'schoenen', 'tassen', 'modewinkel',
+        # PL fashion & retail
+        'odzież', 'buty', 'torebki', 'moda online',
+        # ES / PT fashion & retail
+        'ropa', 'zapatos', 'bolsos', 'moda mujer', 'vestuário', 'calçado'
     )
     has_product_schema = (
         '"@type":"product"' in html_low
@@ -128,10 +144,6 @@ def build_linkedin_xray_query(
     company_category: str = '',
     country_hint: str = ''
 ) -> str:
-    """
-    Bug 5 Fix: Враховує як TLD домену, так і country_hint (визначений за мовою сайту/телефоном),
-    щоб українські та європейські бренди на .com (напр. cher17.com) отримували локалізовані ролі.
-    """
     brand_root = canonical_domain.split('.')[0].capitalize()
     dom_low = canonical_domain.lower()
     hint_up = (country_hint or '').upper().strip()
@@ -262,8 +274,8 @@ def evaluate_qualification_v180(
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
 
     source_extra_note = ''
-    if dm_source_is_legal:
-        source_extra_note = ' DM identified from legal/offer document (ФОП / Impressum) — verify active role via LinkedIn before outbound.'
+    if dm_source_is_legal and dm_source_type != 'impressum_page':
+        source_extra_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.'
     elif dm_source_type in ('product_or_service_page', 'blog_or_press_page'):
         source_extra_note = f' DM identified on {dm_source_type} — verify active role via LinkedIn.'
 
