@@ -10,6 +10,7 @@ import phonenumbers
 from .config import (
     B2B_PARTNERSHIP_PREFIXES,
     B2B_PHONE_KEYWORDS,
+    CITY_NAMES_BLACKLIST,
     DEPARTMENT_OR_ADMISSIONS_PREFIXES,
     DEPARTMENT_PREFIX_BLACKLIST,
     DM_LEGAL_SOURCE_FLAG,
@@ -99,6 +100,7 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
         normalized_local.startswith(INFLUENCER_PREFIXES)
         or local.startswith(INFLUENCER_PREFIXES)
         or first_token in INFLUENCER_PREFIXES
+        or any(t in INFLUENCER_PREFIXES for t in tokens)
     ):
         return 'influencer_gifting_inbox'
 
@@ -106,6 +108,7 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
         normalized_local.startswith(B2B_PARTNERSHIP_PREFIXES)
         or local.startswith(B2B_PARTNERSHIP_PREFIXES)
         or first_token in B2B_PARTNERSHIP_PREFIXES
+        or any(t in B2B_PARTNERSHIP_PREFIXES for t in tokens)
     ):
         return 'b2b_partnerships'
     if (
@@ -121,18 +124,21 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
         normalized_local.startswith(DEPARTMENT_OR_ADMISSIONS_PREFIXES)
         or local.startswith(DEPARTMENT_OR_ADMISSIONS_PREFIXES)
         or first_token in DEPARTMENT_OR_ADMISSIONS_PREFIXES
+        or any(t in DEPARTMENT_OR_ADMISSIONS_PREFIXES for t in tokens)
     ):
         return 'admissions_or_department_inbox'
     if (
         normalized_local.startswith(MARKETING_EXEC_PREFIXES)
         or local.startswith(MARKETING_EXEC_PREFIXES)
         or first_token in MARKETING_EXEC_PREFIXES
+        or any(t in MARKETING_EXEC_PREFIXES for t in tokens)
     ):
         return 'marketing_or_exec_role'
     if (
         normalized_local.startswith(WHOLESALE_MERCH_PREFIXES)
         or local.startswith(WHOLESALE_MERCH_PREFIXES)
         or first_token in WHOLESALE_MERCH_PREFIXES
+        or any(t in WHOLESALE_MERCH_PREFIXES for t in tokens)
     ):
         return 'wholesale_or_sales_inbox'
     if (
@@ -145,6 +151,7 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
         normalized_local.startswith(SUPPORT_PREFIXES)
         or local.startswith(SUPPORT_PREFIXES)
         or first_token in SUPPORT_PREFIXES
+        or any(t in SUPPORT_PREFIXES for t in tokens)
     ):
         return 'customer_support_inbox'
     if (
@@ -371,13 +378,14 @@ def rank_and_clean_emails(
 
     valid, had_external_pollution = reject_external_domain_pollution(valid, base_domain)
 
+    # Ваги типів: wholesale_or_sales_inbox (25) вище за general_office_inbox (24), щоб ops.whsl@ перемагав info@
     type_weights = {
         'marketing_or_exec_role': 35,
         'personal_or_named_inbox': 32,
         'b2b_partnerships': 28,
+        'wholesale_or_sales_inbox': 25,
         'general_office_inbox': 24,
         'brand_webmail_general_inbox': 20,
-        'wholesale_or_sales_inbox': 18,
         'department_or_general_inbox': 15,
         'regional_branch_inbox': 14,
         'brand_webmail_support_inbox': 12,
@@ -390,11 +398,17 @@ def rank_and_clean_emails(
 
     def email_score(addr: str) -> tuple[int, str]:
         _, domain = addr.split('@', 1)
+        dom_root = domain.split('.')[0]
         score = 0
-        if base_domain and (domain == base_domain or domain.endswith(f'.{base_domain}')):
+        if base_domain and domain == base_domain:
             score += 25
-        elif base_brand and domain.split('.')[0] == base_brand:
+        elif base_domain and domain.endswith(f'.{base_domain}'):
+            score += 18
+        elif base_brand and dom_root == base_brand:
             score += 20
+        elif base_brand and base_brand in dom_root:
+            # Суб-вертикалі типу coolblue-energie.nl отримують менший бонус (+8)
+            score += 8
         email_type = classify_email_type(addr, base_brand)
         score += type_weights.get(email_type or '', 0)
         return (-score, addr)
@@ -704,20 +718,22 @@ def classify_dm_source_type(dm_source_url: str | None) -> str | None:
 
 def strip_role_tokens_from_name(candidate: str) -> str:
     """
-    Patch A & Patch B: Очищує висячі дефіси (Koele- -> Koele) та зрізає посадові токени
-    і множинні форми ('Керівники', 'Executives', 'Managers') з початку та кінця імені.
+    Issue 20 Fix: Очищує висячі дефіси (Koele- -> Koele), посадові токени ('Керівники')
+    та назви міст ('Hamburg', 'Berlin', 'Kyiv') з початку та кінця ПІБ.
     """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     words = [w.rstrip('-').lstrip('-') for w in words if w.rstrip('-').lstrip('-')]
     while words and (
         words[0].lower() in ROLE_TOKEN_BLACKLIST
         or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
+        or words[0].lower() in CITY_NAMES_BLACKLIST
         or re.fullmatch(ROLES_REGEX_PART, words[0], re.IGNORECASE)
     ):
         words.pop(0)
     while words and (
         words[-1].lower() in ROLE_TOKEN_BLACKLIST
         or words[-1].lower() in DEPARTMENT_PREFIX_BLACKLIST
+        or words[-1].lower() in CITY_NAMES_BLACKLIST
         or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
     ):
         words.pop(-1)
@@ -735,9 +751,15 @@ def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
     if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
         return False
     words_low = [w.lower() for w in words]
-    if words_low[0] in DEPARTMENT_PREFIX_BLACKLIST:
+    if words_low[0] in DEPARTMENT_PREFIX_BLACKLIST or words_low[0] in CITY_NAMES_BLACKLIST:
         return False
-    if any(wl in _STOP_NAME_WORDS_LOWER or wl in ROLE_TOKEN_BLACKLIST or wl in DEPARTMENT_PREFIX_BLACKLIST for wl in words_low):
+    if any(
+        wl in _STOP_NAME_WORDS_LOWER
+        or wl in ROLE_TOKEN_BLACKLIST
+        or wl in DEPARTMENT_PREFIX_BLACKLIST
+        or wl in CITY_NAMES_BLACKLIST
+        for wl in words_low
+    ):
         return False
     if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
         return False
