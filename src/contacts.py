@@ -112,6 +112,7 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
         normalized_local.startswith(LOW_PRIORITY_PREFIXES)
         or local.startswith(LOW_PRIORITY_PREFIXES)
         or first_token in LOW_PRIORITY_PREFIXES
+        or any(t in LOW_PRIORITY_PREFIXES for t in tokens)
     ):
         return 'legal_or_hr_inbox'
     if local in REGIONAL_BRANCH_LOCALS or first_token in REGIONAL_BRANCH_LOCALS:
@@ -626,10 +627,6 @@ def extract_valid_phones(
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
 ) -> list[tuple[str, int]]:
-    """
-    Bug 9 Fix: Сильний бонус (+35) за збіг країни телефонного коду з регіоном сайту (default_region),
-    щоб на європейських доменах (.de, .it, .fr, .nl) місцеві номери завжди мали вищий пріоритет.
-    """
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
@@ -706,7 +703,12 @@ def classify_dm_source_type(dm_source_url: str | None) -> str | None:
 
 
 def strip_role_tokens_from_name(candidate: str) -> str:
+    """
+    Patch A & Patch B: Очищує висячі дефіси (Koele- -> Koele) та зрізає посадові токени
+    і множинні форми ('Керівники', 'Executives', 'Managers') з початку та кінця імені.
+    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
+    words = [w.rstrip('-').lstrip('-') for w in words if w.rstrip('-').lstrip('-')]
     while words and (
         words[0].lower() in ROLE_TOKEN_BLACKLIST
         or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
@@ -727,11 +729,6 @@ def strip_role_tokens_from_name(candidate: str) -> str:
 
 
 def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
-    """
-    Bug 8 Fix: Перевіряє ПІБ без чутливості до регістру проти STOP_NAME_WORDS,
-    DEPARTMENT_PREFIX_BLACKLIST та назви бренду (щоб відсіяти 'Compliance Immer',
-    'Corporate Communications' та 'Otto Group').
-    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     if len(words) not in (2, 3):
         return False
@@ -747,7 +744,7 @@ def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
     if brand_root:
         b_low = brand_root.lower()
         joined_low = ''.join(words_low)
-        if joined_low == b_low or b_low in words_low and any(w in ('group', 'gruppe', 'holding', 'gmbh', 'ag') for w in words_low):
+        if joined_low == b_low or (b_low in words_low and any(w in ('group', 'gruppe', 'holding', 'gmbh', 'ag') for w in words_low)):
             return False
     return True
 
