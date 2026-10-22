@@ -82,7 +82,7 @@ ROLES_REGEX_PART = (
     r'Генеральний директор|Директор з маркетингу|Керівник відділу маркетингу|'
     r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор|'
     r'Geschäftsführer|Geschäftsführerin|Geschäftsführung|Inhaber|Inhaberin|'
-    r'Gründer|Gründerin|Mitgründer|Mitgründerin|Vorstandsvorsitzender|Vorstand|'
+    r'Gründer|Gründerin|Mitgründer|Mitgründerin|Vorstandsvorsitzender|Vorstand|Aufsichtsratsvorsitzender|'
     r'Marketingleiter|Marketingleiterin|Leiter Marketing|Vertriebsleiter|'
     r'PDG|Président-Directeur Général|Président|Présidente|Directeur Général|Directrice Générale|'
     r'Gérant|Gérante|Associé Gérant|Fondateur|Fondatrice|Co-fondateur|Co-fondatrice|'
@@ -101,7 +101,6 @@ ROLES_REGEX_PART = (
 
 UPPER_CHAR_CLASS = r'A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦŨŪŬŮŰŲŴŶŸŹŻŽ'
 LOWER_CHAR_CLASS = r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\'-'
-# Patch A (Bug 14 Fix): Клас малих літер БЕЗ дефіса, щоб перша частина подвійного прізвища не поглинала дефіс перед великою літерою
 LOWER_CHAR_CLASS_NO_HYPHEN = (
     r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\''
 )
@@ -143,6 +142,21 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
+# Issue 20 Fix: Міста та локації, які стоять поруч із ПІБ на сторінках топ-менеджменту (напр. "Benjamin Schaper Hamburg")
+CITY_NAMES_BLACKLIST = {
+    'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
+    'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
+    'nürnberg', 'nuremberg', 'essen', 'dortmund', 'bonn', 'mannheim', 'karlsruhe',
+    'wien', 'vienna', 'zürich', 'zurich', 'geneva', 'genf', 'basel', 'bern',
+    'london', 'paris', 'lyon', 'madrid', 'barcelona', 'rome', 'roma', 'milan', 'milano',
+    'amsterdam', 'rotterdam', 'utrecht', 'eindhoven', 'brussels', 'antwerp', 'stockholm',
+    'gothenburg', 'oslo', 'copenhagen', 'helsinki', 'lisbon', 'porto', 'warsaw', 'warszawa',
+    'krakow', 'kraków', 'wroclaw', 'wrocław', 'poznan', 'poznań', 'gdansk', 'gdańsk',
+    'prague', 'praha', 'budapest', 'bucharest', 'dublin', 'athens',
+    'kyiv', 'kiev', 'lviv', 'kharkiv', 'odesa', 'odessa', 'dnipro', 'vinnytsia',
+    'київ', 'львів', 'харків', 'одеса', 'дніпро', 'вінниця'
+}
+
 UI_ACTION_WORDS_BLACKLIST = {
     'читати', 'детальніше', 'дивитися', 'дивитись', 'переглянути', 'написати',
     'зв’язатися', 'звязатися', 'автор', 'спікер', 'експерт', 'блог', 'стаття',
@@ -166,7 +180,6 @@ DEPARTMENT_PREFIX_BLACKLIST = {
     'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa'
 }
 
-# Patch B (Issue 17 Fix): Додано множинні форми посад (керівники, директори, executives, führungskräfte тощо)
 ROLE_TOKEN_BLACKLIST = {
     'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
     'partner', 'chairman', 'executive', 'founder', 'cofounder', 'co-founder',
@@ -179,7 +192,8 @@ ROLE_TOKEN_BLACKLIST = {
     'executives', 'managers', 'directors', 'founders', 'employees', 'owners',
     'leitung', 'führungskräfte', 'dirigeants', 'directivos', 'dirigenti', 'bestuurders',
     'geschäftsführer', 'geschäftsführerin', 'geschäftsführung', 'inhaber', 'inhaberin',
-    'gründer', 'gründerin', 'mitgründer', 'vorstand', 'marketingleiter', 'vertriebsleiter',
+    'gründer', 'gründerin', 'mitgründer', 'vorstand', 'aufsichtsratsvorsitzender',
+    'marketingleiter', 'vertriebsleiter',
     'pdg', 'président', 'présidente', 'directeur', 'directrice', 'gérant', 'gérante',
     'fondateur', 'fondatrice', 'responsable', 'fundador', 'fundadora', 'gerente',
     'propietario', 'amministratore', 'direttore', 'fondatore', 'titolare',
@@ -189,6 +203,7 @@ ROLE_TOKEN_BLACKLIST = {
 }
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 ROLE_TOKEN_BLACKLIST.update(DEPARTMENT_PREFIX_BLACKLIST)
+ROLE_TOKEN_BLACKLIST.update(CITY_NAMES_BLACKLIST)
 
 ROLE_WORDS_IN_CONTEXT = (
     'manager', 'менеджер', 'sales', 'sales manager', 'director', 'директор',
@@ -239,6 +254,7 @@ ROLE_NORMALIZATION_MAP = {
     'geschäftsführung': 'Managing Director / CEO',
     'vorstandsvorsitzender': 'Chief Executive Officer (CEO)',
     'vorstand': 'Executive Board / CEO',
+    'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
     'président-directeur général': 'Chief Executive Officer (CEO)',
     'président': 'President / CEO',
@@ -356,7 +372,14 @@ STOP_NAME_WORDS = {
     'Finanzen', 'Personal', 'Einkauf', 'Immer', 'Schritt', 'Voraus', 'Konzern',
     'Gruppe', 'Unternehmen', 'Überblick', 'Themen', 'Karriere', 'Zukunft',
     'Durabilité', 'Stratégie', 'Responsabilité', 'Presse', 'Groupe', 'Entreprise',
-    'Sostenibilità', 'Strategia', 'Responsabilità', 'Comunicazione', 'Stampa', 'Gruppo'
+    'Sostenibilità', 'Strategia', 'Responsabilità', 'Comunicazione', 'Stampa', 'Gruppo',
+    # Issue 20 Fix: міста, щоб "Benjamin Schaper Hamburg" ставав "Benjamin Schaper"
+    'Hamburg', 'Berlin', 'München', 'Muenchen', 'Munich', 'Frankfurt', 'Köln', 'Koeln',
+    'Düsseldorf', 'Duesseldorf', 'Stuttgart', 'Leipzig', 'Dresden', 'Hannover', 'Bremen',
+    'Nürnberg', 'Nuremberg', 'Wien', 'Vienna', 'Zürich', 'Zurich', 'London', 'Paris',
+    'Madrid', 'Barcelona', 'Rome', 'Roma', 'Milan', 'Milano', 'Amsterdam', 'Rotterdam',
+    'Brussels', 'Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Lisbon', 'Warsaw',
+    'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa'
 }
 
 UA_TO_LATIN = {
@@ -394,7 +417,6 @@ EU_GDPR_TLDS = (
     '.lt', '.lv', '.ee', '.si', '.lu', '.mt', '.cy', '.gr', '.ch', '.no', '.is', '.uk', '.co.uk'
 )
 
-# Patch D (Issue 19 Fix): Довідник юрисдикцій для відомих брендів на .com, які можуть блокувати скан WAF-ом
 KNOWN_JURISDICTION_HINTS: dict[str, str] = {
     'bol.com': 'EU_EEA_GDPR',
     'liki24.com': 'UA_PDP',
@@ -439,10 +461,11 @@ B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
     'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp',
     'kooperation', 'kooperationen', 'partenariat', 'partenariats', 'wspolpraca',
-    'samenwerking', 'parcerias', 'alianzas', 'convenios', 'przetargi'
+    'samenwerking', 'parcerias', 'alianzas', 'convenios', 'przetargi',
+    'partnerwerden', 'affiliate', 'affiliates'
 )
 WHOLESALE_MERCH_PREFIXES = (
-    'wholesale', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer',
+    'wholesale', 'whsl', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer',
     'vertrieb', 'verkauf', 'einkauf', 'grosshandel', 'ventes', 'achats',
     'ventas', 'compras', 'mayorista', 'vendite', 'acquisti', 'sprzedaz',
     'hurt', 'hurtownia', 'zamowienia', 'verkoop', 'inkoop', 'salg', 'inkop', 'forsaljning'
@@ -462,7 +485,8 @@ DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
     'department', 'faculty', 'edu', 'study', 'courses', 'academy',
     'booking', 'reservation', 'delivery', 'logistics', 'export', 'import',
-    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn'
+    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn',
+    'laadpalen', 'zonnepanelen', 'energie', 'installatie'
 )
 SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
@@ -477,7 +501,6 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
-# Patch C (Issue 18 Fix): Додано dsa, dsa.concerns, concerns, regulator, regulatory до LOW_PRIORITY_PREFIXES
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
@@ -488,7 +511,9 @@ LOW_PRIORITY_PREFIXES = (
     'facturacion', 'contabilita', 'lavoraconnoi', 'rekrutacja', 'kadry', 'ksiegowosc',
     'faktury', 'vacatures', 'facturatie', 'administracja', 'inspektor', 'iod', 'rodo',
     'dsa', 'dsaconcerns', 'dsa.concerns', 'concerns', 'regulator', 'regulatory',
-    'compliancereport', 'compliance-report', 'dsareport', 'dsa-report'
+    'compliancereport', 'compliance-report', 'dsareport', 'dsa-report',
+    'barrierefrei', 'barrierefreiheit', 'accessibility', 'beschwerde',
+    'beschwerdemanagement', 'ombudsmann', 'whistleblowing', 'hinweisgeber'
 )
 REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro',
@@ -509,7 +534,7 @@ NON_PERSON_TOKENS = (
     | set(PR_MEDIA_PREFIXES)
     | set(LOW_PRIORITY_PREFIXES)
     | REGIONAL_BRANCH_LOCALS
-    | {'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns', 'regulatory'}
+    | {'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns', 'regulatory', 'ops', 'whsl'}
 )
 
 B2B_PHONE_KEYWORDS = (
