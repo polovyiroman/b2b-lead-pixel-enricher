@@ -102,9 +102,15 @@ ROLES_REGEX_PART = (
 UPPER_CHAR_CLASS = r'A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦŨŪŬŮŰŲŴŶŸŹŻŽ'
 LOWER_CHAR_CLASS = r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\'-'
 
+# Bug 14 Fix: Підтримка подвійних прізвищ та імен через дефіс з великої літери (напр. Petra Scharner-Wolff, Karl-Heinz)
+HYPHENATED_WORD_PART = (
+    rf'[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}}'
+    rf'(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}})?'
+)
+
 NAME_REGEX_PART = (
-    rf'([{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}}'
-    rf'(?:\s+[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,25}}){{1,2}})'
+    rf'({HYPHENATED_WORD_PART}'
+    rf'(?:\s+{HYPHENATED_WORD_PART}){{1,2}})'
 )
 
 NAME_BEFORE_ROLE_PATTERN = re.compile(
@@ -117,7 +123,7 @@ ROLE_BEFORE_NAME_PATTERN = re.compile(
 )
 FOP_OWNER_PATTERN = re.compile(
     rf'(?:ФОП|Фізична особа[\s-]підприємець|Einzelunternehmen|Inh\.|Inhaber:?)\s+'
-    rf'([{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,25}}\s+[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}})',
+    rf'({HYPHENATED_WORD_PART}\s+{HYPHENATED_WORD_PART})',
     re.UNICODE
 )
 
@@ -144,7 +150,6 @@ UI_ACTION_WORDS_BLACKLIST = {
     'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere'
 }
 
-# Bug 8 Fix: Чорний список префіксів корпоративних департаментів та функцій (EN/DE/FR/IT/NL/PL)
 DEPARTMENT_PREFIX_BLACKLIST = {
     'compliance', 'sustainability', 'communications', 'communication', 'corporate',
     'legal', 'finance', 'investor', 'relations', 'human', 'resources', 'public',
@@ -314,7 +319,6 @@ ROLE_NORMALIZATION_MAP = {
     'managing partner': 'Managing Partner'
 }
 
-# Bug 8 Fix: Розширений словник STOP_NAME_WORDS для відсікання департаментів та заголовків у німецькому/EU Impressum
 STOP_NAME_WORDS = {
     'Інтернет', 'Магазин', 'Онлайн', 'Бренд', 'Компанія', 'Агентство', 'Агенція',
     'Політика', 'Конфіденційності', 'Умови', 'Доставка', 'Оплата', 'Контакти',
@@ -333,19 +337,15 @@ STOP_NAME_WORDS = {
     'Informativa', 'Sulla', 'Partita', 'Regulamin', 'Polityka', 'Prywatności',
     'Spółka', 'ZOO', 'GmbH', 'AG', 'KG', 'OHG', 'GbR', 'UG', 'SARL', 'SAS', 'SASU',
     'BV', 'NV', 'AB', 'ApS', 'AS', 'Oy', 'SRL', 'SPA', 'SL',
-    # EN corporate functions & generic nouns
     'Compliance', 'Sustainability', 'Communications', 'Communication', 'Corporate',
     'Finance', 'Investor', 'Relations', 'Human', 'Resources', 'Public', 'Affairs',
     'Experience', 'Product', 'Operations', 'Group', 'Holding', 'Retail', 'Commerce',
     'Fashion', 'Management', 'Board', 'Committee', 'Council', 'Division', 'Solutions',
-    # DE corporate & common Impressum words
     'Nachhaltigkeit', 'Strategie', 'Verantwortung', 'Aufsichtsrat', 'Vorstand',
     'Beirat', 'Presse', 'Kommunikation', 'Unternehmenskommunikation', 'Recht',
     'Finanzen', 'Personal', 'Einkauf', 'Immer', 'Schritt', 'Voraus', 'Konzern',
     'Gruppe', 'Unternehmen', 'Überblick', 'Themen', 'Karriere', 'Zukunft',
-    # FR
     'Durabilité', 'Stratégie', 'Responsabilité', 'Presse', 'Groupe', 'Entreprise',
-    # IT
     'Sostenibilità', 'Strategia', 'Responsabilità', 'Comunicazione', 'Stampa', 'Gruppo'
 }
 
