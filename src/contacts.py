@@ -11,6 +11,7 @@ from .config import (
     B2B_PARTNERSHIP_PREFIXES,
     B2B_PHONE_KEYWORDS,
     DEPARTMENT_OR_ADMISSIONS_PREFIXES,
+    DEPARTMENT_PREFIX_BLACKLIST,
     DM_LEGAL_SOURCE_FLAG,
     DM_SOURCE_BLACKLIST,
     FOP_OWNER_PATTERN,
@@ -53,6 +54,8 @@ IMPRESSUM_CANONICAL_PATH_REGEX = re.compile(
     r'/(?:impressum|mentions-legales|aviso-legal)\b',
     re.IGNORECASE
 )
+
+_STOP_NAME_WORDS_LOWER = {w.lower() for w in STOP_NAME_WORDS}
 
 
 def decode_cf_email(encoded_str: str) -> str:
@@ -205,10 +208,6 @@ def verify_person_linkedin_match(full_name: str | None, linkedin_url: str | None
 
 
 async def query_doh_json(client: AsyncSession, domain: str, record_type: str) -> tuple[dict | None, str]:
-    """
-    Bug 3 Fix: Використовує 3 незалежні DoH-резолвери (Google, Cloudflare, Quad9).
-    Якщо проксі-тунель клієнта блокує запит, виконує резервний прямий запит (proxy=None).
-    """
     endpoints = [
         f'https://dns.google/resolve?name={domain}&type={record_type}',
         f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
@@ -241,11 +240,6 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None
 ) -> str | None:
-    """
-    Bug 3 Fix: Захищено по-доменним asyncio.Lock, щоб паралельні перевірки 3 пошт на одному домені
-    (напр. enterprise@readdle.com, insight@readdle.com, pr@readdle.com) не дублювали мережеві DoH-запити.
-    Тимчасові мережеві збої (dns_error / dns_timeout) НЕ кешуються назавжди.
-    """
     if not email or '@' not in email:
         return None
     domain = email.split('@', 1)[1].strip().lower()
@@ -292,7 +286,6 @@ async def verify_email_deliverability_deep(
                     txt_ans = [str(a.get('data', '')).lower() for a in txt_data.get('Answer', [])]
                     has_spf = any('v=spf1' in t for t in txt_ans)
 
-            # Кешуємо лише підтверджені результати (provider знайдено або точно немає MX записів)
             if provider or err_code == 'dns_no_mx_records':
                 DNS_MEMORY_CACHE[domain] = (provider, has_spf, err_code)
 
@@ -633,6 +626,10 @@ def extract_valid_phones(
     raw_tel_candidates: list[tuple[str, str]],
     default_region: str
 ) -> list[tuple[str, int]]:
+    """
+    Bug 9 Fix: Сильний бонус (+35) за збіг країни телефонного коду з регіоном сайту (default_region),
+    щоб на європейських доменах (.de, .it, .fr, .nl) місцеві номери завжди мали вищий пріоритет.
+    """
     phone_scores: dict[str, int] = {}
     phone_order: dict[str, int] = {}
     order_counter = 0
@@ -648,8 +645,8 @@ def extract_valid_phones(
                 formatted = phonenumbers.format_number(
                     parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL
                 )
-                region_bonus = 15 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
-                ctx_score = 10 + region_bonus + score_phone_context(context)
+                region_bonus = 35 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
+                ctx_score = 15 + region_bonus + score_phone_context(context)
                 if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
                     phone_scores[formatted] = ctx_score
                 if formatted not in phone_order:
@@ -669,7 +666,7 @@ def extract_valid_phones(
             start_idx = max(0, match.start - 90)
             end_idx = min(len(text), match.end + 90)
             context = text[start_idx:end_idx]
-            region_bonus = 15 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
+            region_bonus = 35 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
             ctx_score = region_bonus + score_phone_context(context)
 
             if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
@@ -686,10 +683,6 @@ def extract_valid_phones(
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
-    """
-    Класифікує джерело DM. Для європейських Impressum / Mentions Légales повертає
-    канонічний високодовірчий тип 'impressum_page' (окремо від низькопріоритетних оферт/terms).
-    """
     if not dm_source_url:
         return None
     path_low = urlparse(dm_source_url).path.lower()
@@ -716,11 +709,13 @@ def strip_role_tokens_from_name(candidate: str) -> str:
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     while words and (
         words[0].lower() in ROLE_TOKEN_BLACKLIST
+        or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or re.fullmatch(ROLES_REGEX_PART, words[0], re.IGNORECASE)
     ):
         words.pop(0)
     while words and (
         words[-1].lower() in ROLE_TOKEN_BLACKLIST
+        or words[-1].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
     ):
         words.pop(-1)
@@ -731,16 +726,29 @@ def strip_role_tokens_from_name(candidate: str) -> str:
     return ' '.join(words)
 
 
-def is_valid_person_name(candidate: str) -> bool:
+def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
+    """
+    Bug 8 Fix: Перевіряє ПІБ без чутливості до регістру проти STOP_NAME_WORDS,
+    DEPARTMENT_PREFIX_BLACKLIST та назви бренду (щоб відсіяти 'Compliance Immer',
+    'Corporate Communications' та 'Otto Group').
+    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     if len(words) not in (2, 3):
         return False
     if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
         return False
-    if any(w in STOP_NAME_WORDS or w.lower() in ROLE_TOKEN_BLACKLIST for w in words):
+    words_low = [w.lower() for w in words]
+    if words_low[0] in DEPARTMENT_PREFIX_BLACKLIST:
+        return False
+    if any(wl in _STOP_NAME_WORDS_LOWER or wl in ROLE_TOKEN_BLACKLIST or wl in DEPARTMENT_PREFIX_BLACKLIST for wl in words_low):
         return False
     if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
         return False
+    if brand_root:
+        b_low = brand_root.lower()
+        joined_low = ''.join(words_low)
+        if joined_low == b_low or b_low in words_low and any(w in ('group', 'gruppe', 'holding', 'gmbh', 'ag') for w in words_low):
+            return False
     return True
 
 
@@ -773,7 +781,6 @@ def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: 
 
 
 def is_low_trust_legal_offer_page(path: str) -> bool:
-    """Повертає True лише для оферт/terms/договорів, але НЕ для канонічного європейського Impressum."""
     if IMPRESSUM_CANONICAL_PATH_REGEX.search(path):
         return False
     return bool(DM_LEGAL_SOURCE_FLAG.search(path))
@@ -785,6 +792,11 @@ def extract_decision_maker_deep(
     candidate_li_urls = []
     found_dms: list[dict] = []
     seen_names: set[str] = set()
+
+    brand_root = ''
+    if pages_with_urls:
+        first_host = urlparse(pages_with_urls[0][0]).netloc.lower().replace('www.', '')
+        brand_root = first_host.split('.')[0] if first_host else ''
 
     def add_dm_candidate(name: str, role: str | None, page_url: str, is_leg: bool, base_priority: int):
         norm_name = name.strip()
@@ -857,7 +869,7 @@ def extract_decision_maker_deep(
                         if isinstance(val, dict) and val.get('name'):
                             cand = strip_role_tokens_from_name(str(val['name']))
                             role = normalize_executive_role(str(val.get('jobTitle') or default_role))
-                            if is_valid_person_name(cand):
+                            if is_valid_person_name(cand, brand_root):
                                 is_leg = is_low_trust_legal_offer_page(url_path)
                                 add_dm_candidate(cand, role, page_url, is_leg, 40)
                         elif isinstance(val, list):
@@ -865,7 +877,7 @@ def extract_decision_maker_deep(
                                 if isinstance(sub, dict) and sub.get('name'):
                                     cand = strip_role_tokens_from_name(str(sub['name']))
                                     role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
-                                    if is_valid_person_name(cand):
+                                    if is_valid_person_name(cand, brand_root):
                                         is_leg = is_low_trust_legal_offer_page(url_path)
                                         add_dm_candidate(cand, role, page_url, is_leg, 40)
             except Exception:
@@ -885,7 +897,7 @@ def extract_decision_maker_deep(
             if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
                 continue
             cand_role = normalize_executive_role(m.group(2))
-            if is_valid_person_name(cand_name):
+            if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
         for m in ROLE_BEFORE_NAME_PATTERN.finditer(dm_clean_text):
@@ -893,7 +905,7 @@ def extract_decision_maker_deep(
             if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
                 continue
             cand_role = normalize_executive_role(m.group(1))
-            if is_valid_person_name(cand_name):
+            if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
     for page_url, _, page_text in pages_with_urls:
@@ -903,7 +915,7 @@ def extract_decision_maker_deep(
         is_leg = is_low_trust_legal_offer_page(url_path)
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
-            if is_valid_person_name(cand_name):
+            if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, 'Registered Business Owner / ФОП', page_url, is_leg, 10)
 
     if not found_dms:
