@@ -41,6 +41,18 @@ _PW_INIT_LOCK = asyncio.Lock()
 _PW_INSTANCE = None
 _PW_BROWSER = None
 
+STRIPPABLE_SUBDOMAIN_PREFIXES = {
+    'en', 'de', 'fr', 'uk', 'ua', 'us', 'eu', 'it', 'es', 'nl', 'pl',
+    'pt', 'se', 'sv', 'no', 'dk', 'da', 'fi', 'at', 'ch', 'be', 'cz',
+    'ro', 'hu', 'sk', 'ie', 'global', 'int', 'intl', 'm', 'mobile',
+    'web', 'app', 'checkout', 'cart', 'pay', 'secure', 'shop', 'store'
+}
+
+SECOND_LEVEL_PUBLIC_SUFFIXES = {
+    'com', 'co', 'org', 'net', 'edu', 'gov', 'ac', 'mil', 'biz', 'info',
+    'in', 'kiev', 'kyiv', 'lviv', 'odesa', 'kharkiv', 'dnipro', 'zp'
+}
+
 
 def is_playwright_available() -> bool:
     return PLAYWRIGHT_INSTALLED
@@ -83,14 +95,26 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
 
 
 def get_clean_canonical_domain(final_url: str, input_domain: str) -> str:
+    """
+    Bug 13 Fix: Очищує мовні та технічні піддомени (напр. en.zalando.de -> zalando.de),
+    зберігаючи при цьому складені національні зони (.com.ua, .co.uk, .lviv.ua).
+    """
     parsed = urlparse(final_url)
     netloc = re.sub(r':\d+$', '', parsed.netloc.lower().replace('www.', ''))
     if not netloc:
         netloc = input_domain.lower().replace('www.', '')
 
     parts = netloc.split('.')
-    while len(parts) > 2 and parts[0] in ('checkout', 'cart', 'pay', 'secure', 'shop', 'store', 'us', 'eu', 'uk'):
+    has_compound_tld = (
+        len(parts) >= 3
+        and len(parts[-1]) == 2
+        and parts[-2] in SECOND_LEVEL_PUBLIC_SUFFIXES
+    )
+    min_parts = 3 if has_compound_tld else 2
+
+    while len(parts) > min_parts and parts[0].lower() in STRIPPABLE_SUBDOMAIN_PREFIXES:
         parts.pop(0)
+
     return '.'.join(parts)
 
 
@@ -162,7 +186,7 @@ def parse_html_sync(
     secondary_links = set()
 
     soup = BeautifulSoup(html, 'lxml')
-    base_domain = re.sub(r':\d+$', '', urlparse(clean_page).netloc.lower().replace('www.', ''))
+    base_domain = get_clean_canonical_domain(clean_page, urlparse(clean_page).netloc)
     brand_root = base_domain.split('.')[0] if base_domain else ''
     base_clean = clean_page.rstrip('/')
 
@@ -256,7 +280,9 @@ def parse_html_sync(
                 continue
 
             anchor_txt = a_tag.get_text(' ', strip=True).lower()
-            if any(k in path_lower for k in PRIMARY_CONTACT_KEYWORDS) or any(k in anchor_txt for k in ('contact', 'контакти', 'support')):
+            if any(k in path_lower for k in PRIMARY_CONTACT_KEYWORDS) or any(
+                k in anchor_txt for k in ('contact', 'контакти', 'support', 'impressum', 'kontakt', 'mentions légales')
+            ):
                 primary_links.add(normalized_link)
             elif any(k in path_lower for k in SECONDARY_CONTACT_KEYWORDS):
                 secondary_links.add(normalized_link)
@@ -331,7 +357,7 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
         return '', url, 'disabled', False
 
     ctx_kwargs = {
-        'locale': 'uk-UA',
+        'locale': 'en-US',
         'ignore_https_errors': True,
         'user_agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -357,9 +383,16 @@ async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, 
             '#shopify-pc__banner__btn-accept',
             '#onetrust-accept-btn-handler',
             '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+            '#uc-btn-accept-banner',
+            '[data-testid="uc-accept-all-button"]',
             '[data-testid="cookie-accept"]',
             'button:has-text("Accept all")',
             'button:has-text("Accept")',
+            'button:has-text("Alle akzeptieren")',
+            'button:has-text("Tout accepter")',
+            'button:has-text("Accetta tutto")',
+            'button:has-text("Alles accepteren")',
+            'button:has-text("Zaakceptuj wszystko")',
             'button:has-text("Прийняти")'
         ]
         for sel in consent_selectors:
@@ -457,12 +490,27 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
         pass
 
     if not found_urls:
-        found_urls = [
-            f'{base_root}/contacts/',
-            f'{base_root}/kontakty/',
-            f'{base_root}/about/',
-            f'{base_root}/pro-nas/'
-        ]
+        dom_low = urlparse(base_root).netloc.lower()
+        if dom_low.endswith(('.de', '.at', '.ch')):
+            found_urls = [
+                f'{base_root}/impressum/',
+                f'{base_root}/kontakt/',
+                f'{base_root}/ueber-uns/',
+                f'{base_root}/about/'
+            ]
+        elif dom_low.endswith('.fr'):
+            found_urls = [
+                f'{base_root}/mentions-legales/',
+                f'{base_root}/contact/',
+                f'{base_root}/a-propos/'
+            ]
+        else:
+            found_urls = [
+                f'{base_root}/contacts/',
+                f'{base_root}/kontakty/',
+                f'{base_root}/about/',
+                f'{base_root}/pro-nas/'
+            ]
     return found_urls
 
 
@@ -480,7 +528,7 @@ async def fetch_html_safely(
     for attempt in range(retries):
         imp = impersonations[min(attempt, len(impersonations) - 1)]
         req_headers = {
-            'Accept-Language': 'uk-UA,uk;q=0.9,en-GB;q=0.8,en;q=0.7',
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-GB;q=0.8,en;q=0.7,de-DE;q=0.6,de;q=0.5',
             'Referer': 'https://www.google.com/',
             'Upgrade-Insecure-Requests': '1'
         }
