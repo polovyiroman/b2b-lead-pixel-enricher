@@ -85,8 +85,111 @@ COMPLIANCE_DEFAULT_NOTE = (
     'Enriched for legitimate B2B interest; public site data; deletion on request via support'
 )
 
+EU_PHONE_PREFIXES = (
+    '+49', '+33', '+39', '+34', '+31', '+32', '+43', '+48', '+46',
+    '+45', '+358', '+351', '+420', '+36', '+40', '+421', '+353',
+    '+30', '+359', '+385', '+370', '+371', '+372', '+386', '+352'
+)
 
-def _derive_gdpr_jurisdiction(canonical_domain: str) -> str:
+
+def _guess_region_from_domain(canonical_domain: str, html_sample: str = '') -> str | None:
+    """
+    Bug 9 Fix: Визначає телефонний регіон (ISO 2-letter) за TLD домену або <html lang="XX">,
+    щоб європейські сайти (.de, .it, .fr, .nl, .pl) ніколи не парсилися з дефолтним UA/US регіоном.
+    """
+    dom_low = (canonical_domain or '').lower()
+    if dom_low.endswith('.ua'):
+        return 'UA'
+    if dom_low.endswith('.de'):
+        return 'DE'
+    if dom_low.endswith('.at'):
+        return 'AT'
+    if dom_low.endswith('.ch'):
+        return 'CH'
+    if dom_low.endswith('.it'):
+        return 'IT'
+    if dom_low.endswith('.fr'):
+        return 'FR'
+    if dom_low.endswith('.es'):
+        return 'ES'
+    if dom_low.endswith('.nl'):
+        return 'NL'
+    if dom_low.endswith('.be'):
+        return 'BE'
+    if dom_low.endswith('.pl'):
+        return 'PL'
+    if dom_low.endswith('.pt'):
+        return 'PT'
+    if dom_low.endswith('.se'):
+        return 'SE'
+    if dom_low.endswith('.no'):
+        return 'NO'
+    if dom_low.endswith('.dk'):
+        return 'DK'
+    if dom_low.endswith('.fi'):
+        return 'FI'
+    if dom_low.endswith('.cz'):
+        return 'CZ'
+    if dom_low.endswith('.ro'):
+        return 'RO'
+    if dom_low.endswith('.hu'):
+        return 'HU'
+    if dom_low.endswith('.ie'):
+        return 'IE'
+    if dom_low.endswith(('.uk', '.co.uk')):
+        return 'GB'
+
+    if html_sample:
+        html_head = html_sample[:2000].lower()
+        lang_match = re.search(r'<html[^>]+lang=["\']([a-z]{2})(?:[-_]([a-z]{2}))?', html_head)
+        if lang_match:
+            lang = lang_match.group(1).upper()
+            country_sub = (lang_match.group(2) or '').upper()
+            if country_sub in ('UA', 'DE', 'AT', 'CH', 'IT', 'FR', 'ES', 'NL', 'BE', 'PL', 'PT', 'SE', 'NO', 'DK', 'FI', 'GB', 'US'):
+                return country_sub
+            if lang in ('UK', 'UA'):
+                return 'UA'
+            if lang == 'DE':
+                return 'DE'
+            if lang == 'IT':
+                return 'IT'
+            if lang == 'FR':
+                return 'FR'
+            if lang == 'ES':
+                return 'ES'
+            if lang == 'NL':
+                return 'NL'
+            if lang == 'PL':
+                return 'PL'
+            if lang == 'PT':
+                return 'PT'
+            if lang == 'SV':
+                return 'SE'
+    return None
+
+
+def _resolve_effective_phone_region(
+    canonical_domain: str,
+    default_region: str,
+    html_sample: str = ''
+) -> str:
+    guessed = _guess_region_from_domain(canonical_domain, html_sample)
+    if guessed:
+        return guessed
+    return default_region if default_region else 'US'
+
+
+def _derive_gdpr_jurisdiction(
+    canonical_domain: str,
+    phone: str | None = None,
+    content_lang_hint: str = '',
+    html_sample: str = ''
+) -> str:
+    """
+    Bug 12 Fix: Визначає юрисдикцію приватних даних за TLD, а для глобальних .com доменів —
+    за телефонним префіксом, мовою контенту (country_hint) та юридичними маркерами в HTML
+    (напр. ottogroup.com -> EU_EEA_GDPR, asos.com -> UK_GDPR, ringostat.com -> UA_PDP).
+    """
     dom_low = (canonical_domain or '').lower()
     if dom_low.endswith(('.uk', '.co.uk')):
         return 'UK_GDPR'
@@ -96,6 +199,34 @@ def _derive_gdpr_jurisdiction(canonical_domain: str) -> str:
         return 'EU_EEA_GDPR'
     if dom_low.endswith('.ua'):
         return 'UA_PDP'
+
+    phone_str = (phone or '').strip()
+    if phone_str.startswith('+44'):
+        return 'UK_GDPR'
+    if phone_str.startswith('+41'):
+        return 'CH_FADP'
+    if phone_str.startswith(EU_PHONE_PREFIXES):
+        return 'EU_EEA_GDPR'
+    if phone_str.startswith('+380'):
+        return 'UA_PDP'
+
+    hint_up = (content_lang_hint or '').upper().strip()
+    if hint_up in ('DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'PL', 'PT', 'SE', 'NO', 'DK', 'FI', 'CZ', 'RO', 'HU', 'SK', 'IE'):
+        return 'EU_EEA_GDPR'
+    if hint_up in ('GB', 'UK'):
+        return 'UK_GDPR'
+    if hint_up == 'CH':
+        return 'CH_FADP'
+    if hint_up == 'UA':
+        return 'UA_PDP'
+
+    if html_sample:
+        html_low = html_sample[:25000].lower()
+        if any(m in html_low for m in ('registered in england', 'london, uk', 'england and wales', 'asos.com limited')):
+            return 'UK_GDPR'
+        if any(m in html_low for m in ('impressum', 'handelsregister', 'amtsgericht', 'umsatzsteuer-id', 'gmbh & co. kg', 'otto group')):
+            return 'EU_EEA_GDPR'
+
     return 'NON_EU_GLOBAL'
 
 
@@ -135,13 +266,21 @@ def _derive_human_contact_tier(contact_quality_tier: str | None) -> str:
 
 def compute_google_ads_confidence(
     has_ads: bool | None,
-    scan_completeness: str
+    scan_completeness: str,
+    techs_found_count: int = 0
 ) -> str:
+    """
+    Bug 11 Fix: Якщо жодного технологічного сигналу не знайдено взагалі (techs_found_count == 0,
+    як на ottogroup.com чи zalando.de через суворий Consent Mode / SPA), ми не можемо стверджувати
+    'verified_absent' — повертаємо 'unknown'.
+    """
     if has_ads is True:
         return 'verified_present'
     if has_ads is None:
         return 'unknown'
-    if scan_completeness == 'full':
+    if scan_completeness != 'full':
+        return 'unknown'
+    if techs_found_count > 0:
         return 'verified_absent'
     return 'unknown'
 
@@ -153,10 +292,6 @@ def detect_country_hint(
     primary_phone: str | None,
     html_sample: str = ''
 ) -> str:
-    """
-    Bug 7 Fix: Строгий порядок пріоритетів (TLD -> телефон -> специфічний алфавіт -> ТІЛЬКИ <html lang="XX">).
-    Ігнорує альтернативні <link hreflang="de">, щоб macpaw.com та grammarly.com не отримували DE-локаль.
-    """
     dom_low = canonical_domain.lower()
     if dom_low.endswith('.ua'):
         return 'UA'
@@ -176,6 +311,8 @@ def detect_country_hint(
         return 'PT'
     if dom_low.endswith(('.se', '.no', '.dk', '.fi')):
         return 'SE'
+    if dom_low.endswith(('.uk', '.co.uk')):
+        return 'GB'
 
     phone_str = primary_phone or ''
     if phone_str.startswith('+380'):
@@ -192,6 +329,8 @@ def detect_country_hint(
         return 'IT'
     if phone_str.startswith(('+31', '+32')):
         return 'NL'
+    if phone_str.startswith('+44'):
+        return 'GB'
 
     text_combined = f'{page_title} {meta_desc}'
     if re.search(r'[іїєґІЇЄҐ]', text_combined):
@@ -356,8 +495,6 @@ async def process_domain(
         canonical_kv_key = sanitize_kv_key(canonical_domain)
         input_kv_key = sanitize_kv_key(domain_key)
         evergreen_kv_key = f'evergreen_{canonical_kv_key}'
-        is_eu_gdpr = canonical_domain.endswith(EU_GDPR_TLDS)
-        gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain)
 
         all_alias_items = list(initial_aliases)
         if canonical_domain not in all_alias_items:
@@ -402,6 +539,7 @@ async def process_domain(
 
                         cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
                         cached_copy['input_domain'] = domain_key
+                        cached_copy['canonical_domain'] = canonical_domain
                         cached_copy['aliases'] = aliases_str
                         cached_copy['input_was_redirected'] = was_redirected
                         cached_copy['redirect_chain'] = redirect_chain_str
@@ -475,16 +613,33 @@ async def process_domain(
                         if cached_copy['tech_rescan_needed'] and cached_copy.get('tech_scan_completeness') == 'full':
                             cached_copy['tech_scan_completeness'] = 'partial_cached'
 
+                        _cached_tech_count = len(
+                            [x.strip() for x in (cached_copy.get('detected_technologies') or '').split(';') if x.strip()]
+                        )
                         cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
                             cached_copy.get('has_google_ads'),
-                            cached_copy.get('tech_scan_completeness', 'full')
+                            cached_copy.get('tech_scan_completeness', 'full'),
+                            _cached_tech_count
                         )
 
-                        # Синхронізація Human Tier та 6 GDPR полів для кешу
+                        _c_hint = detect_country_hint(
+                            canonical_domain,
+                            cached_copy.get('page_title') or '',
+                            cached_copy.get('meta_description') or '',
+                            cached_copy.get('primary_phone'),
+                            ''
+                        )
+                        _jur = _derive_gdpr_jurisdiction(
+                            canonical_domain,
+                            cached_copy.get('primary_phone'),
+                            _c_hint,
+                            ''
+                        )
+                        cached_copy['gdpr_jurisdiction'] = _jur
+                        cached_copy['gdpr_eu_domain'] = _jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
                         cached_copy['contact_quality_tier_human'] = _derive_human_contact_tier(
                             cached_copy.get('contact_quality_tier')
                         )
-                        cached_copy['gdpr_jurisdiction'] = gdpr_jurisdiction
                         cached_copy['legal_basis_for_processing'] = (
                             'legitimate_interest_b2b'
                             if (cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone'))
@@ -513,6 +668,20 @@ async def process_domain(
 
             seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
             if isinstance(seed_match, dict):
+                _seed_hint = detect_country_hint(
+                    canonical_domain,
+                    seed_match.get('page_title') or '',
+                    seed_match.get('meta_description') or '',
+                    seed_match.get('primary_phone'),
+                    ''
+                )
+                _seed_jur = _derive_gdpr_jurisdiction(
+                    canonical_domain,
+                    seed_match.get('primary_phone'),
+                    _seed_hint,
+                    ''
+                )
+                _seed_is_eu = _seed_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
                 seeded_rec = build_manual_seed_record(
                     seed_match,
                     domain_key,
@@ -522,20 +691,24 @@ async def process_domain(
                     normalized_final_redirect,
                     was_redirected,
                     redirect_chain_str,
-                    is_eu_gdpr,
+                    _seed_is_eu,
                     fail_status,
                     short_err_msg,
                     checked_at,
                     is_playwright_available()
                 )
+                _seed_tech_count = len(
+                    [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
+                )
                 seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
                     seeded_rec.get('has_google_ads'),
-                    seeded_rec.get('tech_scan_completeness', 'full')
+                    seeded_rec.get('tech_scan_completeness', 'full'),
+                    _seed_tech_count
                 )
                 seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
                     seeded_rec.get('contact_quality_tier')
                 )
-                seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
+                seeded_rec['gdpr_jurisdiction'] = _seed_jur
                 seeded_rec['legal_basis_for_processing'] = (
                     'legitimate_interest_b2b'
                     if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
@@ -555,6 +728,8 @@ async def process_domain(
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
             c_hint = detect_country_hint(canonical_domain, '', '', None, '')
+            blocked_jur = _derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
+            blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
             return {
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
@@ -580,8 +755,8 @@ async def process_domain(
                 'contact_quality_tier_human': 'No Contact',
                 'contact_enrichment_status': 'scan_blocked_by_waf',
                 'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
-                'gdpr_eu_domain': is_eu_gdpr,
-                'gdpr_jurisdiction': gdpr_jurisdiction,
+                'gdpr_eu_domain': blocked_is_eu,
+                'gdpr_jurisdiction': blocked_jur,
                 'legal_basis_for_processing': None,
                 'data_subject_can_request_deletion': True,
                 'data_retention_policy_days': 365,
@@ -647,6 +822,9 @@ async def process_domain(
                 'last_checked_at': checked_at
             }
 
+        # Bug 9 Fix: Визначаємо точний телефонний регіон для конкретного домену перед парсингом номерів
+        effective_region = _resolve_effective_phone_region(canonical_domain, default_region, html)
+
         (
             page_title,
             meta_desc,
@@ -656,7 +834,7 @@ async def process_domain(
             socials_with_source,
             contact_links
         ) = await loop.run_in_executor(
-            thread_pool, parse_html_sync, html, normalized_final_redirect, default_region
+            thread_pool, parse_html_sync, html, normalized_final_redirect, effective_region
         )
 
         homepage_was_soft_404 = is_soft_404_page(html, page_title)
@@ -700,7 +878,7 @@ async def process_domain(
                 )
                 if 200 <= sub_status < 400 and sub_html:
                     sub_title, sub_desc, sub_text, sub_e, sub_p, sub_s, _ = await loop.run_in_executor(
-                        thread_pool, parse_html_sync, sub_html, sub_final_url, default_region
+                        thread_pool, parse_html_sync, sub_html, sub_final_url, effective_region
                     )
                     if is_soft_404_page(sub_html, sub_title):
                         continue
@@ -741,7 +919,7 @@ async def process_domain(
             if pw_status_str == 'rendered' and pw_html:
                 pw_used_flag = True
                 pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
-                    thread_pool, parse_html_sync, pw_html, pw_url, default_region
+                    thread_pool, parse_html_sync, pw_html, pw_url, effective_region
                 )
                 if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
                     page_title = pw_title
@@ -765,6 +943,8 @@ async def process_domain(
                         thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
                     )
                     fallback_pw_paths = [
+                        f'{base_root}/impressum/',
+                        f'{base_root}/kontakt/',
                         f'{base_root}/contacts/',
                         f'{base_root}/en/contact-us/',
                         f'{base_root}/ua/kontakty/',
@@ -782,7 +962,7 @@ async def process_domain(
                             sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(pw_sub_u)
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
-                                    thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, default_region
+                                    thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
                                 )
                                 if not is_soft_404_page(sub_pw_html, s_t):
                                     if not page_title and s_t:
@@ -836,9 +1016,13 @@ async def process_domain(
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
 
         normalize_tech_info_booleans(tech_info)
+        detected_tech_list = tech_info['detected_technologies_list']
+
+        # Bug 11 Fix: Передаємо кількість знайдених технологій у compute_google_ads_confidence
         google_ads_conf = compute_google_ads_confidence(
             tech_info.get('has_google_ads'),
-            tech_info.get('tech_scan_completeness', 'full')
+            tech_info.get('tech_scan_completeness', 'full'),
+            len(detected_tech_list)
         )
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
@@ -909,7 +1093,6 @@ async def process_domain(
                 social_source_url = socials_with_source[platform][1]
                 break
 
-        detected_tech_list = tech_info['detected_technologies_list']
         company_category, category_confidence = classify_company_category(
             canonical_domain, page_title, meta_desc, detected_tech_list, html
         )
@@ -929,6 +1112,10 @@ async def process_domain(
 
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
+
+        # Bug 12 Fix: Визначаємо gdpr_jurisdiction з урахуванням телефону, мови контенту та маркерів у HTML
+        gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
+        is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
