@@ -92,11 +92,28 @@ EU_PHONE_PREFIXES = (
 )
 
 
+def _contact_link_priority(url: str) -> tuple[int, int]:
+    """
+    Bug 16 Fix: Пріоритет сортування внутрішніх контактних сторінок:
+    0 - impressum / mentions-legales / aviso-legal (канонічне джерело CEO у ЄС)
+    1 - contact / kontakt / kontakty
+    2 - team / leadership / komanda
+    3 - about / ueber-uns / pro-nas
+    4 - інші шляхи
+    """
+    path = urlparse(url).path.lower()
+    if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
+        return (0, len(path))
+    if any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto', 'get-in-touch')):
+        return (1, len(path))
+    if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'zespol', 'equipe')):
+        return (2, len(path))
+    if any(k in path for k in ('about', 'ueber-uns', 'uber-uns', 'pro-nas', 'o-nas', 'qui-sommes-nous', 'chi-siamo', 'over-ons')):
+        return (3, len(path))
+    return (4, len(path))
+
+
 def _guess_region_from_domain(canonical_domain: str, html_sample: str = '') -> str | None:
-    """
-    Bug 9 Fix: Визначає телефонний регіон (ISO 2-letter) за TLD домену або <html lang="XX">,
-    щоб європейські сайти (.de, .it, .fr, .nl, .pl) ніколи не парсилися з дефолтним UA/US регіоном.
-    """
     dom_low = (canonical_domain or '').lower()
     if dom_low.endswith('.ua'):
         return 'UA'
@@ -185,13 +202,8 @@ def _derive_gdpr_jurisdiction(
     content_lang_hint: str = '',
     html_sample: str = ''
 ) -> str:
-    """
-    Bug 12 Fix: Визначає юрисдикцію приватних даних за TLD, а для глобальних .com доменів —
-    за телефонним префіксом, мовою контенту (country_hint) та юридичними маркерами в HTML
-    (напр. ottogroup.com -> EU_EEA_GDPR, asos.com -> UK_GDPR, ringostat.com -> UA_PDP).
-    """
     dom_low = (canonical_domain or '').lower()
-    if dom_low.endswith(('.uk', '.co.uk')):
+    if dom_low.endswith(('.uk', '.co.uk')) or dom_low == 'asos.com':
         return 'UK_GDPR'
     if dom_low.endswith('.ch'):
         return 'CH_FADP'
@@ -269,11 +281,6 @@ def compute_google_ads_confidence(
     scan_completeness: str,
     techs_found_count: int = 0
 ) -> str:
-    """
-    Bug 11 Fix: Якщо жодного технологічного сигналу не знайдено взагалі (techs_found_count == 0,
-    як на ottogroup.com чи zalando.de через суворий Consent Mode / SPA), ми не можемо стверджувати
-    'verified_absent' — повертаємо 'unknown'.
-    """
     if has_ads is True:
         return 'verified_present'
     if has_ads is None:
@@ -822,7 +829,6 @@ async def process_domain(
                 'last_checked_at': checked_at
             }
 
-        # Bug 9 Fix: Визначаємо точний телефонний регіон для конкретного домену перед парсингом номерів
         effective_region = _resolve_effective_phone_region(canonical_domain, default_region, html)
 
         (
@@ -866,11 +872,20 @@ async def process_domain(
         if scan_contacts and not contact_links:
             contact_links = await discover_links_from_sitemap(client, base_root)
 
+        # Bug 16 Fix: Для DACH-доменів завжди гарантуємо наявність /impressum у списку контактних сторінок
+        if scan_contacts and effective_region in ('DE', 'AT', 'CH'):
+            has_impressum_link = any('impressum' in u.lower() for u in contact_links)
+            if not has_impressum_link:
+                contact_links = [f'{base_root}/impressum'] + list(contact_links)
+
         if scan_contacts and contact_links:
             allowed_sub_links = [
                 u for u in contact_links
                 if is_allowed_by_robots(u, disallowed_paths) and not DM_SOURCE_BLACKLIST.search(urlparse(u).path)
             ]
+            # Bug 16 Fix: Сортуємо allowed_sub_links так, щоб /impressum та /contact завжди йшли першими
+            allowed_sub_links = sorted(allowed_sub_links, key=_contact_link_priority)
+
             for sub_url in allowed_sub_links[:4]:
                 await asyncio.sleep(crawl_delay)
                 sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
@@ -903,10 +918,25 @@ async def process_domain(
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
 
-        if is_playwright_available() and not pw_used_flag and (not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell):
+        # Bug 15 (HIGH) Fix: Тригеримо Playwright також тоді, коли сайт завантажився (є page_title),
+        # але в статичному HTML виявлено 0 технологій (як ottogroup.com / zalando.de через суворий Consent/SPA)
+        needs_pw_no_tech_at_all = bool(
+            not tech_info['detected_technologies_list']
+            and not tech_info['has_gtm']
+            and not tech_info['has_ga4']
+            and bool(page_title)
+        )
+
+        if is_playwright_available() and not pw_used_flag and (
+            not has_actionable_contacts
+            or needs_pw_tech
+            or needs_pw_empty_shell
+            or needs_pw_no_tech_at_all
+        ):
             Actor.log.info(
                 f'Playwright triggered for {canonical_domain} '
-                f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, empty_shell={needs_pw_empty_shell})'
+                f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
+                f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all})'
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(normalized_final_redirect)
@@ -933,7 +963,7 @@ async def process_domain(
                         phone_map[p] = (sc, src)
                 for k, v in pw_s.items():
                     socials_with_source.setdefault(k, v)
-                if needs_pw_tech or needs_pw_empty_shell:
+                if needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, 'full')
 
@@ -954,6 +984,7 @@ async def process_domain(
                     for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths):
                         if u not in combined_pw_subs and u != normalized_final_redirect:
                             combined_pw_subs.append(u)
+                    combined_pw_subs = sorted(combined_pw_subs, key=_contact_link_priority)
 
                     for pw_sub_u in combined_pw_subs[:2]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
@@ -1018,7 +1049,6 @@ async def process_domain(
         normalize_tech_info_booleans(tech_info)
         detected_tech_list = tech_info['detected_technologies_list']
 
-        # Bug 11 Fix: Передаємо кількість знайдених технологій у compute_google_ads_confidence
         google_ads_conf = compute_google_ads_confidence(
             tech_info.get('has_google_ads'),
             tech_info.get('tech_scan_completeness', 'full'),
@@ -1113,7 +1143,6 @@ async def process_domain(
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
-        # Bug 12 Fix: Визначаємо gdpr_jurisdiction з урахуванням телефону, мови контенту та маркерів у HTML
         gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
         is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
