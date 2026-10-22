@@ -101,11 +101,14 @@ ROLES_REGEX_PART = (
 
 UPPER_CHAR_CLASS = r'A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦŨŪŬŮŰŲŴŶŸŹŻŽ'
 LOWER_CHAR_CLASS = r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\'-'
+# Patch A (Bug 14 Fix): Клас малих літер БЕЗ дефіса, щоб перша частина подвійного прізвища не поглинала дефіс перед великою літерою
+LOWER_CHAR_CLASS_NO_HYPHEN = (
+    r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\''
+)
 
-# Bug 14 Fix: Підтримка подвійних прізвищ та імен через дефіс з великої літери (напр. Petra Scharner-Wolff, Karl-Heinz)
 HYPHENATED_WORD_PART = (
-    rf'[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}}'
-    rf'(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS}]{{2,20}})?'
+    rf'[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}}'
+    rf'(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}})?'
 )
 
 NAME_REGEX_PART = (
@@ -163,6 +166,7 @@ DEPARTMENT_PREFIX_BLACKLIST = {
     'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa'
 }
 
+# Patch B (Issue 17 Fix): Додано множинні форми посад (керівники, директори, executives, führungskräfte тощо)
 ROLE_TOKEN_BLACKLIST = {
     'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
     'partner', 'chairman', 'executive', 'founder', 'cofounder', 'co-founder',
@@ -171,6 +175,9 @@ ROLE_TOKEN_BLACKLIST = {
     'директор', 'директорка', 'керівник', 'керівниця', 'начальник', 'президент',
     'засновник', 'засновниця', 'співзасновник', 'співзасновниця', 'власник',
     'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан',
+    'керівники', 'менеджери', 'директори', 'засновники', 'співробітники', 'власники',
+    'executives', 'managers', 'directors', 'founders', 'employees', 'owners',
+    'leitung', 'führungskräfte', 'dirigeants', 'directivos', 'dirigenti', 'bestuurders',
     'geschäftsführer', 'geschäftsführerin', 'geschäftsführung', 'inhaber', 'inhaberin',
     'gründer', 'gründerin', 'mitgründer', 'vorstand', 'marketingleiter', 'vertriebsleiter',
     'pdg', 'président', 'présidente', 'directeur', 'directrice', 'gérant', 'gérante',
@@ -330,6 +337,9 @@ STOP_NAME_WORDS = {
     'Публічна', 'Оферта', 'Договір', 'Персональних', 'Даних', 'Захисту', 'Права',
     'Читати', 'Детальніше', 'Дивитися', 'Переглянути', 'Автор', 'Спікер', 'Експерт',
     'Building', 'Link', 'Кейс', 'Відгук', 'Стаття',
+    'Керівники', 'Менеджери', 'Директори', 'Засновники', 'Співробітники',
+    'Executives', 'Managers', 'Directors', 'Founders', 'Employees',
+    'Leitung', 'Führungskräfte', 'Dirigeants', 'Directivos', 'Dirigenti', 'Bestuurders',
     'Impressum', 'Datenschutz', 'Haftungsausschluss', 'Handelsregister', 'Amtsgericht',
     'Umsatzsteuer', 'Steuernummer', 'Verbraucherstreitbeilegung', 'Streitschlichtung',
     'Mentions', 'Légales', 'Politique', 'Confidentialité', 'Conditions', 'Générales',
@@ -383,6 +393,26 @@ EU_GDPR_TLDS = (
     '.dk', '.fi', '.ie', '.pt', '.cz', '.ro', '.hu', '.sk', '.bg', '.hr',
     '.lt', '.lv', '.ee', '.si', '.lu', '.mt', '.cy', '.gr', '.ch', '.no', '.is', '.uk', '.co.uk'
 )
+
+# Patch D (Issue 19 Fix): Довідник юрисдикцій для відомих брендів на .com, які можуть блокувати скан WAF-ом
+KNOWN_JURISDICTION_HINTS: dict[str, str] = {
+    'bol.com': 'EU_EEA_GDPR',
+    'liki24.com': 'UA_PDP',
+    'asos.com': 'UK_GDPR',
+    'ottogroup.com': 'EU_EEA_GDPR',
+    'ringostat.com': 'UA_PDP',
+    'macpaw.com': 'UA_PDP',
+    'readdle.com': 'UA_PDP',
+    'cher17.com': 'UA_PDP',
+    'ajax.systems': 'UA_PDP',
+    'zalando.de': 'EU_EEA_GDPR',
+    'otto.de': 'EU_EEA_GDPR',
+    'aboutyou.de': 'EU_EEA_GDPR',
+    'docmorris.de': 'EU_EEA_GDPR',
+    'coolblue.nl': 'EU_EEA_GDPR',
+    'laredoute.fr': 'EU_EEA_GDPR',
+    'unicredit.it': 'EU_EEA_GDPR',
+}
 
 JUNK_EMAIL_LOCALS = {
     'test', 'testing', 'example', 'user', 'username', 'name', 'firstname',
@@ -447,6 +477,7 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
+# Patch C (Issue 18 Fix): Додано dsa, dsa.concerns, concerns, regulator, regulatory до LOW_PRIORITY_PREFIXES
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
@@ -455,7 +486,9 @@ LOW_PRIORITY_PREFIXES = (
     'bewerbung', 'karriere', 'personal', 'buchhaltung', 'rechnung', 'rechnungen',
     'recrutement', 'rh', 'comptabilite', 'facturation', 'rrhh', 'empleo',
     'facturacion', 'contabilita', 'lavoraconnoi', 'rekrutacja', 'kadry', 'ksiegowosc',
-    'faktury', 'vacatures', 'facturatie', 'administracja', 'inspektor', 'iod', 'rodo'
+    'faktury', 'vacatures', 'facturatie', 'administracja', 'inspektor', 'iod', 'rodo',
+    'dsa', 'dsaconcerns', 'dsa.concerns', 'concerns', 'regulator', 'regulatory',
+    'compliancereport', 'compliance-report', 'dsareport', 'dsa-report'
 )
 REGIONAL_BRANCH_LOCALS = {
     'kyiv', 'kiev', 'lviv', 'odesa', 'odessa', 'kharkiv', 'dnipro',
@@ -476,7 +509,7 @@ NON_PERSON_TOKENS = (
     | set(PR_MEDIA_PREFIXES)
     | set(LOW_PRIORITY_PREFIXES)
     | REGIONAL_BRANCH_LOCALS
-    | {'corp', 'department', 'dept', 'official', 'press'}
+    | {'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns', 'regulatory'}
 )
 
 B2B_PHONE_KEYWORDS = (
