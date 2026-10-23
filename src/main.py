@@ -44,6 +44,7 @@ from .qualifier import (
 from .scraper import (
     classify_failure_status,
     close_shared_playwright_browser,
+    configure_pw,
     discover_links_from_sitemap,
     extract_semantic_contact_links_from_html,
     fetch_gtm_scripts,
@@ -56,6 +57,7 @@ from .scraper import (
     load_robots_rules,
     parse_html_sync,
     prepare_domains,
+    pw_locale_for_region,
 )
 from .tech_detector import (
     build_summary_from_cached_record,
@@ -298,13 +300,6 @@ def compute_google_ads_confidence(
     consent_mode_likely: bool = False,
     pw_rendered: bool = False
 ) -> str:
-    """
-    Визначає достовірність наявності/відсутності Google Ads:
-    - якщо тег знайдено -> 'verified_present'
-    - якщо скан неповний або 0 технологій -> 'unknown'
-    - якщо є активний Cookie Consent банер і Playwright не відрендерив сторінку -> 'not_observed_consent_gated'
-    - якщо стек відкритий (є інші теги без consent-блокування) -> 'verified_absent'
-    """
     if has_ads is True:
         return 'verified_present'
     if has_ads is None:
@@ -518,18 +513,20 @@ async def process_domain(
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
-        # Запускаємо Playwright rescue не лише при status == 0, а й при HTTP 403 / 429 / 503 (bol.com, laredoute.fr, asos.com)
         if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
             rescue_url = clean_url_port(root_url) or root_url
             pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
+            rescue_locale = pw_locale_for_region(_guess_region_from_domain(canonical_domain) or default_region)
             Actor.log.info(
                 f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
-                f'attempting Playwright rescue on {rescue_url}'
+                f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale})'
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(rescue_url)
             pw_rescue_html, pw_rescue_url, pw_rescue_status, pw_rescue_inc = await fetch_html_playwright_fallback(
-                rescue_url, proxy_url=pw_proxy
+                rescue_url,
+                proxy_url=pw_proxy,
+                locale=rescue_locale,
             )
             if pw_rescue_status == 'rendered' and pw_rescue_html:
                 Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
@@ -541,6 +538,8 @@ async def process_domain(
                 pw_used_flag = True
                 pw_status_str = 'rendered'
                 canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+                if pw_rescue_inc:
+                    pw_had_timeout_or_block = True
             else:
                 pw_status_str = pw_rescue_status
                 if pw_rescue_inc:
@@ -1007,15 +1006,18 @@ async def process_domain(
             or needs_pw_no_tech_at_all
         ):
             pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
+            pw_locale = pw_locale_for_region(effective_region)
             Actor.log.info(
                 f'Playwright triggered for {canonical_domain} '
                 f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
-                f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all})'
+                f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all}, locale={pw_locale})'
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(normalized_final_redirect)
             pw_html, pw_url, pw_status_str, pw_incomplete = await fetch_html_playwright_fallback(
-                normalized_final_redirect, proxy_url=pw_proxy
+                normalized_final_redirect,
+                proxy_url=pw_proxy,
+                locale=pw_locale,
             )
             if pw_incomplete:
                 pw_had_timeout_or_block = True
@@ -1041,7 +1043,8 @@ async def process_domain(
                     socials_with_source.setdefault(k, v)
                 if needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
-                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, 'full')
+                    pw_comp = 'partial_timeout' if pw_incomplete else 'full'
+                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, pw_comp)
 
                 after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
                 if scan_contacts and not (after_pw_emails or phone_map):
@@ -1067,7 +1070,11 @@ async def process_domain(
                             pw_attempts_count += 1
                             pw_attempted_paths.append(pw_sub_u)
                             sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(
-                                pw_sub_u, proxy_url=pw_proxy
+                                pw_sub_u,
+                                proxy_url=pw_proxy,
+                                locale=pw_locale,
+                                accept_consent=False,
+                                max_attempts=1,
                             )
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
@@ -1132,7 +1139,7 @@ async def process_domain(
             tech_info.get('tech_scan_completeness', 'full'),
             len(detected_tech_list),
             bool(tech_info.get('has_cookie_banner')),
-            pw_used_flag
+            pw_used_flag and not pw_had_timeout_or_block
         )
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
@@ -1432,6 +1439,16 @@ async def main() -> None:
                 proxy_config = await Actor.create_proxy_configuration()
         except Exception:
             proxy_config = None
+
+        res_cfg = None
+        try:
+            res_cfg = await Actor.create_proxy_configuration(groups=['RESIDENTIAL'])
+        except Exception:
+            res_cfg = None
+        configure_pw(
+            escalation_proxy=res_cfg,
+            max_concurrent=actor_input.get('maxBrowserConcurrency', 3),
+        )
 
         total_domains = len(prepared_domains)
         Actor.log.info(
