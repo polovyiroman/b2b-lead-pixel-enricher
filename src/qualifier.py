@@ -46,7 +46,6 @@ def classify_company_category(
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
 
-    # Bug 10 Fix: Розширений перелік ключових слів для EU/UA/US E-commerce та Fashion-ритейлерів (напр. aboutyou.de)
     ecom_keywords = (
         'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
         'shop', 'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
@@ -61,20 +60,13 @@ def classify_company_category(
         'sklep internetowy', 'koszyk', 'darmowa dostawa', 'kup teraz', 'zakupy online',
         'loja online', 'frete grátis', 'carrinho', 'comprar agora',
         'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv',
-        # EN fashion & retail
         'fashion', 'fashion online', 'accessories', 'footwear', 'sportswear', 'streetwear',
-        # DE fashion & retail
         'mode', 'bekleidung', 'kleidung', 'schuhe', 'taschen', 'accessoires',
         'damenmode', 'herrenmode', 'online-shop für mode', 'top-marken', 'versandapotheke', 'online-apotheke',
-        # FR fashion & retail
         'prêt-à-porter', 'vêtements', 'chaussures', 'sacs', 'mode en ligne',
-        # IT fashion & retail
         'moda', 'abbigliamento', 'scarpe', 'borse', 'moda online',
-        # NL fashion & retail
         'kleding', 'schoenen', 'tassen', 'modewinkel',
-        # PL fashion & retail
         'odzież', 'buty', 'torebki', 'moda online',
-        # ES / PT fashion & retail
         'ropa', 'zapatos', 'bolsos', 'moda mujer', 'vestuário', 'calçado'
     )
     has_product_schema = (
@@ -404,6 +396,11 @@ def evaluate_qualification_v180(
             readiness_verdict = 'Unverified (Playwright Blocked by WAF — Retry with Residential Proxy)'
         else:
             readiness_verdict = 'Unqualified (No Tech Signals & No Actionable Contacts — Needs Manual Review)'
+    elif dm_name and is_same_person_li:
+        if all_signals:
+            readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
+        else:
+            readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
     elif not all_signals:
         if dm_name:
             readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
@@ -411,8 +408,6 @@ def evaluate_qualification_v180(
             readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
-    elif dm_name and is_same_person_li:
-        readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
     elif best_email_type == 'marketing_or_exec_role':
         readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif best_email_type == 'b2b_partnerships':
@@ -447,6 +442,13 @@ def evaluate_qualification_v180(
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
+    has_real_signals = bool(all_signals)
+    stack_ref_clause = (
+        f' referencing detected stack ({detected_signals_str})'
+        if has_real_signals
+        else ' to initiate B2B discovery (verify tracking stack manually first)'
+    )
+
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
     elif company_category == 'Non-Profit / Education / Institution':
@@ -461,8 +463,8 @@ def evaluate_qualification_v180(
             next_action = 'Skip or review website manually (no tech signals or contacts detected)'
     elif dm_name and is_same_person_li:
         next_action = (
-            f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url} "
-            f"referencing detected stack ({detected_signals_str})"
+            f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url}"
+            f"{stack_ref_clause}"
         )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
@@ -487,8 +489,8 @@ def evaluate_qualification_v180(
             )
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
-            f"Send tailored discovery audit offer to {best_email} ({best_email_type}) "
-            f"referencing detected stack ({detected_signals_str})"
+            f"Send tailored discovery audit offer to {best_email} ({best_email_type})"
+            f"{stack_ref_clause}"
         )
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
         dm_hint = f" ({dm_name})" if dm_name else ""
