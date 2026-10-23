@@ -74,6 +74,7 @@ GTM_FALSE_POSITIVES = {
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
+# Вилучено Aufsichtsratsvorsitzender (наглядова рада), додано Vorstandsvorsitzende та Bereichsvorstand (операційні CEO)
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
     r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
@@ -82,7 +83,7 @@ ROLES_REGEX_PART = (
     r'Генеральний директор|Директор з маркетингу|Керівник відділу маркетингу|'
     r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор|'
     r'Geschäftsführer|Geschäftsführerin|Geschäftsführung|Inhaber|Inhaberin|'
-    r'Gründer|Gründerin|Mitgründer|Mitgründerin|Vorstandsvorsitzender|Vorstand|Aufsichtsratsvorsitzender|'
+    r'Gründer|Gründerin|Mitgründer|Mitgründerin|Vorstandsvorsitzender|Vorstandsvorsitzende|Bereichsvorstand|Vorstand|'
     r'Marketingleiter|Marketingleiterin|Leiter Marketing|Vertriebsleiter|'
     r'PDG|Président-Directeur Général|Président|Présidente|Directeur Général|Directrice Générale|'
     r'Gérant|Gérante|Associé Gérant|Fondateur|Fondatrice|Co-fondateur|Co-fondatrice|'
@@ -129,6 +130,13 @@ FOP_OWNER_PATTERN = re.compile(
     re.UNICODE
 )
 
+# Спеціальний патерн для німецького "Vertreten durch den Vorstand: Ім'я Прізвище" в Impressum
+VERTRETEN_DURCH_PATTERN = re.compile(
+    rf'(?:Vertreten\s+durch(?:\s+den\s+Vorstand|\s+die\s+Geschäftsführung)?|Vorstandsvorsitzende[r]?|Bereichsvorstand)\s*[:\-–—]?\s*'
+    rf'(?:Dr\.\s+|Prof\.\s+)*{NAME_REGEX_PART}',
+    re.UNICODE | re.IGNORECASE
+)
+
 TESTIMONIAL_TEXT_MARKERS = (
     'відгук', 'відгуки', 'наші клієнти', 'клієнти про нас', 'що кажуть клієнти',
     'testimonial', 'testimonials', 'what our clients say', 'customer stories',
@@ -142,7 +150,6 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
-# Issue 20 Fix: Міста та локації, які стоять поруч із ПІБ на сторінках топ-менеджменту (напр. "Benjamin Schaper Hamburg")
 CITY_NAMES_BLACKLIST = {
     'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
     'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
@@ -167,17 +174,23 @@ UI_ACTION_WORDS_BLACKLIST = {
     'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere'
 }
 
+# Bug 22 Fix: Додано німецькі governance-терміни (gesellschafterrat, gesellschafterrats, aufsichtsrat, stiftungsrat тощо)
 DEPARTMENT_PREFIX_BLACKLIST = {
     'compliance', 'sustainability', 'communications', 'communication', 'corporate',
     'legal', 'finance', 'investor', 'relations', 'human', 'resources', 'public',
     'affairs', 'customer', 'experience', 'product', 'operations', 'marketing',
     'sales', 'support', 'service', 'press', 'media', 'group', 'holding', 'retail',
     'commerce', 'fashion', 'technology', 'innovation', 'governance', 'responsibility',
-    'nachhaltigkeit', 'strategie', 'verantwortung', 'aufsichtsrat', 'vorstand',
+    'nachhaltigkeit', 'strategie', 'verantwortung', 'aufsichtsrat', 'aufsichtsrats',
+    'aufsichtsratsvorsitzender', 'ehrenvorsitzender', 'gesellschafterrat',
+    'gesellschafterrats', 'gesellschafterversammlung', 'gesellschafter',
+    'gesellschafterin', 'gesellschafterinnen', 'stiftungsrat', 'kuratorium',
+    'vorstand', 'vorstandsvorsitzender', 'vorstandsvorsitzende', 'bereichsvorstand',
     'beirat', 'presse', 'kommunikation', 'datenschutz', 'unternehmenskommunikation',
     'recht', 'finanzen', 'personal', 'einkauf', 'vertrieb', 'logistik', 'konzern',
     'gruppe', 'unternehmen', 'immer', 'durabilité', 'stratégie', 'responsabilité',
-    'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa'
+    'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa',
+    'laadpalen', 'zonnepanelen', 'energie', 'installatie'
 }
 
 ROLE_TOKEN_BLACKLIST = {
@@ -192,7 +205,9 @@ ROLE_TOKEN_BLACKLIST = {
     'executives', 'managers', 'directors', 'founders', 'employees', 'owners',
     'leitung', 'führungskräfte', 'dirigeants', 'directivos', 'dirigenti', 'bestuurders',
     'geschäftsführer', 'geschäftsführerin', 'geschäftsführung', 'inhaber', 'inhaberin',
-    'gründer', 'gründerin', 'mitgründer', 'vorstand', 'aufsichtsratsvorsitzender',
+    'gründer', 'gründerin', 'mitgründer', 'vorstand', 'vorstandsvorsitzender',
+    'vorstandsvorsitzende', 'bereichsvorstand', 'aufsichtsratsvorsitzender',
+    'gesellschafterrat', 'gesellschafterrats', 'vorsitzender', 'vorsitzende',
     'marketingleiter', 'vertriebsleiter',
     'pdg', 'président', 'présidente', 'directeur', 'directrice', 'gérant', 'gérante',
     'fondateur', 'fondatrice', 'responsable', 'fundador', 'fundadora', 'gerente',
@@ -253,6 +268,8 @@ ROLE_NORMALIZATION_MAP = {
     'geschäftsführerin': 'Managing Director / CEO',
     'geschäftsführung': 'Managing Director / CEO',
     'vorstandsvorsitzender': 'Chief Executive Officer (CEO)',
+    'vorstandsvorsitzende': 'Chief Executive Officer (CEO)',
+    'bereichsvorstand': 'Executive Board / CEO',
     'vorstand': 'Executive Board / CEO',
     'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
@@ -367,13 +384,14 @@ STOP_NAME_WORDS = {
     'Finance', 'Investor', 'Relations', 'Human', 'Resources', 'Public', 'Affairs',
     'Experience', 'Product', 'Operations', 'Group', 'Holding', 'Retail', 'Commerce',
     'Fashion', 'Management', 'Board', 'Committee', 'Council', 'Division', 'Solutions',
-    'Nachhaltigkeit', 'Strategie', 'Verantwortung', 'Aufsichtsrat', 'Vorstand',
+    'Nachhaltigkeit', 'Strategie', 'Verantwortung', 'Aufsichtsrat', 'Aufsichtsrats',
+    'Gesellschafterrat', 'Gesellschafterrats', 'Gesellschafterversammlung',
+    'Stiftungsrat', 'Kuratorium', 'Ehrenvorsitzender', 'Vorstand', 'Bereichsvorstand',
     'Beirat', 'Presse', 'Kommunikation', 'Unternehmenskommunikation', 'Recht',
     'Finanzen', 'Personal', 'Einkauf', 'Immer', 'Schritt', 'Voraus', 'Konzern',
     'Gruppe', 'Unternehmen', 'Überblick', 'Themen', 'Karriere', 'Zukunft',
     'Durabilité', 'Stratégie', 'Responsabilité', 'Presse', 'Groupe', 'Entreprise',
     'Sostenibilità', 'Strategia', 'Responsabilità', 'Comunicazione', 'Stampa', 'Gruppo',
-    # Issue 20 Fix: міста, щоб "Benjamin Schaper Hamburg" ставав "Benjamin Schaper"
     'Hamburg', 'Berlin', 'München', 'Muenchen', 'Munich', 'Frankfurt', 'Köln', 'Koeln',
     'Düsseldorf', 'Duesseldorf', 'Stuttgart', 'Leipzig', 'Dresden', 'Hannover', 'Bremen',
     'Nürnberg', 'Nuremberg', 'Wien', 'Vienna', 'Zürich', 'Zurich', 'London', 'Paris',
@@ -436,12 +454,14 @@ KNOWN_JURISDICTION_HINTS: dict[str, str] = {
     'unicredit.it': 'EU_EEA_GDPR',
 }
 
+# Додано newsletter / mailing / unsubscribe у сміттєві локалі, щоб newsletter@mail.otto.de відсікався
 JUNK_EMAIL_LOCALS = {
     'test', 'testing', 'example', 'user', 'username', 'name', 'firstname',
     'lastname', 'yourname', 'youremail', 'email', 'mail', 'sample', 'demo',
     'foo', 'bar', 'admin', 'root', 'webmaster', 'postmaster', 'hostmaster',
     'abuse', 'noreply', 'no-reply', 'donotreply', 'do-not-reply', 'mailer-daemon',
-    'xxx', 'abc', '123', 'null', 'none', 'undefined', 'u002f', 'u003e', 'u003c', 'jira'
+    'xxx', 'abc', '123', 'null', 'none', 'undefined', 'u002f', 'u003e', 'u003c', 'jira',
+    'newsletter', 'newsletters', 'unsubscribe', 'mailer', 'bounce', 'bounces'
 }
 
 JUNK_EXTENSIONS = (
@@ -481,12 +501,12 @@ GENERAL_OFFICE_PREFIXES = (
     'accueil', 'bonjour', 'contacto', 'hola', 'atencion', 'administracion',
     'contatti', 'segreteria', 'kantoor', 'administratie', 'kontor', 'post', 'firmapost'
 )
+# Bug 23 Fix: прибрано laadpalen, zonnepanelen, energie, installatie — вони тепер повертають чистий department_or_general_inbox
 DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
     'department', 'faculty', 'edu', 'study', 'courses', 'academy',
     'booking', 'reservation', 'delivery', 'logistics', 'export', 'import',
-    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn',
-    'laadpalen', 'zonnepanelen', 'energie', 'installatie'
+    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn'
 )
 SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
@@ -501,9 +521,11 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
+# Додано impressum та productcompliance до LOW_PRIORITY_PREFIXES (legal_or_hr_inbox)
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
+    'productcompliance', 'impressum',
     'gdpr', 'billing', 'invoice', 'invoices', 'accounting', 'finance',
     'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira',
     'bewerbung', 'karriere', 'personal', 'buchhaltung', 'rechnung', 'rechnungen',
@@ -534,7 +556,11 @@ NON_PERSON_TOKENS = (
     | set(PR_MEDIA_PREFIXES)
     | set(LOW_PRIORITY_PREFIXES)
     | REGIONAL_BRANCH_LOCALS
-    | {'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns', 'regulatory', 'ops', 'whsl'}
+    | {
+        'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns',
+        'regulatory', 'ops', 'whsl', 'laadpalen', 'zonnepanelen', 'energie',
+        'installatie', 'impressum', 'productcompliance'
+    }
 )
 
 B2B_PHONE_KEYWORDS = (
