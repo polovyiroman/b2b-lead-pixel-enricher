@@ -82,8 +82,11 @@ AD_PIXEL_LABELS = {
     'Pinterest Tag',
 }
 
+# Issue 21 Fix: Додано роз'яснення, що gdpr_jurisdiction відображає операційний/ринковий штаб (для Delaware Inc з UA/EU офісами)
 COMPLIANCE_DEFAULT_NOTE = (
-    'Enriched for legitimate B2B interest; public site data; deletion on request via support'
+    'Enriched for legitimate B2B interest from public site data; '
+    'jurisdiction hint reflects operational/market HQ (verify registered legal entity for DPA); '
+    'deletion on request via support'
 )
 
 EU_PHONE_PREFIXES = (
@@ -213,10 +216,6 @@ def _derive_gdpr_jurisdiction(
     content_lang_hint: str = '',
     html_sample: str = ''
 ) -> str:
-    """
-    Patch D (Issue 19 Fix): Визначає юрисдикцію з підтримкою KNOWN_JURISDICTION_HINTS
-    на першому кроці, щоб bol.com -> EU_EEA_GDPR та liki24.com -> UA_PDP працювали навіть при WAF-блокуванні.
-    """
     dom_low = (canonical_domain or '').lower()
     if dom_low in KNOWN_JURISDICTION_HINTS:
         return KNOWN_JURISDICTION_HINTS[dom_low]
@@ -391,6 +390,11 @@ def detect_country_hint(
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
+    """
+    Гарантує строгий Tri-State (True / False / None):
+    Якщо scan_completeness in ('partial_timeout', 'partial_blocked', 'partial_cached')
+    або жодного тегу не знайдено при неповному скані, усі невиявлені прапорці стають None.
+    """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
@@ -416,7 +420,10 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
         tech_info['tech_scan_completeness'] = 'full'
 
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
+    is_hard_partial = (
+        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached')
+        or (not techs_set and scan_comp != 'full')
+    )
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
@@ -451,8 +458,15 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
     elif cached_copy.get('tech_scan_completeness') == 'partial_gtm' and has_any_ad_pixel:
         cached_copy['tech_scan_completeness'] = 'full'
 
+    has_cached_tech = bool('Google Tag Manager' in techs_set or 'Google Analytics (GA4)' in techs_set or cached_copy.get('all_ga4_ids'))
+    if not has_cached_tech and cached_copy.get('tech_scan_completeness') == 'full':
+        cached_copy['tech_scan_completeness'] = 'partial_cached'
+
     scan_comp = cached_copy.get('tech_scan_completeness', 'full')
-    is_hard_partial = scan_comp in ('partial_timeout', 'partial_blocked')
+    is_hard_partial = (
+        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached')
+        or not techs_set
+    )
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
@@ -903,6 +917,7 @@ async def process_domain(
             ]
             allowed_sub_links = sorted(allowed_sub_links, key=_contact_link_priority)
 
+            impressum_403_triggered = False
             for sub_url in allowed_sub_links[:4]:
                 await asyncio.sleep(crawl_delay)
                 sub_status, sub_html, sub_final_url, _ = await fetch_html_safely(
@@ -929,6 +944,28 @@ async def process_domain(
                             phone_map[p] = (sc, src)
                     for k, v in sub_s.items():
                         socials_with_source.setdefault(k, v)
+                elif 'impressum' in sub_url.lower() and not impressum_403_triggered:
+                    impressum_403_triggered = True
+                    sitemap_Wait_links = await discover_links_from_sitemap(client, base_root)
+                    for sm_u in sitemap_Wait_links:
+                        if sm_u not in allowed_sub_links and is_allowed_by_robots(sm_u, disallowed_paths):
+                            s_st, s_ht, s_fin, _ = await fetch_html_safely(
+                                client, sm_u, proxy_config=proxy_config, timeout=7.0, retries=1
+                            )
+                            if 200 <= s_st < 400 and s_ht:
+                                st_t, _, st_txt, st_e, st_p, st_s, _ = await loop.run_in_executor(
+                                    thread_pool, parse_html_sync, s_ht, s_fin, effective_region
+                                )
+                                if not is_soft_404_page(s_ht, st_t):
+                                    pages_with_urls.append((s_fin, s_ht, st_txt))
+                                    for em, src in st_e.items():
+                                        email_sources.setdefault(em, src)
+                                    for p, sc, src in st_p:
+                                        if p not in phone_map or sc > phone_map[p][0]:
+                                            phone_map[p] = (sc, src)
+                                    for k, v in st_s.items():
+                                        socials_with_source.setdefault(k, v)
+                                    break
 
         prelim_clean_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
         has_actionable_contacts = bool(prelim_clean_emails or phone_map)
