@@ -74,7 +74,6 @@ GTM_FALSE_POSITIVES = {
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
-# Вилучено Aufsichtsratsvorsitzender (наглядова рада), додано Vorstandsvorsitzende та Bereichsvorstand (операційні CEO)
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
     r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
@@ -130,7 +129,6 @@ FOP_OWNER_PATTERN = re.compile(
     re.UNICODE
 )
 
-# Спеціальний патерн для німецького "Vertreten durch den Vorstand: Ім'я Прізвище" в Impressum
 VERTRETEN_DURCH_PATTERN = re.compile(
     rf'(?:Vertreten\s+durch(?:\s+den\s+Vorstand|\s+die\s+Geschäftsführung)?|Vorstandsvorsitzende[r]?|Bereichsvorstand)\s*[:\-–—]?\s*'
     rf'(?:Dr\.\s+|Prof\.\s+)*{NAME_REGEX_PART}',
@@ -174,7 +172,6 @@ UI_ACTION_WORDS_BLACKLIST = {
     'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere'
 }
 
-# Bug 22 Fix: Додано німецькі governance-терміни (gesellschafterrat, gesellschafterrats, aufsichtsrat, stiftungsrat тощо)
 DEPARTMENT_PREFIX_BLACKLIST = {
     'compliance', 'sustainability', 'communications', 'communication', 'corporate',
     'legal', 'finance', 'investor', 'relations', 'human', 'resources', 'public',
@@ -231,6 +228,7 @@ ROLE_WORDS_IN_CONTEXT = (
     'marknad', 'försäljning', 'salg'
 )
 
+# Точніше розрізнення CEO vs Board Member / Managing Director
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
     'chief marketing officer': 'Chief Marketing Officer (CMO)',
@@ -260,49 +258,49 @@ ROLE_NORMALIZATION_MAP = {
     'head of digital': 'Head of Digital',
     'ceo': 'Chief Executive Officer (CEO)',
     'генеральний директор': 'Chief Executive Officer (CEO)',
-    'директор': 'Managing Director / CEO',
-    'директорка': 'Managing Director / CEO',
+    'директор': 'Managing Director',
+    'директорка': 'Managing Director',
     'general manager': 'General Manager',
-    'managing director': 'Managing Director / CEO',
-    'geschäftsführer': 'Managing Director / CEO',
-    'geschäftsführerin': 'Managing Director / CEO',
-    'geschäftsführung': 'Managing Director / CEO',
+    'managing director': 'Managing Director',
+    'geschäftsführer': 'Managing Director (Geschäftsführer)',
+    'geschäftsführerin': 'Managing Director (Geschäftsführerin)',
+    'geschäftsführung': 'Managing Director (Geschäftsführung)',
     'vorstandsvorsitzender': 'Chief Executive Officer (CEO)',
     'vorstandsvorsitzende': 'Chief Executive Officer (CEO)',
     'bereichsvorstand': 'Executive Board / CEO',
-    'vorstand': 'Executive Board / CEO',
+    'vorstand': 'Executive Board Member (Vorstand)',
     'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
     'président-directeur général': 'Chief Executive Officer (CEO)',
     'président': 'President / CEO',
     'présidente': 'President / CEO',
-    'directeur général': 'Managing Director / CEO',
-    'directrice générale': 'Managing Director / CEO',
-    'gérant': 'Managing Director / CEO',
-    'gérante': 'Managing Director / CEO',
+    'directeur général': 'Managing Director',
+    'directrice générale': 'Managing Director',
+    'gérant': 'Managing Director',
+    'gérante': 'Managing Director',
     'associé gérant': 'Managing Partner',
-    'director general': 'Managing Director / CEO',
-    'directora general': 'Managing Director / CEO',
+    'director general': 'Managing Director',
+    'directora general': 'Managing Director',
     'consejero delegado': 'Chief Executive Officer (CEO)',
     'gerente general': 'General Manager',
     'socio director': 'Managing Partner',
     'amministratore delegato': 'Chief Executive Officer (CEO)',
-    'amministratore unico': 'Managing Director / CEO',
-    'direttore generale': 'Managing Director / CEO',
-    'algemeen directeur': 'Managing Director / CEO',
-    'bestuurder': 'Managing Director / Board Member',
+    'amministratore unico': 'Managing Director',
+    'direttore generale': 'Managing Director',
+    'algemeen directeur': 'Managing Director',
+    'bestuurder': 'Board Member / Managing Director',
     'prezes zarządu': 'Chief Executive Officer (CEO)',
     'wiceprezes zarządu': 'Vice President / Executive',
     'prezes': 'President / CEO',
-    'dyrektor zarządzający': 'Managing Director / CEO',
+    'dyrektor zarządzający': 'Managing Director',
     'członek zarządu': 'Board Member',
-    'diretor geral': 'Managing Director / CEO',
-    'diretora geral': 'Managing Director / CEO',
+    'diretor geral': 'Managing Director',
+    'diretora geral': 'Managing Director',
     'sócio-gerente': 'Managing Partner',
     'verkställande direktör': 'Chief Executive Officer (CEO)',
     'vd': 'Chief Executive Officer (CEO)',
-    'administrerende direktør': 'Managing Director / CEO',
-    'daglig leder': 'Managing Director / CEO',
+    'administrerende direktør': 'Managing Director',
+    'daglig leder': 'Managing Director',
     'founder': 'Founder',
     'засновник': 'Founder',
     'засновниця': 'Founder',
@@ -454,7 +452,6 @@ KNOWN_JURISDICTION_HINTS: dict[str, str] = {
     'unicredit.it': 'EU_EEA_GDPR',
 }
 
-# Додано newsletter / mailing / unsubscribe у сміттєві локалі, щоб newsletter@mail.otto.de відсікався
 JUNK_EMAIL_LOCALS = {
     'test', 'testing', 'example', 'user', 'username', 'name', 'firstname',
     'lastname', 'yourname', 'youremail', 'email', 'mail', 'sample', 'demo',
@@ -477,12 +474,13 @@ MARKETING_EXEC_PREFIXES = (
     'direction', 'gerance', 'direccion', 'direzione', 'directie',
     'zarzad', 'prezes', 'marknad', 'werbung', 'reklama', 'mercadeo'
 )
+# Додано new-business, newbusiness, newbiz для inweb.ua
 B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
     'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp',
     'kooperation', 'kooperationen', 'partenariat', 'partenariats', 'wspolpraca',
     'samenwerking', 'parcerias', 'alianzas', 'convenios', 'przetargi',
-    'partnerwerden', 'affiliate', 'affiliates'
+    'partnerwerden', 'affiliate', 'affiliates', 'new-business', 'newbusiness', 'newbiz'
 )
 WHOLESALE_MERCH_PREFIXES = (
     'wholesale', 'whsl', 'opt', 'orders', 'sales', 'sale', 'supply', 'procurement', 'buyer',
@@ -501,12 +499,13 @@ GENERAL_OFFICE_PREFIXES = (
     'accueil', 'bonjour', 'contacto', 'hola', 'atencion', 'administracion',
     'contatti', 'segreteria', 'kantoor', 'administratie', 'kontor', 'post', 'firmapost'
 )
-# Bug 23 Fix: прибрано laadpalen, zonnepanelen, energie, installatie — вони тепер повертають чистий department_or_general_inbox
+# Додано institutionen, behoerden, publicsector, щоб institutionen@info.otto.de отримував Tier C- замість B-
 DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
     'department', 'faculty', 'edu', 'study', 'courses', 'academy',
     'booking', 'reservation', 'delivery', 'logistics', 'export', 'import',
-    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn'
+    'logistik', 'versand', 'expedition', 'logistica', 'logistyka', 'magazyn',
+    'institutionen', 'behoerden', 'publicsector'
 )
 SUPPORT_PREFIXES = (
     'support', 'supportua', 'supportyo', 'help', 'service', 'care', 'customerservice',
@@ -521,7 +520,6 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
-# Додано impressum та productcompliance до LOW_PRIORITY_PREFIXES (legal_or_hr_inbox)
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
@@ -559,7 +557,7 @@ NON_PERSON_TOKENS = (
     | {
         'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns',
         'regulatory', 'ops', 'whsl', 'laadpalen', 'zonnepanelen', 'energie',
-        'installatie', 'impressum', 'productcompliance'
+        'installatie', 'impressum', 'productcompliance', 'institutionen', 'new'
     }
 )
 
