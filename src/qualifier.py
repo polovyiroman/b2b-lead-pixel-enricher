@@ -265,9 +265,10 @@ def evaluate_qualification_v180(
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
 
+    # Issue 27 Fix: Універсальне англомовне попередження без українського "(ФОП)" для AGB/Terms сторінок
     source_extra_note = ''
     if dm_source_is_legal and dm_source_type != 'impressum_page':
-        source_extra_note = ' DM identified from legal/offer document (ФОП) — verify active role via LinkedIn before outbound.'
+        source_extra_note = ' DM identified from legal/terms document — verify active operational role via LinkedIn before outbound.'
     elif dm_source_type in ('product_or_service_page', 'blog_or_press_page'):
         source_extra_note = f' DM identified on {dm_source_type} — verify active role via LinkedIn.'
 
@@ -314,7 +315,10 @@ def evaluate_qualification_v180(
             f'Warning: Email {best_email} belongs to a different person than '
             f'the executive found ({dm_name}). Do not address {best_email} as {dm_name}.{source_extra_note}'
         )
-    elif dm_name and best_email_type in ('legal_or_hr_inbox', 'customer_support_inbox', 'pr_and_media_inbox', 'influencer_gifting_inbox'):
+    elif dm_name and best_email_type in (
+        'legal_or_hr_inbox', 'customer_support_inbox', 'pr_and_media_inbox',
+        'influencer_gifting_inbox', 'admissions_or_department_inbox'
+    ):
         contact_quality = (
             f'Tier C- (Executive {dm_name} Identified on Site, '
             f'but Email {best_email} is {best_email_type} — Do Not Cold Pitch Email)'
