@@ -82,11 +82,6 @@ def _matches_prefix_safely(
     tokens: list[str],
     prefixes: tuple[str, ...]
 ) -> bool:
-    """
-    Запобігає помилковому спрацьовуванню коротких префіксів (напр. 'pr' у 'productcompliance' або 'privacy').
-    Префікси довжиною <= 3 символи перевіряються ТІЛЬКИ за точним збігом токена.
-    Довгі префікси (>= 4 символи) додатково перевіряються через startswith().
-    """
     prefix_set = set(prefixes)
     if local in prefix_set or normalized_local in prefix_set:
         return True
@@ -116,7 +111,6 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
             return 'pr_and_media_inbox'
         return 'brand_webmail_general_inbox'
 
-    # Спочатку перевіряємо LOW_PRIORITY_PREFIXES, щоб productcompliance@, impressum@, dsa.concerns@ одразу відсікалися
     if _matches_prefix_safely(local, normalized_local, tokens, LOW_PRIORITY_PREFIXES):
         return 'legal_or_hr_inbox'
 
@@ -345,7 +339,6 @@ def rank_and_clean_emails(
         if 'sentry.' in domain_part or HEX_HASH_LOCAL_REGEX.match(local_part):
             continue
 
-        # Відсікаємо технічні піддомени розсилок (напр. mail.otto.de, newsletter.brand.com)
         if base_domain and domain_part != base_domain and domain_part.endswith(f'.{base_domain}'):
             sub_prefix = domain_part[:-len(base_domain)]
             if sub_prefix in SENDER_SUBDOMAIN_PREFIXES:
@@ -684,21 +677,25 @@ def extract_valid_phones(
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
+    """
+    Issue 26 Fix: Перевіряємо канонічний Impressum та DM_LEGAL_SOURCE_FLAG (/agb, /terms, /oferta)
+    РАНІШЕ за /about та /ueber-uns, щоб /ueber-uns/agb класифікувався як 'legal_or_offer_page'.
+    """
     if not dm_source_url:
         return None
     path_low = urlparse(dm_source_url).path.lower()
-    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders', '/zespol', '/equipe')):
-        return 'team_page'
     if IMPRESSUM_CANONICAL_PATH_REGEX.search(path_low):
         return 'impressum_page'
+    if DM_LEGAL_SOURCE_FLAG.search(path_low):
+        return 'legal_or_offer_page'
+    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders', '/zespol', '/equipe')):
+        return 'team_page'
     if any(k in path_low for k in (
         '/about', '/pro-nas', '/o-nas', '/company', '/our-story',
         '/uber-uns', '/ueber-uns', '/qui-sommes-nous', '/a-propos',
         '/quienes-somos', '/chi-siamo', '/over-ons', '/o-firmie', '/om-oss'
     )):
         return 'about_page'
-    if DM_LEGAL_SOURCE_FLAG.search(path_low):
-        return 'legal_or_offer_page'
     if any(k in path_low for k in ('/blog', '/news', '/article', '/post', '/media', '/press')):
         return 'blog_or_press_page'
     if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/', '/de/', '/fr/', '/pl/', '/es/', '/it/', '/nl/'):
@@ -823,14 +820,13 @@ def extract_decision_maker_deep(
         }.get(src_type or '', 5)
 
         role_low = (role or '').lower()
-        # Bug 25 Fix: Штрафуємо членів наглядової ради (Supervisory Board / Aufsichtsrat), щоб операційний CEO завжди перемагав
         if 'supervisory' in role_low or 'aufsichtsrat' in role_low or 'gesellschafterrat' in role_low:
             role_bonus = -30
         elif src_type == 'product_or_service_page' and 'ceo' in role_low and 'founder' not in role_low:
             role_bonus = -10
         elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
             role_bonus = 20
-        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner', 'managing director', 'executive board')):
+        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner', 'managing director')):
             role_bonus = 15
         else:
             role_bonus = 5
@@ -900,21 +896,21 @@ def extract_decision_maker_deep(
         clean_soup = BeautifulSoup(html, 'lxml')
         dm_clean_text = strip_testimonial_elements_and_get_clean_text(clean_soup)
 
-        # Bug 25 Fix: Спочатку шукаємо операційних керівників у блоці "Vertreten durch / Vorstandsvorsitzende / Bereichsvorstand"
         for vm in VERTRETEN_DURCH_PATTERN.finditer(dm_clean_text):
             cand_name = strip_role_tokens_from_name(vm.group(1))
             if is_valid_person_name(cand_name, brand_root):
-                add_dm_candidate(cand_name, 'Executive Board / CEO', page_url, is_leg, 45)
+                add_dm_candidate(cand_name, 'Chief Executive Officer (CEO)', page_url, is_leg, 45)
 
         for m in NAME_BEFORE_ROLE_PATTERN.finditer(dm_clean_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
                 continue
             cand_role = normalize_executive_role(m.group(2))
-            # Перевіряємо, чи перед ім'ям або після нього в радіусі 45 символів не стоїть "Aufsichtsrat" або "Gesellschafterrat"
-            ctx_slice = dm_clean_text[max(0, m.start() - 45):min(len(dm_clean_text), m.end() + 45)].lower()
-            if 'aufsichtsrat' in ctx_slice or 'gesellschafterrat' in ctx_slice:
+            ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
+            if 'aufsichtsrat' in ctx_slice:
                 continue
+            if 'gesellschafterrat' in ctx_slice or 'stiftungskurator' in ctx_slice:
+                cand_role = 'Co-Founder / Managing Partner'
             if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
@@ -923,9 +919,11 @@ def extract_decision_maker_deep(
             if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
                 continue
             cand_role = normalize_executive_role(m.group(1))
-            ctx_slice = dm_clean_text[max(0, m.start() - 45):min(len(dm_clean_text), m.end() + 45)].lower()
-            if 'aufsichtsrat' in ctx_slice or 'gesellschafterrat' in ctx_slice:
+            ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
+            if 'aufsichtsrat' in ctx_slice:
                 continue
+            if 'gesellschafterrat' in ctx_slice or 'stiftungskurator' in ctx_slice:
+                cand_role = 'Co-Founder / Managing Partner'
             if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
