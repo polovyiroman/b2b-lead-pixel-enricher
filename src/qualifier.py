@@ -400,7 +400,7 @@ def evaluate_qualification_v180(
         if all_signals:
             readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
         else:
-            readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
+            readiness_verdict = f'Contact-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
     elif not all_signals:
         if dm_name:
             readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
