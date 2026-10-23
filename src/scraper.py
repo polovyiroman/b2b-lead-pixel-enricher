@@ -1,8 +1,10 @@
 import asyncio
 import html as html_lib
+import random
 import re
 import textwrap
-from urllib.parse import urljoin, urlparse
+import time
+from urllib.parse import unquote, urljoin, urlparse
 from apify import Actor
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
@@ -32,9 +34,13 @@ from .contacts import (
 
 try:
     from playwright.async_api import async_playwright
+    from playwright.async_api import Error as PWError
+    from playwright.async_api import TimeoutError as PWTimeoutError
     PLAYWRIGHT_INSTALLED = True
 except ImportError:
     PLAYWRIGHT_INSTALLED = False
+    PWError = Exception
+    PWTimeoutError = Exception
 
 PW_SEMAPHORE = asyncio.Semaphore(3)
 _PW_INIT_LOCK = asyncio.Lock()
@@ -71,6 +77,69 @@ TRACKING_NETWORK_DOMAINS = (
     'hs-analytics.net',
     'klaviyo.com',
     'intercom.io',
+)
+
+_PW_MARKER_RE = re.compile(r'<!-- pw_[a-z_]+:.*?-->', re.S)
+
+PW_NAV_TIMEOUT_MS = 35_000
+PW_ATTEMPT_BUDGET_S = 60.0
+PW_TOTAL_BUDGET_S = 140.0
+PW_MAX_ATTEMPTS = 3
+PW_MAX_TRACKING_URLS = 120
+PW_PERMANENT_STATUSES = frozenset({404, 410})
+PW_BLOCKED_RESOURCE_TYPES = frozenset({'image', 'media', 'font'})
+
+_PW_ESCALATION_PROXY = None
+
+PW_LOCALE_BY_REGION = {
+    'DE': 'de-DE', 'AT': 'de-AT', 'CH': 'de-CH', 'UA': 'uk-UA', 'FR': 'fr-FR',
+    'IT': 'it-IT', 'ES': 'es-ES', 'NL': 'nl-NL', 'BE': 'nl-BE', 'PL': 'pl-PL',
+    'PT': 'pt-PT', 'SE': 'sv-SE', 'NO': 'nb-NO', 'DK': 'da-DK', 'FI': 'fi-FI',
+    'CZ': 'cs-CZ', 'GB': 'en-GB', 'IE': 'en-IE', 'US': 'en-US',
+}
+
+_PW_CHALLENGE_TITLE_RE = re.compile(
+    r'just a moment|attention required|access denied|pardon our interruption|'
+    r'are you a robot|robot or human|verifying you are human|checking your browser|'
+    r'security check|request unsuccessful|one more step',
+    re.IGNORECASE,
+)
+
+_PW_CONSENT_CSS = ', '.join([
+    '#onetrust-accept-btn-handler',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonAccept',
+    '#uc-btn-accept-banner',
+    '[data-testid="uc-accept-all-button"]',
+    '[data-testid="cookie-accept"]',
+    '#didomi-notice-agree-button',
+    '#shopify-pc__banner__btn-accept',
+    '.cky-btn-accept',
+    '.cmplz-btn.cmplz-accept',
+    '#truste-consent-button',
+    '.osano-cm-accept-all',
+    '#axeptio_btn_acceptAll',
+    '[data-cookiefirst-action="accept"]',
+    '#tarteaucitronPersonalize2',
+    '.iubenda-cs-accept-btn',
+    '.fc-cta-consent',
+    '.cm-btn-success',
+])
+
+_PW_ACCEPT_RE = re.compile(
+    r'^\s*(?:accept(?: all)?(?: cookies)?|allow all(?: cookies)?|agree(?: and close)?|'
+    r'i agree|got it|alle akzeptieren|alles akzeptieren|alle cookies akzeptieren|'
+    r'akzeptieren|zustimmen|einverstanden|tout accepter|accepter(?: et fermer)?|'
+    r'j.accepte|accetta(?: tutto| tutti)?|aceptar(?: todo| todas)?|'
+    r'accepteer(?: alles| alle)?|accepteren|alles toestaan|zaakceptuj(?: wszystkie)?|'
+    r'akceptuj[eę](?: wszystkie)?|прийняти(?: все| всі)?|погоджуюсь|згоден)\s*[.!]?\s*$',
+    re.IGNORECASE,
+)
+_PW_REJECT_HINT_RE = re.compile(
+    r'reject|decline|refuse|necessary|essential|only|settings|preferences|manage|'
+    r'customi[sz]e|einstellungen|nur |ablehnen|refuser|rifiuta|rechazar|weigeren|'
+    r'odrzu|відхил|налашт',
+    re.IGNORECASE,
 )
 
 
@@ -146,7 +215,8 @@ def is_soft_404_page(html: str, page_title: str) -> bool:
 
 def extract_semantic_contact_links_from_html(html: str, page_url: str, canonical_domain: str) -> list[str]:
     found = []
-    soup = BeautifulSoup(html, 'lxml')
+    clean_html = _PW_MARKER_RE.sub('', html)
+    soup = BeautifulSoup(clean_html, 'lxml')
     base_clean = (clean_url_port(page_url) or page_url).rstrip('/')
 
     for a_tag in soup.find_all('a', href=True):
@@ -186,6 +256,7 @@ def parse_html_sync(
     page_url: str,
     default_region: str
 ) -> tuple[str, str, str, dict[str, str], list[tuple[str, int, str]], dict[str, tuple[str, str]], list[str]]:
+    html = _PW_MARKER_RE.sub('', html)
     clean_page = clean_url_port(page_url) or page_url
     unescaped_html = html_lib.unescape(html)
     email_sources: dict[str, str] = {}
@@ -321,21 +392,36 @@ def parse_html_sync(
     return page_title, meta_desc, text_content, email_sources, phones_with_source, socials_with_source, ordered_contact_links
 
 
+def configure_pw(escalation_proxy=None, max_concurrent: int | None = None) -> None:
+    global _PW_ESCALATION_PROXY, PW_SEMAPHORE
+    _PW_ESCALATION_PROXY = escalation_proxy
+    if max_concurrent:
+        PW_SEMAPHORE = asyncio.Semaphore(max(1, int(max_concurrent)))
+
+
+def pw_locale_for_region(region: str | None) -> str:
+    return PW_LOCALE_BY_REGION.get((region or '').upper(), 'en-US')
+
+
 async def get_shared_playwright_browser():
     global _PW_INSTANCE, _PW_BROWSER, PLAYWRIGHT_INSTALLED
     if not PLAYWRIGHT_INSTALLED:
         return None
     async with _PW_INIT_LOCK:
+        if _PW_BROWSER is not None and not _PW_BROWSER.is_connected():
+            _PW_BROWSER = None
         if _PW_BROWSER is None:
             try:
-                _PW_INSTANCE = await async_playwright().start()
+                if _PW_INSTANCE is None:
+                    _PW_INSTANCE = await async_playwright().start()
                 _PW_BROWSER = await _PW_INSTANCE.chromium.launch(
                     headless=True,
                     args=[
                         '--no-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-blink-features=AutomationControlled'
-                    ]
+                        '--disable-gpu',
+                        '--disable-blink-features=AutomationControlled',
+                    ],
                 )
             except Exception as e:
                 Actor.log.warning(f'Playwright launch failed ({e}); disabling browser fallback for this run.')
@@ -348,6 +434,17 @@ async def get_shared_playwright_browser():
                 PLAYWRIGHT_INSTALLED = False
                 return None
     return _PW_BROWSER
+
+
+async def reset_shared_playwright_browser():
+    global _PW_BROWSER
+    async with _PW_INIT_LOCK:
+        if _PW_BROWSER is not None:
+            try:
+                await _PW_BROWSER.close()
+            except Exception:
+                pass
+            _PW_BROWSER = None
 
 
 async def close_shared_playwright_browser():
@@ -367,109 +464,332 @@ async def close_shared_playwright_browser():
             _PW_INSTANCE = None
 
 
-async def _fetch_pw_inner(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
+def _is_tracking_url(u: str) -> bool:
+    low = u.lower()
+    return any(td in low for td in TRACKING_NETWORK_DOMAINS)
+
+
+def _pw_looks_like_challenge(title: str) -> bool:
+    return bool(title and _PW_CHALLENGE_TITLE_RE.search(title))
+
+
+def _pw_proxy_dict(proxy_url: str | None) -> dict | None:
+    if not proxy_url:
+        return None
+    try:
+        p = urlparse(proxy_url)
+        if not p.hostname:
+            return None
+        server = f'{p.scheme or "http"}://{p.hostname}'
+        if p.port:
+            server += f':{p.port}'
+        out = {'server': server}
+        if p.username:
+            out['username'] = unquote(p.username)
+        if p.password:
+            out['password'] = unquote(p.password)
+        return out
+    except Exception:
+        return None
+
+
+async def _pw_safe_content(page, timeout_s: float = 8.0) -> str:
+    try:
+        return await asyncio.wait_for(page.content(), timeout_s)
+    except Exception:
+        return ''
+
+
+async def _pw_safe_title(page) -> str:
+    try:
+        return await asyncio.wait_for(page.title(), 3.0)
+    except Exception:
+        return ''
+
+
+async def _pw_try_accept_consent(page, budget_s: float = 4.0) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_s
+    while True:
+        try:
+            scopes = [page] + [f for f in page.frames if f != page.main_frame][:6]
+        except Exception:
+            scopes = [page]
+        for scope in scopes:
+            try:
+                loc = scope.locator(_PW_CONSENT_CSS)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=1500)
+                    await page.wait_for_timeout(900)
+                    return True
+            except Exception:
+                pass
+            for role in ('button', 'link'):
+                try:
+                    cand = scope.get_by_role(role, name=_PW_ACCEPT_RE)
+                    for i in range(min(await cand.count(), 4)):
+                        el = cand.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        label = (await el.inner_text(timeout=500)).strip()
+                        if _PW_REJECT_HINT_RE.search(label):
+                            continue
+                        await el.click(timeout=1500)
+                        await page.wait_for_timeout(900)
+                        return True
+                except Exception:
+                    pass
+        if loop.time() >= deadline:
+            return False
+        await page.wait_for_timeout(500)
+
+
+def _pw_finalize_html(html: str, hits: list[str], consent: bool, partial: bool) -> str:
+    marks = []
+    if consent:
+        marks.append('<!-- pw_consent: accepted -->')
+    if partial:
+        marks.append('<!-- pw_partial: nav_timeout -->')
+    for u in hits:
+        marks.append(f'<!-- pw_net_req: {u.replace("-->", "%2D%2D%3E")} -->')
+    return html + '\n' + '\n'.join(marks) if marks else html
+
+
+def _pw_new_result(url: str) -> dict:
+    return {
+        'html': '', 'final_url': url, 'http': 0, 'err': '',
+        'consent': False, 'partial': False, 'hits': [], 'timings': {},
+    }
+
+
+async def _pw_render_once(
+    res: dict,
+    url: str,
+    proxy_url: str | None,
+    locale: str,
+    nav_timeout_ms: int,
+    accept_consent: bool,
+) -> None:
+    tm = res['timings']
+    t0 = time.monotonic()
     browser = await get_shared_playwright_browser()
     if browser is None:
-        return '', url, 'disabled', False
+        res['err'] = 'disabled'
+        return
+    tm['browser'] = round(time.monotonic() - t0, 1)
 
+    major = (getattr(browser, 'version', '') or '').split('.')[0] or '131'
+    lang = locale.split('-')[0]
     ctx_kwargs = {
-        'locale': 'en-US',
+        'locale': locale,
         'ignore_https_errors': True,
+        'viewport': {'width': 1366, 'height': 850},
         'user_agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-        )
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            f'(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36'
+        ),
+        'extra_http_headers': {'Accept-Language': f'{locale},{lang};q=0.9,en;q=0.8'},
     }
-    if proxy_url:
-        ctx_kwargs['proxy'] = {'server': proxy_url}
+    pw_proxy = _pw_proxy_dict(proxy_url)
+    if pw_proxy:
+        ctx_kwargs['proxy'] = pw_proxy
 
+    hits = res['hits']
+    seen: set[str] = set()
+
+    def _record(u: str) -> None:
+        if len(hits) >= PW_MAX_TRACKING_URLS or not _is_tracking_url(u):
+            return
+        key = u[:200]
+        if key in seen:
+            return
+        seen.add(key)
+        hits.append(u[:500])
+
+    t1 = time.monotonic()
     context = await browser.new_context(**ctx_kwargs)
-    await context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
-    captured_tracking_urls: list[str] = []
+    tm['context'] = round(time.monotonic() - t1, 1)
+    try:
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = await context.new_page()
+        page.on('request', lambda r: _record(r.url))
 
-    def _on_request(req):
+        async def _route(route):
+            try:
+                req = route.request
+                tracking = _is_tracking_url(req.url)
+                if tracking:
+                    _record(req.url)
+                if not tracking and req.resource_type in PW_BLOCKED_RESOURCE_TYPES:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await page.route('**/*', _route)
+
+        t2 = time.monotonic()
+        nav_timed_out = False
         try:
-            r_url = req.url
-            r_low = r_url.lower()
-            if any(td in r_low for td in TRACKING_NETWORK_DOMAINS):
-                if len(captured_tracking_urls) < 60:
-                    captured_tracking_urls.append(r_url)
+            resp = await page.goto(url, wait_until='domcontentloaded', timeout=nav_timeout_ms)
+            res['http'] = resp.status if resp else 0
+        except PWTimeoutError:
+            nav_timed_out = True
+            res['err'] = f'Page.goto: Timeout {nav_timeout_ms}ms exceeded.'
+        tm['goto'] = round(time.monotonic() - t2, 1)
+
+        if nav_timed_out:
+            if hits:
+                res['html'] = await _pw_safe_content(page, 5.0) or '<html><head></head><body></body></html>'
+                res['final_url'] = clean_url_port(page.url) or url
+                res['partial'] = True
+                res['err'] = ''
+            return
+
+        title = await _pw_safe_title(page)
+        if res['http'] in (403, 429, 503) or _pw_looks_like_challenge(title):
+            cleared = False
+            for _ in range(10):
+                await page.wait_for_timeout(1000)
+                title = await _pw_safe_title(page)
+                if not _pw_looks_like_challenge(title) and title:
+                    cleared = True
+                    break
+            if not cleared:
+                res['err'] = f'HTTP {res["http"]}' if res['http'] >= 400 else 'challenge'
+                return
+            res['http'] = 200
+        elif res['http'] >= 400:
+            res['err'] = f'HTTP {res["http"]}'
+            return
+
+        t3 = time.monotonic()
+        if accept_consent:
+            res['consent'] = await _pw_try_accept_consent(page)
+        try:
+            await page.wait_for_load_state('networkidle', timeout=6000)
         except Exception:
             pass
-
-    try:
-        page = await context.new_page()
-        page.on('request', _on_request)
-        resp = await page.goto(url, wait_until='domcontentloaded', timeout=16000)
-        if resp and resp.status >= 400:
-            return '', url, f'launched_blocked (HTTP {resp.status})', True
-
-        await page.wait_for_timeout(1000)
-
-        consent_selectors = [
-            '#shopify-pc__banner__btn-accept',
-            '#onetrust-accept-btn-handler',
-            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-            '#uc-btn-accept-banner',
-            '[data-testid="uc-accept-all-button"]',
-            '[data-testid="cookie-accept"]',
-            '#didomi-notice-agree-button',
-            'button:has-text("Accept all")',
-            'button:has-text("Allow all")',
-            'button:has-text("Accept")',
-            'button:has-text("Alle akzeptieren")',
-            'button:has-text("Alles akzeptieren")',
-            'button:has-text("Zustimmen")',
-            'button:has-text("Tout accepter")',
-            'button:has-text("Accetta tutto")',
-            'button:has-text("Alles accepteren")',
-            'button:has-text("Zaakceptuj wszystko")',
-            'button:has-text("Прийняти")'
-        ]
-        for sel in consent_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=200):
-                    await loc.click(timeout=500)
-                    await page.wait_for_timeout(1100)
-                    break
-            except Exception:
-                continue
-
+        await page.wait_for_timeout(1200 if res['consent'] else 600)
         try:
             await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
             await page.wait_for_timeout(500)
         except Exception:
             pass
+        tm['consent_settle'] = round(time.monotonic() - t3, 1)
 
-        rendered_html = await page.content()
-        final_u = clean_url_port(page.url) or url
-        if not rendered_html or len(rendered_html) <= 500:
-            return '', final_u, 'launched_empty', True
-
-        if captured_tracking_urls:
-            net_dump = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_tracking_urls)
-            rendered_html = f'{rendered_html}\n{net_dump}'
-
-        return rendered_html, final_u, 'rendered', False
+        t4 = time.monotonic()
+        html = await _pw_safe_content(page, 8.0)
+        tm['content'] = round(time.monotonic() - t4, 1)
+        res['final_url'] = clean_url_port(page.url) or url
+        if not html or len(html) <= 500:
+            res['err'] = 'launched_empty'
+            return
+        res['html'] = html
+    except PWTimeoutError:
+        res['err'] = 'Page.goto: Timeout (post-navigation step)'
+    except PWError as e:
+        msg = ' '.join(str(e).split())
+        if any(k in msg.lower() for k in ('browser has been closed', 'target closed', 'connection closed')):
+            res['err'] = 'browser_closed'
+        elif 'crash' in msg.lower():
+            res['err'] = 'Target crashed'
+        else:
+            res['err'] = msg[:60] or 'error'
     finally:
-        await context.close()
+        try:
+            await context.close()
+        except Exception:
+            pass
 
 
-async def fetch_html_playwright_fallback(url: str, proxy_url: str | None = None) -> tuple[str, str, str, bool]:
+async def fetch_html_playwright_fallback(
+    url: str,
+    proxy_url: str | None = None,
+    locale: str = 'en-US',
+    accept_consent: bool = True,
+    max_attempts: int | None = None,
+) -> tuple[str, str, str, bool]:
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled', False
 
+    n_max = max_attempts or PW_MAX_ATTEMPTS
+    if _PW_ESCALATION_PROXY is None:
+        n_max = min(n_max, 2)
+    host = urlparse(url).netloc or url
+    started = time.monotonic()
+    last_err = 'unknown'
+    last_final = url
+    best_partial: tuple[str, str] | None = None
+
     async with PW_SEMAPHORE:
-        try:
-            return await asyncio.wait_for(_fetch_pw_inner(url, proxy_url), timeout=24.0)
-        except asyncio.TimeoutError:
-            return '', url, 'launched_blocked (Page.goto: Timeout 24000ms exceeded.)', True
-        except Exception as e:
-            err_short = str(e).splitlines()[0][:60] if str(e) else 'error'
-            return '', url, f'launched_blocked ({err_short})', True
+        for attempt in range(1, n_max + 1):
+            if attempt > 1 and time.monotonic() - started > PW_TOTAL_BUDGET_S:
+                break
+
+            use_proxy, route_name = proxy_url, ('proxy' if proxy_url else 'direct')
+            if attempt >= 2 and _PW_ESCALATION_PROXY is not None:
+                try:
+                    use_proxy = await _PW_ESCALATION_PROXY.new_url(
+                        session_id=f'pw{attempt}x{random.randint(0, 999999)}'
+                    )
+                    route_name = 'residential'
+                except Exception:
+                    use_proxy, route_name = None, 'direct-retry'
+            elif attempt >= 2:
+                route_name = 'direct-retry'
+
+            res = _pw_new_result(url)
+            try:
+                await asyncio.wait_for(
+                    _pw_render_once(res, url, use_proxy, locale, PW_NAV_TIMEOUT_MS, accept_consent),
+                    timeout=PW_ATTEMPT_BUDGET_S,
+                )
+            except asyncio.TimeoutError:
+                res['err'] = f'Page.goto: Timeout {int(PW_ATTEMPT_BUDGET_S * 1000)}ms exceeded.'
+                if res['hits'] and not res['html']:
+                    res['html'] = '<html><head></head><body></body></html>'
+                    res['partial'] = True
+                    res['err'] = ''
+            except Exception as e:
+                res['err'] = (str(e).splitlines()[0][:60] if str(e) else 'error')
+
+            last_final = res['final_url'] or url
+            outcome = 'ok' if (res['html'] and not res['err']) else (res['err'] or 'empty')
+            Actor.log.info(
+                f'[pw] {host} try {attempt}/{n_max} via {route_name}: {outcome}'
+                f'{" (partial)" if res["partial"] else ""} consent={res["consent"]} '
+                f'trackers={len(res["hits"])} t={res["timings"]}'
+            )
+
+            if res['html'] and not res['err']:
+                html = _pw_finalize_html(res['html'], res['hits'], res['consent'], res['partial'])
+                if not res['partial']:
+                    return html, last_final, 'rendered', False
+                if best_partial is None or len(html) > len(best_partial[0]):
+                    best_partial = (html, last_final)
+                last_err = 'Page.goto: Timeout (partial salvaged)'
+            else:
+                last_err = res['err'] or 'empty'
+
+            if res['err'] == 'browser_closed':
+                await reset_shared_playwright_browser()
+            if res['http'] in PW_PERMANENT_STATUSES:
+                break
+            if attempt < n_max:
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+
+    if best_partial is not None:
+        return best_partial[0], best_partial[1], 'rendered', True
+    if last_err == 'launched_empty':
+        return '', last_final, 'launched_empty', True
+    return '', last_final, f'launched_blocked ({last_err})', True
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
