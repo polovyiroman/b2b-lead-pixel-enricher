@@ -82,7 +82,6 @@ AD_PIXEL_LABELS = {
     'Pinterest Tag',
 }
 
-# Issue 21 Fix: Додано роз'яснення, що gdpr_jurisdiction відображає операційний/ринковий штаб (для Delaware Inc з UA/EU офісами)
 COMPLIANCE_DEFAULT_NOTE = (
     'Enriched for legitimate B2B interest from public site data; '
     'jurisdiction hint reflects operational/market HQ (verify registered legal entity for DPA); '
@@ -295,17 +294,26 @@ def _derive_human_contact_tier(contact_quality_tier: str | None) -> str:
 def compute_google_ads_confidence(
     has_ads: bool | None,
     scan_completeness: str,
-    techs_found_count: int = 0
+    techs_found_count: int = 0,
+    consent_mode_likely: bool = False,
+    pw_rendered: bool = False
 ) -> str:
+    """
+    Визначає достовірність наявності/відсутності Google Ads:
+    - якщо тег знайдено -> 'verified_present'
+    - якщо скан неповний або 0 технологій -> 'unknown'
+    - якщо є активний Cookie Consent банер і Playwright не відрендерив сторінку -> 'not_observed_consent_gated'
+    - якщо стек відкритий (є інші теги без consent-блокування) -> 'verified_absent'
+    """
     if has_ads is True:
         return 'verified_present'
     if has_ads is None:
         return 'unknown'
-    if scan_completeness != 'full':
+    if scan_completeness != 'full' or techs_found_count == 0:
         return 'unknown'
-    if techs_found_count > 0:
-        return 'verified_absent'
-    return 'unknown'
+    if consent_mode_likely and not pw_rendered:
+        return 'not_observed_consent_gated'
+    return 'verified_absent'
 
 
 def detect_country_hint(
@@ -390,11 +398,6 @@ def detect_country_hint(
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
-    """
-    Гарантує строгий Tri-State (True / False / None):
-    Якщо scan_completeness in ('partial_timeout', 'partial_blocked', 'partial_cached')
-    або жодного тегу не знайдено при неповному скані, усі невиявлені прапорці стають None.
-    """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
@@ -422,7 +425,7 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
     is_hard_partial = (
         scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached')
-        or (not techs_set and scan_comp != 'full')
+        or not techs_set
     )
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
@@ -475,6 +478,17 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
 
 
+async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None:
+    if proxy_config is None:
+        return None
+    try:
+        return await proxy_config.new_url(
+            session_id=f"pw_{abs(hash(domain_key)) % 100000}"
+        )
+    except Exception:
+        return None
+
+
 async def process_domain(
     client: AsyncSession,
     domain_key: str,
@@ -504,15 +518,19 @@ async def process_domain(
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
-        if status == 0 and is_playwright_available():
+        # Запускаємо Playwright rescue не лише при status == 0, а й при HTTP 403 / 429 / 503 (bol.com, laredoute.fr, asos.com)
+        if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
             rescue_url = clean_url_port(root_url) or root_url
+            pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
             Actor.log.info(
-                f'Curl tunnel/connection failed for {canonical_domain} ({short_err_msg}); '
+                f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
                 f'attempting Playwright rescue on {rescue_url}'
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(rescue_url)
-            pw_rescue_html, pw_rescue_url, pw_rescue_status, pw_rescue_inc = await fetch_html_playwright_fallback(rescue_url)
+            pw_rescue_html, pw_rescue_url, pw_rescue_status, pw_rescue_inc = await fetch_html_playwright_fallback(
+                rescue_url, proxy_url=pw_proxy
+            )
             if pw_rescue_status == 'rendered' and pw_rescue_html:
                 Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                 status = 200
@@ -659,7 +677,9 @@ async def process_domain(
                         cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
                             cached_copy.get('has_google_ads'),
                             cached_copy.get('tech_scan_completeness', 'full'),
-                            _cached_tech_count
+                            _cached_tech_count,
+                            bool(cached_copy.get('consent_mode_likely')),
+                            False
                         )
 
                         _c_hint = detect_country_hint(
@@ -743,7 +763,9 @@ async def process_domain(
                 seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
                     seeded_rec.get('has_google_ads'),
                     seeded_rec.get('tech_scan_completeness', 'full'),
-                    _seed_tech_count
+                    _seed_tech_count,
+                    bool(seeded_rec.get('consent_mode_likely')),
+                    True
                 )
                 seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
                     seeded_rec.get('contact_quality_tier')
@@ -946,8 +968,8 @@ async def process_domain(
                         socials_with_source.setdefault(k, v)
                 elif 'impressum' in sub_url.lower() and not impressum_403_triggered:
                     impressum_403_triggered = True
-                    sitemap_Wait_links = await discover_links_from_sitemap(client, base_root)
-                    for sm_u in sitemap_Wait_links:
+                    sitemap_links = await discover_links_from_sitemap(client, base_root)
+                    for sm_u in sitemap_links:
                         if sm_u not in allowed_sub_links and is_allowed_by_robots(sm_u, disallowed_paths):
                             s_st, s_ht, s_fin, _ = await fetch_html_safely(
                                 client, sm_u, proxy_config=proxy_config, timeout=7.0, retries=1
@@ -984,6 +1006,7 @@ async def process_domain(
             or needs_pw_empty_shell
             or needs_pw_no_tech_at_all
         ):
+            pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
             Actor.log.info(
                 f'Playwright triggered for {canonical_domain} '
                 f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
@@ -991,7 +1014,9 @@ async def process_domain(
             )
             pw_attempts_count += 1
             pw_attempted_paths.append(normalized_final_redirect)
-            pw_html, pw_url, pw_status_str, pw_incomplete = await fetch_html_playwright_fallback(normalized_final_redirect)
+            pw_html, pw_url, pw_status_str, pw_incomplete = await fetch_html_playwright_fallback(
+                normalized_final_redirect, proxy_url=pw_proxy
+            )
             if pw_incomplete:
                 pw_had_timeout_or_block = True
             Actor.log.info(
@@ -1041,7 +1066,9 @@ async def process_domain(
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                             pw_attempts_count += 1
                             pw_attempted_paths.append(pw_sub_u)
-                            sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(pw_sub_u)
+                            sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(
+                                pw_sub_u, proxy_url=pw_proxy
+                            )
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
                                     thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
@@ -1103,7 +1130,9 @@ async def process_domain(
         google_ads_conf = compute_google_ads_confidence(
             tech_info.get('has_google_ads'),
             tech_info.get('tech_scan_completeness', 'full'),
-            len(detected_tech_list)
+            len(detected_tech_list),
+            bool(tech_info.get('has_cookie_banner')),
+            pw_used_flag
         )
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
@@ -1241,6 +1270,7 @@ async def process_domain(
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
         needs_rescan = bool(
             tech_info['tech_scan_completeness'] != 'full'
+            or not detected_tech_list
             or (not tech_info['has_gtm'] and not tech_info['has_ga4'] and pw_had_timeout_or_block)
         )
 
