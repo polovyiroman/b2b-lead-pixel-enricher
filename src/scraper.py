@@ -81,9 +81,10 @@ TRACKING_NETWORK_DOMAINS = (
 
 _PW_MARKER_RE = re.compile(r'<!-- pw_[a-z_]+:.*?-->', re.S)
 
-PW_NAV_TIMEOUT_MS = 35_000
-PW_ATTEMPT_BUDGET_S = 60.0
-PW_TOTAL_BUDGET_S = 140.0
+# Крок 2.1: Оптимізовані бюджети Playwright (25s навігація, 40s спроба, 100s загалом на домен)
+PW_NAV_TIMEOUT_MS = 25_000
+PW_ATTEMPT_BUDGET_S = 40.0
+PW_TOTAL_BUDGET_S = 100.0
 PW_MAX_ATTEMPTS = 3
 PW_MAX_TRACKING_URLS = 120
 PW_PERMANENT_STATUSES = frozenset({404, 410})
@@ -141,6 +142,27 @@ _PW_REJECT_HINT_RE = re.compile(
     r'odrzu|відхил|налашт',
     re.IGNORECASE,
 )
+
+_PW_BUTTON_DEBUG_JS = """
+() => {
+    const btns = Array.from(document.querySelectorAll('button, a[role="button"], [class*="cookie"] button, [id*="cookie"] button'))
+        .slice(0, 8)
+        .map(el => (el.innerText || el.getAttribute('aria-label') || el.id || '').trim().replace(/\\s+/g, ' ').slice(0, 35))
+        .filter(Boolean);
+    const cmp = [];
+    if (window.OneTrust) cmp.push('OneTrust');
+    if (window.Cookiebot) cmp.push('Cookiebot');
+    if (window.UC_UI || document.querySelector('#usercentrics-root')) cmp.push('Usercentrics');
+    if (window.Didomi) cmp.push('Didomi');
+    const hasShadowUc = !!document.querySelector('#usercentrics-root');
+    return {
+        buttons: btns.slice(0, 5),
+        cmp: cmp,
+        shadow_uc: hasShadowUc,
+        iframes: document.querySelectorAll('iframe').length
+    };
+}
+"""
 
 
 def is_playwright_available() -> bool:
@@ -507,41 +529,80 @@ async def _pw_safe_title(page) -> str:
         return ''
 
 
-async def _pw_try_accept_consent(page, budget_s: float = 4.0) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget_s
-    while True:
+# Крок 2.2: Захищений Consent-блок із жорстким таймаутом 6.0s + функція діагностики кнопок
+async def _pw_try_accept_consent(page) -> bool:
+    # 1. Швидка спроба кліку по Usercentrics у Shadow DOM (Otto, Zalando, DocMorris)
+    try:
+        clicked_shadow = await asyncio.wait_for(
+            page.evaluate("""() => {
+                const uc = document.querySelector('#usercentrics-root');
+                if (uc && uc.shadowRoot) {
+                    const btn = uc.shadowRoot.querySelector('[data-testid="uc-accept-all-button"], button[aria-label*="accept" i], button[aria-label*="akzeptieren" i]');
+                    if (btn) { btn.click(); return true; }
+                }
+                return false;
+            }"""),
+            timeout=1.5
+        )
+        if clicked_shadow:
+            await page.wait_for_timeout(700)
+            return True
+    except Exception:
+        pass
+
+    try:
+        scopes = [page] + [f for f in page.frames if f != page.main_frame][:4]
+    except Exception:
+        scopes = [page]
+
+    for scope in scopes:
         try:
-            scopes = [page] + [f for f in page.frames if f != page.main_frame][:6]
+            loc = scope.locator(_PW_CONSENT_CSS).first
+            if await loc.is_visible(timeout=400):
+                await loc.click(timeout=1000)
+                await page.wait_for_timeout(700)
+                return True
         except Exception:
-            scopes = [page]
-        for scope in scopes:
+            pass
+        for role in ('button', 'link'):
             try:
-                loc = scope.locator(_PW_CONSENT_CSS)
-                if await loc.count() > 0 and await loc.first.is_visible():
-                    await loc.first.click(timeout=1500)
-                    await page.wait_for_timeout(900)
+                cand = scope.get_by_role(role, name=_PW_ACCEPT_RE)
+                cnt = min(await cand.count(), 3)
+                for i in range(cnt):
+                    el = cand.nth(i)
+                    if not await el.is_visible(timeout=300):
+                        continue
+                    label = (await el.inner_text(timeout=400)).strip()
+                    if _PW_REJECT_HINT_RE.search(label):
+                        continue
+                    await el.click(timeout=1000)
+                    await page.wait_for_timeout(700)
                     return True
             except Exception:
                 pass
-            for role in ('button', 'link'):
-                try:
-                    cand = scope.get_by_role(role, name=_PW_ACCEPT_RE)
-                    for i in range(min(await cand.count(), 4)):
-                        el = cand.nth(i)
-                        if not await el.is_visible():
-                            continue
-                        label = (await el.inner_text(timeout=500)).strip()
-                        if _PW_REJECT_HINT_RE.search(label):
-                            continue
-                        await el.click(timeout=1500)
-                        await page.wait_for_timeout(900)
-                        return True
-                except Exception:
-                    pass
-        if loop.time() >= deadline:
-            return False
-        await page.wait_for_timeout(500)
+    return False
+
+
+async def _pw_accept_consent_guarded(page, max_s: float = 6.0) -> bool:
+    try:
+        return await asyncio.wait_for(_pw_try_accept_consent(page), timeout=max_s)
+    except Exception:
+        return False
+
+
+async def _pw_debug_consent(page) -> str:
+    try:
+        info = await asyncio.wait_for(page.evaluate(_PW_BUTTON_DEBUG_JS), timeout=2.0)
+        if isinstance(info, dict):
+            return (
+                f"buttons={info.get('buttons', [])} "
+                f"cmp={info.get('cmp', [])} "
+                f"shadow_uc={info.get('shadow_uc', False)} "
+                f"iframes={info.get('iframes', 0)}"
+            )
+    except Exception:
+        pass
+    return 'debug_unavailable'
 
 
 def _pw_finalize_html(html: str, hits: list[str], consent: bool, partial: bool) -> str:
@@ -558,7 +619,8 @@ def _pw_finalize_html(html: str, hits: list[str], consent: bool, partial: bool) 
 def _pw_new_result(url: str) -> dict:
     return {
         'html': '', 'final_url': url, 'http': 0, 'err': '',
-        'consent': False, 'partial': False, 'hits': [], 'timings': {},
+        'consent': False, 'consent_debug': '', 'partial': False,
+        'hits': [], 'timings': {},
     }
 
 
@@ -646,7 +708,7 @@ async def _pw_render_once(
 
         if nav_timed_out:
             if hits:
-                res['html'] = await _pw_safe_content(page, 5.0) or '<html><head></head><body></body></html>'
+                res['html'] = await _pw_safe_content(page, 4.0) or '<html><head></head><body></body></html>'
                 res['final_url'] = clean_url_port(page.url) or url
                 res['partial'] = True
                 res['err'] = ''
@@ -655,7 +717,7 @@ async def _pw_render_once(
         title = await _pw_safe_title(page)
         if res['http'] in (403, 429, 503) or _pw_looks_like_challenge(title):
             cleared = False
-            for _ in range(10):
+            for _ in range(6):
                 await page.wait_for_timeout(1000)
                 title = await _pw_safe_title(page)
                 if not _pw_looks_like_challenge(title) and title:
@@ -671,21 +733,26 @@ async def _pw_render_once(
 
         t3 = time.monotonic()
         if accept_consent:
-            res['consent'] = await _pw_try_accept_consent(page)
+            res['consent'] = await _pw_accept_consent_guarded(page, max_s=6.0)
+            if not res['consent']:
+                res['consent_debug'] = await _pw_debug_consent(page)
         try:
-            await page.wait_for_load_state('networkidle', timeout=6000)
+            await page.wait_for_load_state('networkidle', timeout=3500)
         except Exception:
             pass
-        await page.wait_for_timeout(1200 if res['consent'] else 600)
+        await page.wait_for_timeout(900 if res['consent'] else 400)
         try:
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await page.wait_for_timeout(500)
+            await asyncio.wait_for(
+                page.evaluate('window.scrollTo(0, document.body.scrollHeight)'),
+                timeout=2.0
+            )
+            await page.wait_for_timeout(400)
         except Exception:
             pass
         tm['consent_settle'] = round(time.monotonic() - t3, 1)
 
         t4 = time.monotonic()
-        html = await _pw_safe_content(page, 8.0)
+        html = await _pw_safe_content(page, 6.0)
         tm['content'] = round(time.monotonic() - t4, 1)
         res['final_url'] = clean_url_port(page.url) or url
         if not html or len(html) <= 500:
@@ -704,7 +771,7 @@ async def _pw_render_once(
             res['err'] = msg[:60] or 'error'
     finally:
         try:
-            await context.close()
+            await asyncio.wait_for(context.close(), timeout=5.0)
         except Exception:
             pass
 
@@ -715,9 +782,14 @@ async def fetch_html_playwright_fallback(
     locale: str = 'en-US',
     accept_consent: bool = True,
     max_attempts: int | None = None,
-) -> tuple[str, str, str, bool]:
+    start_residential: bool = False,
+) -> tuple[str, str, str, bool, int]:
+    """
+    Крок 2.2, 2.3 та 4.3: Повертає 5 значень:
+    (html, final_url, pw_status_str, is_partial_or_incomplete, attempts_made)
+    """
     if not PLAYWRIGHT_INSTALLED:
-        return '', url, 'disabled', False
+        return '', url, 'disabled', False, 0
 
     n_max = max_attempts or PW_MAX_ATTEMPTS
     if _PW_ESCALATION_PROXY is None:
@@ -727,21 +799,23 @@ async def fetch_html_playwright_fallback(
     last_err = 'unknown'
     last_final = url
     best_partial: tuple[str, str] | None = None
+    attempts_made = 0
 
     async with PW_SEMAPHORE:
         for attempt in range(1, n_max + 1):
             if attempt > 1 and time.monotonic() - started > PW_TOTAL_BUDGET_S:
                 break
 
+            attempts_made = attempt
             use_proxy, route_name = proxy_url, ('proxy' if proxy_url else 'direct')
-            if attempt >= 2 and _PW_ESCALATION_PROXY is not None:
+            if (attempt >= 2 or start_residential) and _PW_ESCALATION_PROXY is not None:
                 try:
                     use_proxy = await _PW_ESCALATION_PROXY.new_url(
                         session_id=f'pw{attempt}x{random.randint(0, 999999)}'
                     )
                     route_name = 'residential'
                 except Exception:
-                    use_proxy, route_name = None, 'direct-retry'
+                    use_proxy, route_name = proxy_url, ('proxy-retry' if proxy_url else 'direct-retry')
             elif attempt >= 2:
                 route_name = 'direct-retry'
 
@@ -752,7 +826,8 @@ async def fetch_html_playwright_fallback(
                     timeout=PW_ATTEMPT_BUDGET_S,
                 )
             except asyncio.TimeoutError:
-                res['err'] = f'Page.goto: Timeout {int(PW_ATTEMPT_BUDGET_S * 1000)}ms exceeded.'
+                # Крок 2.3: Чесна причина таймауту бюджету замість фейкового Page.goto: Timeout
+                res['err'] = f'attempt_budget_exceeded ({int(PW_ATTEMPT_BUDGET_S)}s)'
                 if res['hits'] and not res['html']:
                     res['html'] = '<html><head></head><body></body></html>'
                     res['partial'] = True
@@ -762,16 +837,17 @@ async def fetch_html_playwright_fallback(
 
             last_final = res['final_url'] or url
             outcome = 'ok' if (res['html'] and not res['err']) else (res['err'] or 'empty')
+            dbg_suffix = f" consent_debug={res['consent_debug']}" if res.get('consent_debug') else ''
             Actor.log.info(
                 f'[pw] {host} try {attempt}/{n_max} via {route_name}: {outcome}'
                 f'{" (partial)" if res["partial"] else ""} consent={res["consent"]} '
-                f'trackers={len(res["hits"])} t={res["timings"]}'
+                f'trackers={len(res["hits"])} t={res["timings"]}{dbg_suffix}'
             )
 
             if res['html'] and not res['err']:
                 html = _pw_finalize_html(res['html'], res['hits'], res['consent'], res['partial'])
                 if not res['partial']:
-                    return html, last_final, 'rendered', False
+                    return html, last_final, 'rendered', False, attempts_made
                 if best_partial is None or len(html) > len(best_partial[0]):
                     best_partial = (html, last_final)
                 last_err = 'Page.goto: Timeout (partial salvaged)'
@@ -783,13 +859,13 @@ async def fetch_html_playwright_fallback(
             if res['http'] in PW_PERMANENT_STATUSES:
                 break
             if attempt < n_max:
-                await asyncio.sleep(random.uniform(1.0, 3.0))
+                await asyncio.sleep(random.uniform(0.8, 2.0))
 
     if best_partial is not None:
-        return best_partial[0], best_partial[1], 'rendered', True
+        return best_partial[0], best_partial[1], 'rendered', True, attempts_made
     if last_err == 'launched_empty':
-        return '', last_final, 'launched_empty', True
-    return '', last_final, f'launched_blocked ({last_err})', True
+        return '', last_final, 'launched_empty', True, attempts_made
+    return '', last_final, f'launched_blocked ({last_err})', True, attempts_made
 
 
 async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[str], float]:
