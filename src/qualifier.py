@@ -89,7 +89,7 @@ def classify_company_category(
         'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
         'email service', 'automation service', 'chatbot', 'cloud-lösung', 'softwarelösung',
         'logiciel saas', 'plateforme cloud', 'software de gestión', 'piattaforma cloud',
-        'oprogramowanie dla firm', 'system crm'
+        'oprogramowanie dla firm', 'system crm', 'ringostat', 'sendpulse', 'macpaw', 'readdle', 'grammarly'
     )
     if any(k in text for k in saas_keywords):
         return 'SaaS / Marketplace / Tech Platform', 'high'
@@ -112,9 +112,10 @@ def classify_company_category(
         )
     )
 
+    # Проблема 2 Fix: Використовуємо \b...\b word-boundary, щоб 'ngo' не спрацьовувало на 'ringostat.com'
     if is_explicit_npo or (
         not has_commercial_stack and any(
-            w in text for w in (
+            re.search(rf'\b{re.escape(w)}\b', text) for w in (
                 'університет', 'university', 'college', 'академія', 'інститут', 'ngo',
                 'universität', 'hochschule', 'université', 'universidad', 'università',
                 'universiteit', 'uniwersytet', 'universidade'
@@ -265,7 +266,6 @@ def evaluate_qualification_v180(
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
 
-    # Issue 27 Fix: Універсальне англомовне попередження без українського "(ФОП)" для AGB/Terms сторінок
     source_extra_note = ''
     if dm_source_is_legal and dm_source_type != 'impressum_page':
         source_extra_note = ' DM identified from legal/terms document — verify active operational role via LinkedIn before outbound.'
