@@ -3,7 +3,9 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import os
 import re
+import time
 from urllib.parse import urlparse
 from apify import Actor
 from curl_cffi.requests import AsyncSession
@@ -513,21 +515,29 @@ async def process_domain(
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
 
+        # Крок 3.5 та 4.3: Playwright rescue з start_residential=(status != 0) та підрахунком реальних спроб
         if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
             rescue_url = clean_url_port(root_url) or root_url
             pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
             rescue_locale = pw_locale_for_region(_guess_region_from_domain(canonical_domain) or default_region)
             Actor.log.info(
                 f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
-                f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale})'
+                f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale}, start_res={status != 0})'
             )
-            pw_attempts_count += 1
             pw_attempted_paths.append(rescue_url)
-            pw_rescue_html, pw_rescue_url, pw_rescue_status, pw_rescue_inc = await fetch_html_playwright_fallback(
+            (
+                pw_rescue_html,
+                pw_rescue_url,
+                pw_rescue_status,
+                pw_rescue_inc,
+                pw_rescue_attempts
+            ) = await fetch_html_playwright_fallback(
                 rescue_url,
                 proxy_url=pw_proxy,
                 locale=rescue_locale,
+                start_residential=(status != 0),
             )
+            pw_attempts_count += pw_rescue_attempts
             if pw_rescue_status == 'rendered' and pw_rescue_html:
                 Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                 status = 200
@@ -1012,13 +1022,19 @@ async def process_domain(
                 f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
                 f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all}, locale={pw_locale})'
             )
-            pw_attempts_count += 1
             pw_attempted_paths.append(normalized_final_redirect)
-            pw_html, pw_url, pw_status_str, pw_incomplete = await fetch_html_playwright_fallback(
+            (
+                pw_html,
+                pw_url,
+                pw_status_str,
+                pw_incomplete,
+                pw_main_attempts
+            ) = await fetch_html_playwright_fallback(
                 normalized_final_redirect,
                 proxy_url=pw_proxy,
                 locale=pw_locale,
             )
+            pw_attempts_count += pw_main_attempts
             if pw_incomplete:
                 pw_had_timeout_or_block = True
             Actor.log.info(
@@ -1067,15 +1083,21 @@ async def process_domain(
 
                     for pw_sub_u in combined_pw_subs[:2]:
                         if is_allowed_by_robots(pw_sub_u, disallowed_paths):
-                            pw_attempts_count += 1
                             pw_attempted_paths.append(pw_sub_u)
-                            sub_pw_html, sub_pw_final, sub_pw_st, _ = await fetch_html_playwright_fallback(
+                            (
+                                sub_pw_html,
+                                sub_pw_final,
+                                sub_pw_st,
+                                _,
+                                sub_pw_tries
+                            ) = await fetch_html_playwright_fallback(
                                 pw_sub_u,
                                 proxy_url=pw_proxy,
                                 locale=pw_locale,
                                 accept_consent=False,
                                 max_attempts=1,
                             )
+                            pw_attempts_count += sub_pw_tries
                             if sub_pw_st == 'rendered' and sub_pw_html:
                                 s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
                                     thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
@@ -1128,7 +1150,7 @@ async def process_domain(
                     pass
 
         if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm']):
-            scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() else 'partial_blocked'
+            scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
 
         normalize_tech_info_booleans(tech_info)
@@ -1227,11 +1249,94 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
+        # Крок 4.4: Merge DMs з кешу, якщо Playwright заблоковано або в кеші збережено повніший перелік ЛПР (напр. 5 DMs на ottogroup.com)
+        if cache_store is not None and (pw_status_str.startswith('launched_blocked') or pw_had_timeout_or_block or not dm_name):
+            for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
+                try:
+                    c_rec = await cache_store.get_value(c_key)
+                    if isinstance(c_rec, dict) and c_rec.get('decision_makers_found'):
+                        cached_dms_str = str(c_rec.get('decision_makers_found'))
+                        curr_dms_count = (decision_makers_found_str or '').count(';') + (1 if decision_makers_found_str else 0)
+                        cached_dms_count = cached_dms_str.count(';') + 1
+                        if not dm_name or cached_dms_count > curr_dms_count:
+                            decision_makers_found_str = cached_dms_str
+                            dm_name = dm_name or c_rec.get('decision_maker_name')
+                            dm_role = dm_role or c_rec.get('decision_maker_role')
+                            dm_linkedin_url = dm_linkedin_url or c_rec.get('decision_maker_linkedin_url')
+                            dm_source_url = dm_source_url or c_rec.get('decision_maker_source_url')
+                            dm_source_type = dm_source_type or c_rec.get('decision_maker_source_type')
+                            Actor.log.info(f'[DM MERGE] {canonical_domain}: recovered {cached_dms_count} DMs from cache')
+                            break
+                except Exception:
+                    pass
+
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
         gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
         is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+
+        # Крок 4.1: Merge Rozetka з manual_seed, якщо живий скан повернув порожню Cloudflare challenge-оболонку (<2 тегів, 0 пошт, 0 DM)
+        seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
+        if (
+            isinstance(seed_match, dict)
+            and not best_email
+            and not dm_name
+            and len(detected_tech_list) < 2
+        ):
+            Actor.log.info(f'[SEED MERGE] {canonical_domain}: live thin, merging manual_seed')
+            seeded_rec = build_manual_seed_record(
+                seed_match,
+                domain_key,
+                canonical_domain,
+                aliases_str,
+                clean_website_url,
+                normalized_final_redirect,
+                was_redirected,
+                redirect_chain_str,
+                is_eu_gdpr,
+                'success',
+                'live_scan_thin',
+                checked_at,
+                is_playwright_available(),
+            )
+            _seed_tech_count = len(
+                [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
+            )
+            seeded_rec['status'] = 'success (seed_merged)'
+            seeded_rec['playwright_used'] = pw_used_flag
+            seeded_rec['playwright_status'] = pw_status_str
+            seeded_rec['playwright_attempts_count'] = pw_attempts_count
+            seeded_rec['playwright_paths_attempted'] = '; '.join(pw_attempted_paths) if pw_attempted_paths else None
+            seeded_rec['error_message'] = 'Live scan returned minimal data (WAF challenge shell); merged verified manual_seed'
+            seeded_rec['data_confidence_warning'] = 'Note: Live HTML minimal; contacts/tech recovered from verified manual_seed.'
+            seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
+                seeded_rec.get('has_google_ads'),
+                seeded_rec.get('tech_scan_completeness', 'full'),
+                _seed_tech_count,
+                bool(seeded_rec.get('consent_mode_likely')),
+                True
+            )
+            seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
+                seeded_rec.get('contact_quality_tier')
+            )
+            seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
+            seeded_rec['legal_basis_for_processing'] = (
+                'legitimate_interest_b2b'
+                if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
+                else None
+            )
+            seeded_rec['data_subject_can_request_deletion'] = True
+            seeded_rec['data_retention_policy_days'] = 365
+            seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
+                seeded_rec.get('best_email'),
+                seeded_rec.get('best_email_type'),
+                seeded_rec.get('decision_maker_name'),
+                seeded_rec.get('primary_phone'),
+                seeded_rec.get('decision_maker_linkedin_url')
+            )
+            seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
+            return seeded_rec
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
@@ -1394,8 +1499,141 @@ async def process_domain(
         return result_record
 
 
+# Крок 3.2 та 3.3: Захист від Apify Run Timeout (жоден домен не губиться)
+def _remaining_run_seconds() -> float | None:
+    raw = os.environ.get('ACTOR_TIMEOUT_AT') or os.environ.get('APIFY_TIMEOUT_AT')
+    if not raw:
+        if not hasattr(_remaining_run_seconds, '_start'):
+            _remaining_run_seconds._start = time.monotonic()
+        return 1140.0 - (time.monotonic() - _remaining_run_seconds._start)
+    try:
+        end = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        return (end - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
+
+
+def _timeout_stub(domain_key: str, aliases: list[str]) -> dict:
+    checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    canonical_domain = domain_key.lower().replace('www.', '')
+    clean_website_url = f'https://{canonical_domain}/'
+    cat, cat_conf = classify_company_category(canonical_domain, '', '', [])
+    c_hint = detect_country_hint(canonical_domain, '', '', None, '')
+    jur = _derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
+    is_eu = jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+    return {
+        'input_domain': domain_key,
+        'canonical_domain': canonical_domain,
+        'aliases': '; '.join(aliases) if aliases else canonical_domain,
+        'input_was_redirected': False,
+        'redirect_chain': None,
+        'website_url': clean_website_url,
+        'final_redirect_url': clean_website_url,
+        'status': 'run_timeout_unfinished',
+        'cached_snapshot_source': 'none (run_timeout)',
+        'cached_snapshot_age_days': None,
+        'error_message': 'Actor run approached global timeout before domain finished; retry in smaller batch',
+        'sales_readiness_verdict': 'Unverified (Run Timeout Reached — Retry Domain)',
+        'company_category': cat,
+        'category_confidence': cat_conf,
+        'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
+        'marketplace_platform_pollution_detected': False,
+        'icp_fit_tier': 'Unverified (Run Timeout Reached)',
+        'technical_signal_strength': None,
+        'tech_scan_completeness': 'partial_timeout',
+        'tech_rescan_needed': True,
+        'contact_quality_tier': 'Tier F (Run Timeout)',
+        'contact_quality_tier_human': 'No Contact',
+        'contact_enrichment_status': 'run_timeout_unfinished',
+        'data_confidence_warning': 'Warning: Actor run approached time limit before this domain completed. Re-run with higher timeout.',
+        'gdpr_eu_domain': is_eu,
+        'gdpr_jurisdiction': jur,
+        'legal_basis_for_processing': None,
+        'data_subject_can_request_deletion': True,
+        'data_retention_policy_days': 365,
+        'personal_data_fields_in_record': 'none (run_timeout)',
+        'compliance_note': COMPLIANCE_DEFAULT_NOTE,
+        'playwright_available': is_playwright_available(),
+        'playwright_used': False,
+        'playwright_status': 'aborted_by_run_timeout',
+        'playwright_attempts_count': 0,
+        'playwright_paths_attempted': None,
+        'page_title': '[Run timeout reached before completion]',
+        'meta_description': None,
+        'best_email': None,
+        'email_domain': None,
+        'best_email_type': None,
+        'email_source_type': None,
+        'email_source_note': None,
+        'named_email_owner_role_hint': None,
+        'email_deliverability_check': None,
+        'all_emails_deliverability': None,
+        'all_emails_classification': None,
+        'email_source_url': None,
+        'primary_phone': None,
+        'e164_phone': None,
+        'phone_availability': 'not_checked_timeout',
+        'phone_source_url': None,
+        'decision_maker_name': None,
+        'decision_maker_role': None,
+        'decision_maker_source_url': None,
+        'decision_maker_source_type': None,
+        'decision_makers_found': None,
+        'decision_maker_linkedin_url': None,
+        'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat, c_hint),
+        'linkedin_url': None,
+        'instagram_url': None,
+        'facebook_url': None,
+        'telegram_url': None,
+        'tiktok_url': None,
+        'youtube_url': None,
+        'social_source_url': None,
+        'detected_signals': None,
+        'detected_cms': None,
+        'consent_mode_likely': None,
+        'ga4_detection_confidence': None,
+        'has_google_ads_confidence': 'unknown',
+        'sales_opportunity': 'Domain scan interrupted by global run timeout',
+        'next_best_action': 'Re-run domain or use decision_maker_search_query on LinkedIn',
+        'technology_evidence_summary': None,
+        'technology_evidence': None,
+        'has_meta_pixel': None,
+        'has_tiktok_pixel': None,
+        'has_google_ads': None,
+        'has_linkedin_pixel': None,
+        'has_pinterest_tag': None,
+        'has_hubspot': None,
+        'has_klaviyo': None,
+        'has_ga4': None,
+        'has_gtm': None,
+        'all_ga4_ids': None,
+        'detected_technologies': None,
+        'all_emails': None,
+        'all_phones': None,
+        'last_checked_at': checked_at,
+    }
+
+
+async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
+    rem = _remaining_run_seconds()
+    budget = max(15.0, min(180.0, (rem - 12.0) if rem is not None else 180.0))
+    if rem is not None and rem <= 15.0:
+        coro.close()
+        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: <15s remaining in run, emitting timeout stub')
+        return _timeout_stub(domain_key, aliases)
+    try:
+        return await asyncio.wait_for(coro, timeout=budget)
+    except asyncio.TimeoutError:
+        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: exceeded domain budget ({budget:.0f}s), emitting timeout stub')
+        return _timeout_stub(domain_key, aliases)
+    except Exception as e:
+        Actor.log.warning(f'[GUARD ERROR] {domain_key}: {e}')
+        return _timeout_stub(domain_key, aliases)
+
+
 async def main() -> None:
     async with Actor:
+        _remaining_run_seconds()
         if not is_playwright_available():
             Actor.log.warning(
                 'PLAYWRIGHT NOT INSTALLED: Browser SPA fallback disabled. '
@@ -1407,7 +1645,8 @@ async def main() -> None:
         scan_contacts = actor_input.get('scanContactPages', True)
         unpack_gtm = actor_input.get('unpackGtmContainers', True)
         default_region = actor_input.get('defaultPhoneRegion', 'US').upper().strip()
-        max_concurrency = actor_input.get('maxConcurrency', 15)
+        # Крок 1: Дефолтний maxConcurrency піднято до 30, щоб швидкі curl-домени не чекали за Playwright
+        max_concurrency = actor_input.get('maxConcurrency', 30)
         proxy_settings = actor_input.get('proxyConfiguration')
 
         user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
@@ -1470,20 +1709,25 @@ async def main() -> None:
                 verify=False,
                 proxy=primary_proxy_url
             ) as client:
+                # Крок 3.4: Кожен process_domain обгорнуто в guarded()
                 tasks = [
-                    process_domain(
-                        client,
+                    guarded(
+                        process_domain(
+                            client,
+                            domain_key,
+                            root_url,
+                            initial_aliases,
+                            scan_contacts,
+                            unpack_gtm,
+                            default_region,
+                            proxy_config,
+                            cache_store,
+                            manual_seeds,
+                            thread_pool,
+                            semaphore
+                        ),
                         domain_key,
-                        root_url,
                         initial_aliases,
-                        scan_contacts,
-                        unpack_gtm,
-                        default_region,
-                        proxy_config,
-                        cache_store,
-                        manual_seeds,
-                        thread_pool,
-                        semaphore
                     )
                     for domain_key, root_url, initial_aliases in prepared_domains
                 ]
@@ -1525,6 +1769,7 @@ async def main() -> None:
                 'playwright_rendered_count': metrics_counter['playwright_rendered'],
                 'no_contacts_count': metrics_counter['status_no_contacts_found'],
                 'blocked_count': metrics_counter['status_blocked'],
+                'timeout_unfinished_count': metrics_counter['status_run_timeout_unfinished'],
                 'checked_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             Actor.log.info(f'PIPELINE TELEMETRY SUMMARY: {json.dumps(run_telemetry)}')
