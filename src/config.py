@@ -228,7 +228,7 @@ ROLE_WORDS_IN_CONTEXT = (
     'marknad', 'försäljning', 'salg'
 )
 
-# Точніше розрізнення CEO vs Board Member / Managing Director
+# Крок 4.2 Fix: Повернуто "CEO" у нормалізацію Geschäftsführer / Managing Director для CRM-фільтрів DE-покупців
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
     'chief marketing officer': 'Chief Marketing Officer (CMO)',
@@ -258,13 +258,13 @@ ROLE_NORMALIZATION_MAP = {
     'head of digital': 'Head of Digital',
     'ceo': 'Chief Executive Officer (CEO)',
     'генеральний директор': 'Chief Executive Officer (CEO)',
-    'директор': 'Managing Director',
-    'директорка': 'Managing Director',
+    'директор': 'Managing Director / CEO',
+    'директорка': 'Managing Director / CEO',
     'general manager': 'General Manager',
-    'managing director': 'Managing Director',
-    'geschäftsführer': 'Managing Director (Geschäftsführer)',
-    'geschäftsführerin': 'Managing Director (Geschäftsführerin)',
-    'geschäftsführung': 'Managing Director (Geschäftsführung)',
+    'managing director': 'Managing Director / CEO',
+    'geschäftsführer': 'Managing Director / CEO (Geschäftsführer)',
+    'geschäftsführerin': 'Managing Director / CEO (Geschäftsführerin)',
+    'geschäftsführung': 'Managing Director / CEO (Geschäftsführung)',
     'vorstandsvorsitzender': 'Chief Executive Officer (CEO)',
     'vorstandsvorsitzende': 'Chief Executive Officer (CEO)',
     'bereichsvorstand': 'Executive Board / CEO',
@@ -274,33 +274,33 @@ ROLE_NORMALIZATION_MAP = {
     'président-directeur général': 'Chief Executive Officer (CEO)',
     'président': 'President / CEO',
     'présidente': 'President / CEO',
-    'directeur général': 'Managing Director',
-    'directrice générale': 'Managing Director',
-    'gérant': 'Managing Director',
-    'gérante': 'Managing Director',
+    'directeur général': 'Managing Director / CEO',
+    'directrice générale': 'Managing Director / CEO',
+    'gérant': 'Managing Director / CEO',
+    'gérante': 'Managing Director / CEO',
     'associé gérant': 'Managing Partner',
-    'director general': 'Managing Director',
-    'directora general': 'Managing Director',
+    'director general': 'Managing Director / CEO',
+    'directora general': 'Managing Director / CEO',
     'consejero delegado': 'Chief Executive Officer (CEO)',
     'gerente general': 'General Manager',
     'socio director': 'Managing Partner',
     'amministratore delegato': 'Chief Executive Officer (CEO)',
-    'amministratore unico': 'Managing Director',
-    'direttore generale': 'Managing Director',
-    'algemeen directeur': 'Managing Director',
+    'amministratore unico': 'Managing Director / CEO',
+    'direttore generale': 'Managing Director / CEO',
+    'algemeen directeur': 'Managing Director / CEO',
     'bestuurder': 'Board Member / Managing Director',
     'prezes zarządu': 'Chief Executive Officer (CEO)',
     'wiceprezes zarządu': 'Vice President / Executive',
     'prezes': 'President / CEO',
-    'dyrektor zarządzający': 'Managing Director',
+    'dyrektor zarządzający': 'Managing Director / CEO',
     'członek zarządu': 'Board Member',
-    'diretor geral': 'Managing Director',
-    'diretora geral': 'Managing Director',
+    'diretor geral': 'Managing Director / CEO',
+    'diretora geral': 'Managing Director / CEO',
     'sócio-gerente': 'Managing Partner',
     'verkställande direktör': 'Chief Executive Officer (CEO)',
     'vd': 'Chief Executive Officer (CEO)',
-    'administrerende direktør': 'Managing Director',
-    'daglig leder': 'Managing Director',
+    'administrerende direktør': 'Managing Director / CEO',
+    'daglig leder': 'Managing Director / CEO',
     'founder': 'Founder',
     'засновник': 'Founder',
     'засновниця': 'Founder',
@@ -474,7 +474,6 @@ MARKETING_EXEC_PREFIXES = (
     'direction', 'gerance', 'direccion', 'direzione', 'directie',
     'zarzad', 'prezes', 'marknad', 'werbung', 'reklama', 'mercadeo'
 )
-# Додано new-business, newbusiness, newbiz для inweb.ua
 B2B_PARTNERSHIP_PREFIXES = (
     'partner', 'partners', 'partnerships', 'b2b', 'bizdev', 'bd', 'commercial',
     'corporate', 'corpcom', 'deals', 'tender', 'tenders', 'enterprise', 'corp',
@@ -499,7 +498,6 @@ GENERAL_OFFICE_PREFIXES = (
     'accueil', 'bonjour', 'contacto', 'hola', 'atencion', 'administracion',
     'contatti', 'segreteria', 'kantoor', 'administratie', 'kontor', 'post', 'firmapost'
 )
-# Додано institutionen, behoerden, publicsector, щоб institutionen@info.otto.de отримував Tier C- замість B-
 DEPARTMENT_OR_ADMISSIONS_PREFIXES = (
     'vstup', 'admissions', 'admission', 'dekanat', 'rector', 'rectorate',
     'department', 'faculty', 'edu', 'study', 'courses', 'academy',
