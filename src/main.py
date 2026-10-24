@@ -114,6 +114,26 @@ KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
     'unicredit.it': 'IT',
 }
 
+# Проблема 5 Fix: Домени з жорстким WAF / HTTP 405 для headless-браузера, де Playwright пропускається
+# (вони миттєво обробляються через curl + Impressum + cache, не блокуючи семафор Playwright)
+KNOWN_PW_HOPELESS = {
+    'coolblue.nl',
+    'otto.de',
+}
+
+
+def _domain_weight(item: tuple[str, str, list[str]]) -> tuple[int, str]:
+    """
+    Проблема 6 Fix: Сортує легкі (curl-only UA/SaaS) домени на початок черги,
+    щоб вони завершувалися за перші 20 секунд і не чекали за важкими EU-сайтами.
+    """
+    domain_key = item[0].lower()
+    is_heavy = (
+        domain_key.endswith(('.de', '.fr', '.it', '.nl', '.uk', '.co.uk'))
+        or domain_key in {'bol.com', 'asos.com', 'grammarly.com', 'glossier.com', 'rozetka.com.ua', 'comfy.ua', 'intertop.ua', 'liki24.com'}
+    )
+    return (1 if is_heavy else 0, domain_key)
+
 
 def _contact_link_priority(url: str) -> tuple[int, int]:
     path = urlparse(url).path.lower()
@@ -514,46 +534,51 @@ async def process_domain(
         )
         short_err_msg = truncate_error_msg(err_msg)
         canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+        is_pw_hopeless = (canonical_domain in KNOWN_PW_HOPELESS or domain_key in KNOWN_PW_HOPELESS)
 
-        # Крок 3.5 та 4.3: Playwright rescue з start_residential=(status != 0) та підрахунком реальних спроб
         if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
-            rescue_url = clean_url_port(root_url) or root_url
-            pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
-            rescue_locale = pw_locale_for_region(_guess_region_from_domain(canonical_domain) or default_region)
-            Actor.log.info(
-                f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
-                f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale}, start_res={status != 0})'
-            )
-            pw_attempted_paths.append(rescue_url)
-            (
-                pw_rescue_html,
-                pw_rescue_url,
-                pw_rescue_status,
-                pw_rescue_inc,
-                pw_rescue_attempts
-            ) = await fetch_html_playwright_fallback(
-                rescue_url,
-                proxy_url=pw_proxy,
-                locale=rescue_locale,
-                start_residential=(status != 0),
-            )
-            pw_attempts_count += pw_rescue_attempts
-            if pw_rescue_status == 'rendered' and pw_rescue_html:
-                Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
-                status = 200
-                html = pw_rescue_html
-                final_url = pw_rescue_url
-                err_msg = ''
-                short_err_msg = ''
-                pw_used_flag = True
-                pw_status_str = 'rendered'
-                canonical_domain = get_clean_canonical_domain(final_url, domain_key)
-                if pw_rescue_inc:
-                    pw_had_timeout_or_block = True
+            if is_pw_hopeless:
+                pw_status_str = 'skipped_hopeless_waf'
+                pw_had_timeout_or_block = True
+                Actor.log.info(f'[PW SKIP] {canonical_domain} is in KNOWN_PW_HOPELESS; skipping Playwright rescue')
             else:
-                pw_status_str = pw_rescue_status
-                if pw_rescue_inc:
-                    pw_had_timeout_or_block = True
+                rescue_url = clean_url_port(root_url) or root_url
+                pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
+                rescue_locale = pw_locale_for_region(_guess_region_from_domain(canonical_domain) or default_region)
+                Actor.log.info(
+                    f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
+                    f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale}, start_res={status != 0})'
+                )
+                pw_attempted_paths.append(rescue_url)
+                (
+                    pw_rescue_html,
+                    pw_rescue_url,
+                    pw_rescue_status,
+                    pw_rescue_inc,
+                    pw_rescue_attempts
+                ) = await fetch_html_playwright_fallback(
+                    rescue_url,
+                    proxy_url=pw_proxy,
+                    locale=rescue_locale,
+                    start_residential=(status != 0),
+                )
+                pw_attempts_count += pw_rescue_attempts
+                if pw_rescue_status == 'rendered' and pw_rescue_html:
+                    Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
+                    status = 200
+                    html = pw_rescue_html
+                    final_url = pw_rescue_url
+                    err_msg = ''
+                    short_err_msg = ''
+                    pw_used_flag = True
+                    pw_status_str = 'rendered'
+                    canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+                    if pw_rescue_inc:
+                        pw_had_timeout_or_block = True
+                else:
+                    pw_status_str = pw_rescue_status
+                    if pw_rescue_inc:
+                        pw_had_timeout_or_block = True
 
         parsed_final = urlparse(final_url)
         scheme = parsed_final.scheme or 'https'
@@ -623,7 +648,7 @@ async def process_domain(
                         cached_copy['playwright_available'] = is_playwright_available()
                         cached_copy['playwright_used'] = False
                         cached_copy['playwright_status'] = (
-                            pw_status_str if pw_attempts_count > 0 else 'not_attempted_cached_fallback'
+                            pw_status_str if (pw_attempts_count > 0 or is_pw_hopeless) else 'not_attempted_cached_fallback'
                         )
                         cached_copy['playwright_attempts_count'] = pw_attempts_count
                         cached_copy['playwright_paths_attempted'] = (
@@ -835,7 +860,7 @@ async def process_domain(
                 'compliance_note': COMPLIANCE_DEFAULT_NOTE,
                 'playwright_available': is_playwright_available(),
                 'playwright_used': False,
-                'playwright_status': pw_status_str if pw_attempts_count > 0 else 'not_attempted_site_blocked',
+                'playwright_status': pw_status_str if (pw_attempts_count > 0 or is_pw_hopeless) else 'not_attempted_site_blocked',
                 'playwright_attempts_count': pw_attempts_count,
                 'playwright_paths_attempted': '; '.join(pw_attempted_paths) if pw_attempted_paths else None,
                 'page_title': f'[Site blocked: {short_err_msg}]',
@@ -894,6 +919,7 @@ async def process_domain(
             }
 
         effective_region = _resolve_effective_phone_region(canonical_domain, default_region, html)
+        is_pw_hopeless = (canonical_domain in KNOWN_PW_HOPELESS or domain_key in KNOWN_PW_HOPELESS)
 
         (
             page_title,
@@ -1015,109 +1041,114 @@ async def process_domain(
             or needs_pw_empty_shell
             or needs_pw_no_tech_at_all
         ):
-            pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
-            pw_locale = pw_locale_for_region(effective_region)
-            Actor.log.info(
-                f'Playwright triggered for {canonical_domain} '
-                f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
-                f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all}, locale={pw_locale})'
-            )
-            pw_attempted_paths.append(normalized_final_redirect)
-            (
-                pw_html,
-                pw_url,
-                pw_status_str,
-                pw_incomplete,
-                pw_main_attempts
-            ) = await fetch_html_playwright_fallback(
-                normalized_final_redirect,
-                proxy_url=pw_proxy,
-                locale=pw_locale,
-            )
-            pw_attempts_count += pw_main_attempts
-            if pw_incomplete:
+            if is_pw_hopeless:
+                pw_status_str = 'skipped_hopeless_waf'
                 pw_had_timeout_or_block = True
-            Actor.log.info(
-                f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
-            )
-            if pw_status_str == 'rendered' and pw_html:
-                pw_used_flag = True
-                pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
-                    thread_pool, parse_html_sync, pw_html, pw_url, effective_region
+                Actor.log.info(f'[PW SKIP] {canonical_domain} is in KNOWN_PW_HOPELESS; skipping Playwright fallback')
+            else:
+                pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
+                pw_locale = pw_locale_for_region(effective_region)
+                Actor.log.info(
+                    f'Playwright triggered for {canonical_domain} '
+                    f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
+                    f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all}, locale={pw_locale})'
                 )
-                if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
-                    page_title = pw_title
-                if not meta_desc and pw_desc:
-                    meta_desc = pw_desc
-                pages_with_urls.append((pw_url, pw_html, pw_text))
-                for em, src in pw_e.items():
-                    email_sources.setdefault(em, src)
-                for p, sc, src in pw_p:
-                    if p not in phone_map or sc > phone_map[p][0]:
-                        phone_map[p] = (sc, src)
-                for k, v in pw_s.items():
-                    socials_with_source.setdefault(k, v)
-                if needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all:
-                    pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
-                    pw_comp = 'partial_timeout' if pw_incomplete else 'full'
-                    tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, pw_comp)
-
-                after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
-                if scan_contacts and not (after_pw_emails or phone_map):
-                    semantic_pw_links = await loop.run_in_executor(
-                        thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
+                pw_attempted_paths.append(normalized_final_redirect)
+                (
+                    pw_html,
+                    pw_url,
+                    pw_status_str,
+                    pw_incomplete,
+                    pw_main_attempts
+                ) = await fetch_html_playwright_fallback(
+                    normalized_final_redirect,
+                    proxy_url=pw_proxy,
+                    locale=pw_locale,
+                )
+                pw_attempts_count += pw_main_attempts
+                if pw_incomplete:
+                    pw_had_timeout_or_block = True
+                Actor.log.info(
+                    f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
+                )
+                if pw_status_str == 'rendered' and pw_html:
+                    pw_used_flag = True
+                    pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
+                        thread_pool, parse_html_sync, pw_html, pw_url, effective_region
                     )
-                    fallback_pw_paths = [
-                        f'{base_root}/impressum/',
-                        f'{base_root}/kontakt/',
-                        f'{base_root}/contacts/',
-                        f'{base_root}/en/contact-us/',
-                        f'{base_root}/ua/kontakty/',
-                        f'{base_root}/about/'
-                    ]
-                    combined_pw_subs = []
-                    for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths):
-                        if u not in combined_pw_subs and u != normalized_final_redirect:
-                            combined_pw_subs.append(u)
-                    combined_pw_subs = sorted(combined_pw_subs, key=_contact_link_priority)
+                    if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
+                        page_title = pw_title
+                    if not meta_desc and pw_desc:
+                        meta_desc = pw_desc
+                    pages_with_urls.append((pw_url, pw_html, pw_text))
+                    for em, src in pw_e.items():
+                        email_sources.setdefault(em, src)
+                    for p, sc, src in pw_p:
+                        if p not in phone_map or sc > phone_map[p][0]:
+                            phone_map[p] = (sc, src)
+                    for k, v in pw_s.items():
+                        socials_with_source.setdefault(k, v)
+                    if needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all:
+                        pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
+                        pw_comp = 'partial_timeout' if pw_incomplete else 'full'
+                        tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, pw_comp)
 
-                    for pw_sub_u in combined_pw_subs[:2]:
-                        if is_allowed_by_robots(pw_sub_u, disallowed_paths):
-                            pw_attempted_paths.append(pw_sub_u)
-                            (
-                                sub_pw_html,
-                                sub_pw_final,
-                                sub_pw_st,
-                                _,
-                                sub_pw_tries
-                            ) = await fetch_html_playwright_fallback(
-                                pw_sub_u,
-                                proxy_url=pw_proxy,
-                                locale=pw_locale,
-                                accept_consent=False,
-                                max_attempts=1,
-                            )
-                            pw_attempts_count += sub_pw_tries
-                            if sub_pw_st == 'rendered' and sub_pw_html:
-                                s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
-                                    thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
+                    after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
+                    if scan_contacts and not (after_pw_emails or phone_map):
+                        semantic_pw_links = await loop.run_in_executor(
+                            thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
+                        )
+                        fallback_pw_paths = [
+                            f'{base_root}/impressum/',
+                            f'{base_root}/kontakt/',
+                            f'{base_root}/contacts/',
+                            f'{base_root}/en/contact-us/',
+                            f'{base_root}/ua/kontakty/',
+                            f'{base_root}/about/'
+                        ]
+                        combined_pw_subs = []
+                        for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths):
+                            if u not in combined_pw_subs and u != normalized_final_redirect:
+                                combined_pw_subs.append(u)
+                        combined_pw_subs = sorted(combined_pw_subs, key=_contact_link_priority)
+
+                        for pw_sub_u in combined_pw_subs[:2]:
+                            if is_allowed_by_robots(pw_sub_u, disallowed_paths):
+                                pw_attempted_paths.append(pw_sub_u)
+                                (
+                                    sub_pw_html,
+                                    sub_pw_final,
+                                    sub_pw_st,
+                                    _,
+                                    sub_pw_tries
+                                ) = await fetch_html_playwright_fallback(
+                                    pw_sub_u,
+                                    proxy_url=pw_proxy,
+                                    locale=pw_locale,
+                                    accept_consent=False,
+                                    max_attempts=1,
                                 )
-                                if not is_soft_404_page(sub_pw_html, s_t):
-                                    if not page_title and s_t:
-                                        page_title = s_t
-                                    if not meta_desc and s_d:
-                                        meta_desc = s_d
-                                    pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
-                                    for em, src in s_e.items():
-                                        email_sources.setdefault(em, src)
-                                    for p, sc, src in s_p:
-                                        if p not in phone_map or sc > phone_map[p][0]:
-                                            phone_map[p] = (sc, src)
-                                    for k, v in s_s.items():
-                                        socials_with_source.setdefault(k, v)
-                                    chk_em, _ = rank_and_clean_emails(email_sources, canonical_domain)
-                                    if chk_em or phone_map:
-                                        break
+                                pw_attempts_count += sub_pw_tries
+                                if sub_pw_st == 'rendered' and sub_pw_html:
+                                    s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
+                                        thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
+                                    )
+                                    if not is_soft_404_page(sub_pw_html, s_t):
+                                        if not page_title and s_t:
+                                            page_title = s_t
+                                        if not meta_desc and s_d:
+                                            meta_desc = s_d
+                                        pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
+                                        for em, src in s_e.items():
+                                            email_sources.setdefault(em, src)
+                                        for p, sc, src in s_p:
+                                            if p not in phone_map or sc > phone_map[p][0]:
+                                                phone_map[p] = (sc, src)
+                                        for k, v in s_s.items():
+                                            socials_with_source.setdefault(k, v)
+                                        chk_em, _ = rank_and_clean_emails(email_sources, canonical_domain)
+                                        if chk_em or phone_map:
+                                            break
 
         if not tech_info['has_ga4'] and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
@@ -1249,7 +1280,6 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
-        # Крок 4.4: Merge DMs з кешу, якщо Playwright заблоковано або в кеші збережено повніший перелік ЛПР (напр. 5 DMs на ottogroup.com)
         if cache_store is not None and (pw_status_str.startswith('launched_blocked') or pw_had_timeout_or_block or not dm_name):
             for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                 try:
@@ -1276,7 +1306,6 @@ async def process_domain(
         gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
         is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
-        # Крок 4.1: Merge Rozetka з manual_seed, якщо живий скан повернув порожню Cloudflare challenge-оболонку (<2 тегів, 0 пошт, 0 DM)
         seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
         if (
             isinstance(seed_match, dict)
@@ -1499,7 +1528,6 @@ async def process_domain(
         return result_record
 
 
-# Крок 3.2 та 3.3: Захист від Apify Run Timeout (жоден домен не губиться)
 def _remaining_run_seconds() -> float | None:
     raw = os.environ.get('ACTOR_TIMEOUT_AT') or os.environ.get('APIFY_TIMEOUT_AT')
     if not raw:
@@ -1614,17 +1642,23 @@ def _timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     }
 
 
+# Проблема 1 Fix: Знято штучний ліміт min(180.0, ...). Тепер кожен домен може чекати в черзі до кінця 1200s-рану.
 async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
     rem = _remaining_run_seconds()
-    budget = max(15.0, min(180.0, (rem - 12.0) if rem is not None else 180.0))
-    if rem is not None and rem <= 15.0:
+    if rem is not None:
+        budget = max(45.0, rem - 30.0)
+    else:
+        budget = 900.0
+
+    if rem is not None and rem <= 20.0:
         coro.close()
-        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: <15s remaining in run, emitting timeout stub')
+        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: only {rem:.0f}s remaining, stub')
         return _timeout_stub(domain_key, aliases)
+
     try:
         return await asyncio.wait_for(coro, timeout=budget)
     except asyncio.TimeoutError:
-        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: exceeded domain budget ({budget:.0f}s), emitting timeout stub')
+        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: exceeded {budget:.0f}s')
         return _timeout_stub(domain_key, aliases)
     except Exception as e:
         Actor.log.warning(f'[GUARD ERROR] {domain_key}: {e}')
@@ -1645,8 +1679,7 @@ async def main() -> None:
         scan_contacts = actor_input.get('scanContactPages', True)
         unpack_gtm = actor_input.get('unpackGtmContainers', True)
         default_region = actor_input.get('defaultPhoneRegion', 'US').upper().strip()
-        # Крок 1: Дефолтний maxConcurrency піднято до 30, щоб швидкі curl-домени не чекали за Playwright
-        max_concurrency = actor_input.get('maxConcurrency', 30)
+        max_concurrency = max(30, int(actor_input.get('maxConcurrency', 30)))
         proxy_settings = actor_input.get('proxyConfiguration')
 
         user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
@@ -1660,6 +1693,9 @@ async def main() -> None:
         if not prepared_domains:
             Actor.log.warning('No valid domains provided in input!')
             return
+
+        # Проблема 6 Fix: Сортуємо легкі домени на початок черги
+        prepared_domains = sorted(prepared_domains, key=_domain_weight)
 
         cache_store = None
         try:
@@ -1709,7 +1745,6 @@ async def main() -> None:
                 verify=False,
                 proxy=primary_proxy_url
             ) as client:
-                # Крок 3.4: Кожен process_domain обгорнуто в guarded()
                 tasks = [
                     guarded(
                         process_domain(
