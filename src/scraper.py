@@ -81,13 +81,13 @@ TRACKING_NETWORK_DOMAINS = (
 
 _PW_MARKER_RE = re.compile(r'<!-- pw_[a-z_]+:.*?-->', re.S)
 
-# Крок 2.1: Оптимізовані бюджети Playwright (25s навігація, 40s спроба, 100s загалом на домен)
-PW_NAV_TIMEOUT_MS = 25_000
-PW_ATTEMPT_BUDGET_S = 40.0
-PW_TOTAL_BUDGET_S = 100.0
+# Проблема 4 Fix: PW_ATTEMPT_BUDGET_S = 55.0, PW_TOTAL_BUDGET_S = 150.0 + 405 у PW_PERMANENT_STATUSES
+PW_NAV_TIMEOUT_MS = 28_000
+PW_ATTEMPT_BUDGET_S = 55.0
+PW_TOTAL_BUDGET_S = 150.0
 PW_MAX_ATTEMPTS = 3
 PW_MAX_TRACKING_URLS = 120
-PW_PERMANENT_STATUSES = frozenset({404, 410})
+PW_PERMANENT_STATUSES = frozenset({404, 405, 410})
 PW_BLOCKED_RESOURCE_TYPES = frozenset({'image', 'media', 'font'})
 
 _PW_ESCALATION_PROXY = None
@@ -529,9 +529,7 @@ async def _pw_safe_title(page) -> str:
         return ''
 
 
-# Крок 2.2: Захищений Consent-блок із жорстким таймаутом 6.0s + функція діагностики кнопок
 async def _pw_try_accept_consent(page) -> bool:
-    # 1. Швидка спроба кліку по Usercentrics у Shadow DOM (Otto, Zalando, DocMorris)
     try:
         clicked_shadow = await asyncio.wait_for(
             page.evaluate("""() => {
@@ -784,10 +782,6 @@ async def fetch_html_playwright_fallback(
     max_attempts: int | None = None,
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
-    """
-    Крок 2.2, 2.3 та 4.3: Повертає 5 значень:
-    (html, final_url, pw_status_str, is_partial_or_incomplete, attempts_made)
-    """
     if not PLAYWRIGHT_INSTALLED:
         return '', url, 'disabled', False, 0
 
@@ -826,7 +820,6 @@ async def fetch_html_playwright_fallback(
                     timeout=PW_ATTEMPT_BUDGET_S,
                 )
             except asyncio.TimeoutError:
-                # Крок 2.3: Чесна причина таймауту бюджету замість фейкового Page.goto: Timeout
                 res['err'] = f'attempt_budget_exceeded ({int(PW_ATTEMPT_BUDGET_S)}s)'
                 if res['hits'] and not res['html']:
                     res['html'] = '<html><head></head><body></body></html>'
