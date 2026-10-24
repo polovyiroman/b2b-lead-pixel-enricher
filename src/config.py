@@ -129,8 +129,12 @@ FOP_OWNER_PATTERN = re.compile(
     re.UNICODE
 )
 
+# Проблема 3 Fix: Розширений патерн для Impressum та AGB (включно з "Vorstand: Gundula Koele-Pabst" та "Geschäftsführer: ...")
 VERTRETEN_DURCH_PATTERN = re.compile(
-    rf'(?:Vertreten\s+durch(?:\s+den\s+Vorstand|\s+die\s+Geschäftsführung)?|Vorstandsvorsitzende[r]?|Bereichsvorstand)\s*[:\-–—]?\s*'
+    rf'(?:Vertreten\s+durch(?:\s+den\s+Vorstand|\s+die\s+Geschäftsführung|\s+den\s+Aufsichtsrat)?|'
+    rf'Vorstandsvorsitzende[r]?|Bereichsvorstand|'
+    rf'Geschäftsführer(?:in)?[:\s]|'
+    rf'Vorstand(?:smitglied)?[:\s])\s*[:\-–—]?\s*'
     rf'(?:Dr\.\s+|Prof\.\s+)*{NAME_REGEX_PART}',
     re.UNICODE | re.IGNORECASE
 )
@@ -228,7 +232,6 @@ ROLE_WORDS_IN_CONTEXT = (
     'marknad', 'försäljning', 'salg'
 )
 
-# Крок 4.2 Fix: Повернуто "CEO" у нормалізацію Geschäftsführer / Managing Director для CRM-фільтрів DE-покупців
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
     'chief marketing officer': 'Chief Marketing Officer (CMO)',
@@ -268,7 +271,7 @@ ROLE_NORMALIZATION_MAP = {
     'vorstandsvorsitzender': 'Chief Executive Officer (CEO)',
     'vorstandsvorsitzende': 'Chief Executive Officer (CEO)',
     'bereichsvorstand': 'Executive Board / CEO',
-    'vorstand': 'Executive Board Member (Vorstand)',
+    'vorstand': 'Executive Board / CEO (Vorstand)',
     'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
     'président-directeur général': 'Chief Executive Officer (CEO)',
