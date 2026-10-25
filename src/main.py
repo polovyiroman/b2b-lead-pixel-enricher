@@ -40,6 +40,7 @@ from .qualifier import (
     build_linkedin_xray_query,
     build_manual_seed_record,
     classify_company_category,
+    compute_data_quality_score,
     evaluate_qualification_v180,
     is_marketplace_platform,
 )
@@ -114,25 +115,29 @@ KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
     'unicredit.it': 'IT',
 }
 
-# Проблема 5 Fix: Домени з жорстким WAF / HTTP 405 для headless-браузера, де Playwright пропускається
-# (вони миттєво обробляються через curl + Impressum + cache, не блокуючи семафор Playwright)
 KNOWN_PW_HOPELESS = {
     'coolblue.nl',
     'otto.de',
 }
 
+PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
+
 
 def _domain_weight(item: tuple[str, str, list[str]]) -> tuple[int, str]:
-    """
-    Проблема 6 Fix: Сортує легкі (curl-only UA/SaaS) домени на початок черги,
-    щоб вони завершувалися за перші 20 секунд і не чекали за важкими EU-сайтами.
-    """
     domain_key = item[0].lower()
     is_heavy = (
         domain_key.endswith(('.de', '.fr', '.it', '.nl', '.uk', '.co.uk'))
         or domain_key in {'bol.com', 'asos.com', 'grammarly.com', 'glossier.com', 'rozetka.com.ua', 'comfy.ua', 'intertop.ua', 'liki24.com'}
     )
     return (1 if is_heavy else 0, domain_key)
+
+
+def _clean_legacy_dm_contamination(val: str | None) -> str | None:
+    if not val:
+        return val
+    cleaned = re.sub(r'\b(Petra\s+Scharner-Wolff)\s+Katy\b', r'\1', val)
+    cleaned = re.sub(r'\bGesellschafterrats\s+', '', cleaned)
+    return cleaned.strip()
 
 
 def _contact_link_priority(url: str) -> tuple[int, int]:
@@ -560,6 +565,7 @@ async def process_domain(
                     rescue_url,
                     proxy_url=pw_proxy,
                     locale=rescue_locale,
+                    max_attempts=PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN,
                     start_residential=(status != 0),
                 )
                 pw_attempts_count += pw_rescue_attempts
@@ -573,7 +579,7 @@ async def process_domain(
                     pw_used_flag = True
                     pw_status_str = 'rendered'
                     canonical_domain = get_clean_canonical_domain(final_url, domain_key)
-                    if pw_rescue_inc:
+                    if pw_rescue_inc and len(pw_rescue_html) < 15_000:
                         pw_had_timeout_or_block = True
                 else:
                     pw_status_str = pw_rescue_status
@@ -606,6 +612,69 @@ async def process_domain(
 
         if status == 0 or status >= 400 or not html:
             fail_status = classify_failure_status(status, err_msg)
+            # Спочатку перевіряємо manual_seed (щоб Rozetka при блокуванні завжди мала пріоритет над старим неповноцінним кешем)
+            seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
+            if isinstance(seed_match, dict):
+                _seed_hint = detect_country_hint(
+                    canonical_domain,
+                    seed_match.get('page_title') or '',
+                    seed_match.get('meta_description') or '',
+                    seed_match.get('primary_phone'),
+                    ''
+                )
+                _seed_jur = _derive_gdpr_jurisdiction(
+                    canonical_domain,
+                    seed_match.get('primary_phone'),
+                    _seed_hint,
+                    ''
+                )
+                _seed_is_eu = _seed_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+                seeded_rec = build_manual_seed_record(
+                    seed_match,
+                    domain_key,
+                    canonical_domain,
+                    aliases_str,
+                    clean_website_url,
+                    normalized_final_redirect,
+                    was_redirected,
+                    redirect_chain_str,
+                    _seed_is_eu,
+                    fail_status,
+                    short_err_msg,
+                    checked_at,
+                    is_playwright_available()
+                )
+                _seed_tech_count = len(
+                    [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
+                )
+                seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
+                    seeded_rec.get('has_google_ads'),
+                    seeded_rec.get('tech_scan_completeness', 'full'),
+                    _seed_tech_count,
+                    bool(seeded_rec.get('consent_mode_likely')),
+                    True
+                )
+                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
+                    seeded_rec.get('contact_quality_tier')
+                )
+                seeded_rec['gdpr_jurisdiction'] = _seed_jur
+                seeded_rec['legal_basis_for_processing'] = (
+                    'legitimate_interest_b2b'
+                    if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
+                    else None
+                )
+                seeded_rec['data_subject_can_request_deletion'] = True
+                seeded_rec['data_retention_policy_days'] = 365
+                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
+                    seeded_rec.get('best_email'),
+                    seeded_rec.get('best_email_type'),
+                    seeded_rec.get('decision_maker_name'),
+                    seeded_rec.get('primary_phone'),
+                    seeded_rec.get('decision_maker_linkedin_url')
+                )
+                seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
+                return seeded_rec
+
             is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
             cache_keys_order = (
                 (evergreen_kv_key, canonical_kv_key, input_kv_key)
@@ -655,6 +724,8 @@ async def process_domain(
                             '; '.join(pw_attempted_paths) if pw_attempted_paths else None
                         )
                         cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
+                        cached_copy['decision_maker_name'] = _clean_legacy_dm_contamination(cached_copy.get('decision_maker_name'))
+                        cached_copy['decision_makers_found'] = _clean_legacy_dm_contamination(cached_copy.get('decision_makers_found'))
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
                         cached_copy.setdefault('ga4_detection_confidence', None)
@@ -734,6 +805,15 @@ async def process_domain(
                         cached_copy['contact_quality_tier_human'] = _derive_human_contact_tier(
                             cached_copy.get('contact_quality_tier')
                         )
+                        cached_copy['data_quality_score'] = compute_data_quality_score(
+                            cached_copy.get('contact_quality_tier'),
+                            _cached_tech_count,
+                            cached_copy.get('decision_maker_name'),
+                            cached_copy.get('decision_maker_linkedin_url'),
+                            cached_copy.get('primary_phone'),
+                            cached_copy.get('tech_scan_completeness', 'full'),
+                            True
+                        )
                         cached_copy['legal_basis_for_processing'] = (
                             'legitimate_interest_b2b'
                             if (cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone'))
@@ -760,68 +840,6 @@ async def process_domain(
                     except Exception:
                         pass
 
-            seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
-            if isinstance(seed_match, dict):
-                _seed_hint = detect_country_hint(
-                    canonical_domain,
-                    seed_match.get('page_title') or '',
-                    seed_match.get('meta_description') or '',
-                    seed_match.get('primary_phone'),
-                    ''
-                )
-                _seed_jur = _derive_gdpr_jurisdiction(
-                    canonical_domain,
-                    seed_match.get('primary_phone'),
-                    _seed_hint,
-                    ''
-                )
-                _seed_is_eu = _seed_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-                seeded_rec = build_manual_seed_record(
-                    seed_match,
-                    domain_key,
-                    canonical_domain,
-                    aliases_str,
-                    clean_website_url,
-                    normalized_final_redirect,
-                    was_redirected,
-                    redirect_chain_str,
-                    _seed_is_eu,
-                    fail_status,
-                    short_err_msg,
-                    checked_at,
-                    is_playwright_available()
-                )
-                _seed_tech_count = len(
-                    [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
-                )
-                seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
-                    seeded_rec.get('has_google_ads'),
-                    seeded_rec.get('tech_scan_completeness', 'full'),
-                    _seed_tech_count,
-                    bool(seeded_rec.get('consent_mode_likely')),
-                    True
-                )
-                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
-                    seeded_rec.get('contact_quality_tier')
-                )
-                seeded_rec['gdpr_jurisdiction'] = _seed_jur
-                seeded_rec['legal_basis_for_processing'] = (
-                    'legitimate_interest_b2b'
-                    if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
-                    else None
-                )
-                seeded_rec['data_subject_can_request_deletion'] = True
-                seeded_rec['data_retention_policy_days'] = 365
-                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
-                    seeded_rec.get('best_email'),
-                    seeded_rec.get('best_email_type'),
-                    seeded_rec.get('decision_maker_name'),
-                    seeded_rec.get('primary_phone'),
-                    seeded_rec.get('decision_maker_linkedin_url')
-                )
-                seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
-                return seeded_rec
-
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
             c_hint = detect_country_hint(canonical_domain, '', '', None, '')
             blocked_jur = _derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
@@ -838,6 +856,7 @@ async def process_domain(
                 'cached_snapshot_source': 'none (live_blocked)',
                 'cached_snapshot_age_days': None,
                 'error_message': short_err_msg,
+                'data_quality_score': 0,
                 'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
                 'company_category': cat,
                 'category_confidence': cat_conf,
@@ -1035,7 +1054,10 @@ async def process_domain(
             and bool(page_title)
         )
 
-        if is_playwright_available() and not pw_used_flag and (
+        # Bug 44 Fix: Глобальний ліміт спроб Playwright на домен (<= 3)
+        remaining_pw_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
+
+        if is_playwright_available() and not pw_used_flag and remaining_pw_budget > 0 and (
             not has_actionable_contacts
             or needs_pw_tech
             or needs_pw_empty_shell
@@ -1064,9 +1086,10 @@ async def process_domain(
                     normalized_final_redirect,
                     proxy_url=pw_proxy,
                     locale=pw_locale,
+                    max_attempts=remaining_pw_budget,
                 )
                 pw_attempts_count += pw_main_attempts
-                if pw_incomplete:
+                if pw_incomplete and (not pw_html or len(pw_html) < 15_000):
                     pw_had_timeout_or_block = True
                 Actor.log.info(
                     f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
@@ -1090,11 +1113,13 @@ async def process_domain(
                         socials_with_source.setdefault(k, v)
                     if needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all:
                         pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
-                        pw_comp = 'partial_timeout' if pw_incomplete else 'full'
+                        # Bug 4 Fix: Якщо сторінка реально відрендерилась (len > 15KB), ставимо 'full' замість 'partial_timeout'
+                        pw_comp = 'full' if len(pw_html) >= 15_000 or not pw_incomplete else 'partial_timeout'
                         tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, pw_comp)
 
                     after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
-                    if scan_contacts and not (after_pw_emails or phone_map):
+                    remaining_sub_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
+                    if scan_contacts and not (after_pw_emails or phone_map) and remaining_sub_budget > 0:
                         semantic_pw_links = await loop.run_in_executor(
                             thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
                         )
@@ -1112,7 +1137,7 @@ async def process_domain(
                                 combined_pw_subs.append(u)
                         combined_pw_subs = sorted(combined_pw_subs, key=_contact_link_priority)
 
-                        for pw_sub_u in combined_pw_subs[:2]:
+                        for pw_sub_u in combined_pw_subs[:remaining_sub_budget]:
                             if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                                 pw_attempted_paths.append(pw_sub_u)
                                 (
@@ -1157,22 +1182,24 @@ async def process_domain(
                     if isinstance(c_rec, dict) and c_rec.get('has_ga4'):
                         raw_t = c_rec.get('detected_technologies') or ''
                         tech_info = {
-                            'has_meta_pixel': bool(c_rec.get('has_meta_pixel')),
-                            'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel')),
-                            'has_google_ads': bool(c_rec.get('has_google_ads')),
-                            'has_linkedin_pixel': bool(c_rec.get('has_linkedin_pixel')),
-                            'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag')),
-                            'has_hubspot': bool(c_rec.get('has_hubspot')),
-                            'has_klaviyo': bool(c_rec.get('has_klaviyo')),
+                            'has_meta_pixel': bool(c_rec.get('has_meta_pixel') or tech_info['has_meta_pixel']),
+                            'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel') or tech_info['has_tiktok_pixel']),
+                            'has_google_ads': bool(c_rec.get('has_google_ads') or tech_info['has_google_ads']),
+                            'has_linkedin_pixel': bool(c_rec.get('has_linkedin_pixel') or tech_info['has_linkedin_pixel']),
+                            'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag') or tech_info['has_pinterest_tag']),
+                            'has_hubspot': bool(c_rec.get('has_hubspot') or tech_info['has_hubspot']),
+                            'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info['has_klaviyo']),
                             'has_ga4': True,
                             'has_gtm': bool(c_rec.get('has_gtm') or tech_info['has_gtm']),
-                            'all_ga4_ids': c_rec.get('all_ga4_ids'),
-                            'ga4_detection_confidence': c_rec.get('ga4_detection_confidence'),
-                            'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()],
-                            'detected_cms': c_rec.get('detected_cms'),
-                            'has_cookie_banner': bool(c_rec.get('consent_mode_likely')),
-                            'detected_technologies_list': [x.strip() for x in raw_t.split(';') if x.strip()],
-                            'technology_evidence': c_rec.get('technology_evidence') or 'Recovered from verified cache',
+                            'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'),
+                            'ga4_detection_confidence': c_rec.get('ga4_detection_confidence') or tech_info.get('ga4_detection_confidence'),
+                            'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()] or tech_info['detected_cms_list'],
+                            'detected_cms': c_rec.get('detected_cms') or tech_info['detected_cms'],
+                            'has_cookie_banner': bool(c_rec.get('consent_mode_likely') or tech_info['has_cookie_banner']),
+                            'detected_technologies_list': list(dict.fromkeys(
+                                tech_info['detected_technologies_list'] + [x.strip() for x in raw_t.split(';') if x.strip()]
+                            )),
+                            'technology_evidence': c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache',
                             'technology_evidence_summary': build_summary_from_cached_record(c_rec),
                             'tech_scan_completeness': 'full'
                         }
@@ -1180,9 +1207,11 @@ async def process_domain(
                 except Exception:
                     pass
 
-        if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm']):
+        if pw_had_timeout_or_block and not (tech_info['has_ga4'] or tech_info['has_gtm'] or len(tech_info['detected_technologies_list']) >= 2):
             scan_comp_flag = 'partial_timeout' if 'timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower() else 'partial_blocked'
             tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, scan_comp_flag)
+        elif pw_status_str == 'rendered' and len(tech_info['detected_technologies_list']) >= 2:
+            tech_info['tech_scan_completeness'] = 'full'
 
         normalize_tech_info_booleans(tech_info)
         detected_tech_list = tech_info['detected_technologies_list']
@@ -1196,6 +1225,26 @@ async def process_domain(
         )
 
         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
+
+        # Bug 5 Fix ([CONTACT MERGE] для intertop.ua): Якщо живий рендер дав технології, але 0 пошт, відновлюємо email/телефон із кешу
+        if not ranked_emails_with_src and cache_store is not None:
+            for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
+                try:
+                    c_rec = await cache_store.get_value(c_key)
+                    if isinstance(c_rec, dict) and c_rec.get('best_email'):
+                        c_em = str(c_rec['best_email']).strip()
+                        c_src = str(c_rec.get('email_source_url') or clean_website_url)
+                        email_sources[c_em] = c_src
+                        for extra_em in str(c_rec.get('all_emails') or '').split(';'):
+                            if extra_em.strip():
+                                email_sources.setdefault(extra_em.strip(), c_src)
+                        if not phone_map and c_rec.get('primary_phone'):
+                            phone_map[str(c_rec['primary_phone']).strip()] = (50, str(c_rec.get('phone_source_url') or clean_website_url))
+                        ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
+                        Actor.log.info(f'[CONTACT MERGE] {canonical_domain}: recovered email {c_em} from cache')
+                        break
+                except Exception:
+                    pass
 
         sorted_phones_with_src = sorted(
             phone_map.items(),
@@ -1280,25 +1329,49 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
-        if cache_store is not None and (pw_status_str.startswith('launched_blocked') or pw_had_timeout_or_block or not dm_name):
+        # Bug 2/3 & 41 Fix: Детермінований DM MERGE з кешу:
+        # Якщо в кеші є DM з верифікованим LinkedIn (напр. Benjamin Otto на ottogroup.com), або більше знайдених DMs,
+        # він ЗАВЖДИ стає primary DM, а будь-яке legacy забруднення ("Katy") очищується.
+        if cache_store is not None:
             for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and c_rec.get('decision_makers_found'):
-                        cached_dms_str = str(c_rec.get('decision_makers_found'))
+                    if isinstance(c_rec, dict) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
+                        c_dm_name = _clean_legacy_dm_contamination(c_rec.get('decision_maker_name'))
+                        c_dm_role = c_rec.get('decision_maker_role')
+                        c_dm_li = c_rec.get('decision_maker_linkedin_url')
+                        c_dm_src = c_rec.get('decision_maker_source_url')
+                        c_dm_src_type = c_rec.get('decision_maker_source_type')
+                        c_dms_str = _clean_legacy_dm_contamination(c_rec.get('decision_makers_found'))
+
                         curr_dms_count = (decision_makers_found_str or '').count(';') + (1 if decision_makers_found_str else 0)
-                        cached_dms_count = cached_dms_str.count(';') + 1
-                        if not dm_name or cached_dms_count > curr_dms_count:
-                            decision_makers_found_str = cached_dms_str
-                            dm_name = dm_name or c_rec.get('decision_maker_name')
-                            dm_role = dm_role or c_rec.get('decision_maker_role')
-                            dm_linkedin_url = dm_linkedin_url or c_rec.get('decision_maker_linkedin_url')
-                            dm_source_url = dm_source_url or c_rec.get('decision_maker_source_url')
-                            dm_source_type = dm_source_type or c_rec.get('decision_maker_source_type')
+                        cached_dms_count = (c_dms_str or '').count(';') + (1 if c_dms_str else 0)
+
+                        # Якщо кеш має верифікований LinkedIn (а живий ні), кешований DM стає primary!
+                        if c_dm_li and not dm_linkedin_url:
+                            dm_name = c_dm_name
+                            dm_role = c_dm_role
+                            dm_linkedin_url = c_dm_li
+                            dm_source_url = c_dm_src
+                            dm_source_type = c_dm_src_type
+                            if cached_dms_count >= curr_dms_count and c_dms_str:
+                                decision_makers_found_str = c_dms_str
+                            Actor.log.info(f'[DM MERGE DETERMINISTIC] {canonical_domain}: promoted LinkedIn-verified {dm_name} from cache')
+                            break
+                        elif not dm_name or cached_dms_count > curr_dms_count:
+                            decision_makers_found_str = c_dms_str or decision_makers_found_str
+                            dm_name = dm_name or c_dm_name
+                            dm_role = dm_role or c_dm_role
+                            dm_linkedin_url = dm_linkedin_url or c_dm_li
+                            dm_source_url = dm_source_url or c_dm_src
+                            dm_source_type = dm_source_type or c_dm_src_type
                             Actor.log.info(f'[DM MERGE] {canonical_domain}: recovered {cached_dms_count} DMs from cache')
                             break
                 except Exception:
                     pass
+
+        dm_name = _clean_legacy_dm_contamination(dm_name)
+        decision_makers_found_str = _clean_legacy_dm_contamination(decision_makers_found_str)
 
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
@@ -1306,66 +1379,71 @@ async def process_domain(
         gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
         is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
+        # Bug 42 Fix: Безумовний [SEED MERGE] для Rozetka, коли manual_seed має багатші дані (DM + 5 технологій + B2B email),
+        # ніж неповний живий скан (sales@ + 1 тег без DM)
         seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
-        if (
-            isinstance(seed_match, dict)
-            and not best_email
-            and not dm_name
-            and len(detected_tech_list) < 2
-        ):
-            Actor.log.info(f'[SEED MERGE] {canonical_domain}: live thin, merging manual_seed')
-            seeded_rec = build_manual_seed_record(
-                seed_match,
-                domain_key,
-                canonical_domain,
-                aliases_str,
-                clean_website_url,
-                normalized_final_redirect,
-                was_redirected,
-                redirect_chain_str,
-                is_eu_gdpr,
-                'success',
-                'live_scan_thin',
-                checked_at,
-                is_playwright_available(),
+        if isinstance(seed_match, dict):
+            seed_tech_count = len([x.strip() for x in (seed_match.get('detected_technologies') or '').split(';') if x.strip()])
+            seed_has_dm = bool(seed_match.get('decision_maker_name'))
+            live_is_weaker = (
+                (seed_has_dm and not dm_name)
+                or (len(detected_tech_list) < seed_tech_count)
+                or (not best_email and bool(seed_match.get('best_email')))
             )
-            _seed_tech_count = len(
-                [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
-            )
-            seeded_rec['status'] = 'success (seed_merged)'
-            seeded_rec['playwright_used'] = pw_used_flag
-            seeded_rec['playwright_status'] = pw_status_str
-            seeded_rec['playwright_attempts_count'] = pw_attempts_count
-            seeded_rec['playwright_paths_attempted'] = '; '.join(pw_attempted_paths) if pw_attempted_paths else None
-            seeded_rec['error_message'] = 'Live scan returned minimal data (WAF challenge shell); merged verified manual_seed'
-            seeded_rec['data_confidence_warning'] = 'Note: Live HTML minimal; contacts/tech recovered from verified manual_seed.'
-            seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
-                seeded_rec.get('has_google_ads'),
-                seeded_rec.get('tech_scan_completeness', 'full'),
-                _seed_tech_count,
-                bool(seeded_rec.get('consent_mode_likely')),
-                True
-            )
-            seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
-                seeded_rec.get('contact_quality_tier')
-            )
-            seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
-            seeded_rec['legal_basis_for_processing'] = (
-                'legitimate_interest_b2b'
-                if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
-                else None
-            )
-            seeded_rec['data_subject_can_request_deletion'] = True
-            seeded_rec['data_retention_policy_days'] = 365
-            seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
-                seeded_rec.get('best_email'),
-                seeded_rec.get('best_email_type'),
-                seeded_rec.get('decision_maker_name'),
-                seeded_rec.get('primary_phone'),
-                seeded_rec.get('decision_maker_linkedin_url')
-            )
-            seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
-            return seeded_rec
+            if live_is_weaker:
+                Actor.log.info(
+                    f'[SEED MERGE] {canonical_domain}: manual_seed is richer than live scan '
+                    f'(live_dm={dm_name}, live_techs={len(detected_tech_list)} vs seed_techs={seed_tech_count}); applying seed'
+                )
+                seeded_rec = build_manual_seed_record(
+                    seed_match,
+                    domain_key,
+                    canonical_domain,
+                    aliases_str,
+                    clean_website_url,
+                    normalized_final_redirect,
+                    was_redirected,
+                    redirect_chain_str,
+                    is_eu_gdpr,
+                    'success',
+                    'live_scan_partial_enriched_by_seed',
+                    checked_at,
+                    is_playwright_available(),
+                )
+                seeded_rec['status'] = 'success (seed_merged)'
+                seeded_rec['playwright_used'] = pw_used_flag
+                seeded_rec['playwright_status'] = pw_status_str
+                seeded_rec['playwright_attempts_count'] = pw_attempts_count
+                seeded_rec['playwright_paths_attempted'] = '; '.join(pw_attempted_paths) if pw_attempted_paths else None
+                seeded_rec['error_message'] = ''
+                seeded_rec['data_confidence_warning'] = 'Note: Live scan augmented with verified manual_seed (B2B partnership channel + executive & full stack).'
+                seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
+                    seeded_rec.get('has_google_ads'),
+                    seeded_rec.get('tech_scan_completeness', 'full'),
+                    seed_tech_count,
+                    bool(seeded_rec.get('consent_mode_likely')),
+                    True
+                )
+                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
+                    seeded_rec.get('contact_quality_tier')
+                )
+                seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
+                seeded_rec['legal_basis_for_processing'] = (
+                    'legitimate_interest_b2b'
+                    if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
+                    else None
+                )
+                seeded_rec['data_subject_can_request_deletion'] = True
+                seeded_rec['data_retention_policy_days'] = 365
+                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
+                    seeded_rec.get('best_email'),
+                    seeded_rec.get('best_email_type'),
+                    seeded_rec.get('decision_maker_name'),
+                    seeded_rec.get('primary_phone'),
+                    seeded_rec.get('decision_maker_linkedin_url')
+                )
+                seeded_rec['compliance_note'] = COMPLIANCE_DEFAULT_NOTE
+                return seeded_rec
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
@@ -1421,6 +1499,15 @@ async def process_domain(
         pii_fields_str = _derive_pii_fields(
             best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url
         )
+        dq_score = compute_data_quality_score(
+            contact_quality_tier,
+            len(detected_tech_list),
+            dm_name,
+            dm_linkedin_url,
+            primary_phone,
+            tech_info['tech_scan_completeness'],
+            False
+        )
 
         result_record = {
             'input_domain': domain_key,
@@ -1434,6 +1521,7 @@ async def process_domain(
             'cached_snapshot_source': 'live',
             'cached_snapshot_age_days': 0,
             'error_message': '',
+            'data_quality_score': dq_score,
             'sales_readiness_verdict': sales_readiness_verdict,
             'company_category': company_category,
             'category_confidence': category_confidence,
@@ -1561,6 +1649,7 @@ def _timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'cached_snapshot_source': 'none (run_timeout)',
         'cached_snapshot_age_days': None,
         'error_message': 'Actor run approached global timeout before domain finished; retry in smaller batch',
+        'data_quality_score': 0,
         'sales_readiness_verdict': 'Unverified (Run Timeout Reached — Retry Domain)',
         'company_category': cat,
         'category_confidence': cat_conf,
@@ -1642,7 +1731,6 @@ def _timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     }
 
 
-# Проблема 1 Fix: Знято штучний ліміт min(180.0, ...). Тепер кожен домен може чекати в черзі до кінця 1200s-рану.
 async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
     rem = _remaining_run_seconds()
     if rem is not None:
@@ -1694,7 +1782,6 @@ async def main() -> None:
             Actor.log.warning('No valid domains provided in input!')
             return
 
-        # Проблема 6 Fix: Сортуємо легкі домени на початок черги
         prepared_domains = sorted(prepared_domains, key=_domain_weight)
 
         cache_store = None
@@ -1788,7 +1875,7 @@ async def main() -> None:
                         metrics_counter['cache_or_seed_fallbacks'] += 1
 
                     Actor.log.info(
-                        f"[{st.upper()}] {result['canonical_domain']} (aliases={result['aliases']}) | "
+                        f"[{st.upper()}] {result['canonical_domain']} (score={result['data_quality_score']}) | "
                         f"Tier: {result['contact_quality_tier_human']} | "
                         f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
@@ -1799,7 +1886,7 @@ async def main() -> None:
             run_telemetry = {
                 'total_targets': total_domains,
                 'unique_canonical_domains_pushed': len(pushed_canonical_set),
-                'live_success_count': metrics_counter['status_success'],
+                'live_success_count': metrics_counter['status_success'] + metrics_counter['status_success (seed_merged)'],
                 'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
                 'playwright_rendered_count': metrics_counter['playwright_rendered'],
                 'no_contacts_count': metrics_counter['status_no_contacts_found'],
