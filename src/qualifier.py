@@ -112,7 +112,6 @@ def classify_company_category(
         )
     )
 
-    # Проблема 2 Fix: Використовуємо \b...\b word-boundary, щоб 'ngo' не спрацьовувало на 'ringostat.com'
     if is_explicit_npo or (
         not has_commercial_stack and any(
             re.search(rf'\b{re.escape(w)}\b', text) for w in (
@@ -175,6 +174,48 @@ def build_linkedin_xray_query(
     )
 
 
+def compute_data_quality_score(
+    contact_quality_tier: str | None,
+    techs_count: int,
+    dm_name: str | None,
+    dm_linkedin_url: str | None,
+    primary_phone: str | None,
+    scan_completeness: str = 'full',
+    is_cached_or_seed: bool = False
+) -> int:
+    score = 0
+    t_str = contact_quality_tier or ''
+    if 'Tier A' in t_str or 'Agency Tier A' in t_str:
+        score += 45
+    elif 'Tier B+' in t_str or 'Agency Tier B+' in t_str:
+        score += 38
+    elif 'Tier B' in t_str:
+        score += 32
+    elif 'Tier C' in t_str or 'Agency Tier C' in t_str:
+        score += 20
+    elif 'Tier D' in t_str:
+        score += 8
+
+    if dm_name:
+        score += 15
+    if dm_linkedin_url:
+        score += 10
+    if primary_phone:
+        score += 10
+
+    if techs_count >= 4:
+        score += 20
+    elif techs_count >= 2:
+        score += 15
+    elif techs_count == 1:
+        score += 8
+
+    if scan_completeness != 'full' and techs_count == 0 and not is_cached_or_seed:
+        score = max(0, score - 10)
+
+    return min(100, score)
+
+
 def evaluate_qualification_v180(
     company_category: str,
     tech_info: dict,
@@ -217,7 +258,7 @@ def evaluate_qualification_v180(
     detected_cms = tech_info.get('detected_cms_list', [])
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    pw_blocked_by_waf = pw_status_str.startswith('launched_blocked')
+    pw_blocked_by_waf = pw_status_str.startswith('launched_blocked') or pw_status_str == 'skipped_hopeless_waf'
 
     if all_signals:
         detected_signals_str = ', '.join(all_signals)
@@ -305,6 +346,15 @@ def evaluate_qualification_v180(
         contact_quality = f'Tier A- (Decision-Maker Found: {dm_name} + Direct Marketing Role Inbox: {best_email})'
         enrichment_status = 'decision_maker_found_plus_marketing_role_inbox'
         confidence_warning = f'Note: Executive identified on site and paired with dedicated marketing@ department inbox.{source_extra_note}'
+    # Bug 11 & 12 Fix: Верифікований DM + комерційний B2B/Sales інбокс (sales@ringostat, corporate@macpaw, partner@rozetka, partnerwerden@docmorris) + підтверджений стек -> Tier A- (Hot)
+    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and len(all_signals) >= 1:
+        contact_quality = (
+            f'Tier A- (Decision-Maker Found: {dm_name} + Commercial B2B/Sales Channel: {best_email})'
+        )
+        enrichment_status = 'decision_maker_paired_with_commercial_b2b_channel'
+        confidence_warning = (
+            f'Note: Verified executive ({dm_name}) paired with commercial B2B/Sales inbox ({best_email}).{source_extra_note}'
+        )
     elif dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
         contact_quality = (
             f'Tier B+ (Named Staff Inbox {best_email} Found, '
@@ -405,15 +455,17 @@ def evaluate_qualification_v180(
             readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
         else:
             readiness_verdict = f'Contact-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
+    elif dm_name and is_same_person_email:
+        readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
+    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and all_signals:
+        readiness_verdict = f'Sales-Ready Tier 1.5 (Verified Decision-Maker {dm_name} + Commercial B2B/Sales Channel)'
+    elif best_email_type == 'marketing_or_exec_role' and all_signals:
+        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif not all_signals:
         if dm_name:
             readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
         else:
             readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
-    elif dm_name and is_same_person_email:
-        readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
-    elif best_email_type == 'marketing_or_exec_role':
-        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif best_email_type == 'b2b_partnerships':
         readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
     elif enrichment_status == 'owner_identified_paired_with_brand_webmail':
@@ -470,6 +522,11 @@ def evaluate_qualification_v180(
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url}"
             f"{stack_ref_clause}"
         )
+    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
+        next_action = (
+            f"Contact {dm_name} ({dm_role}) via LinkedIn or send B2B discovery proposal to {best_email}"
+            f"{stack_ref_clause}{phone_note}"
+        )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
         'regional_branch_inbox', 'admissions_or_department_inbox', 'legal_or_hr_inbox',
@@ -481,16 +538,10 @@ def evaluate_qualification_v180(
             f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
         )
     elif best_email_type == 'b2b_partnerships':
-        if dm_name:
-            next_action = (
-                f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics "
-                f"(or contact {dm_name} [{dm_role}] via LinkedIn{phone_note})"
-            )
-        else:
-            next_action = (
-                f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
-                f"NO DM found on site — use decision_maker_search_query on LinkedIn to find CMO/Head of Marketing first{phone_note}"
-            )
+        next_action = (
+            f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
+            f"NO DM found on site — use decision_maker_search_query on LinkedIn to find CMO/Head of Marketing first{phone_note}"
+        )
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
             f"Send tailored discovery audit offer to {best_email} ({best_email_type})"
@@ -616,6 +667,16 @@ def build_manual_seed_record(
         if seed_emails_list else None
     )
 
+    dq_score = compute_data_quality_score(
+        contact_quality_tier,
+        len(seed_tech_list),
+        dm_name,
+        seed.get('decision_maker_linkedin_url'),
+        primary_phone,
+        'full',
+        True
+    )
+
     return {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -628,6 +689,7 @@ def build_manual_seed_record(
         'cached_snapshot_source': 'manual_seed',
         'cached_snapshot_age_days': age_days,
         'error_message': truncate_error_msg(f'Live {short_err_msg}; served verified manual_seed from {verified_at}'),
+        'data_quality_score': dq_score,
         'sales_readiness_verdict': sales_readiness_verdict,
         'company_category': cat,
         'category_confidence': cat_conf,
