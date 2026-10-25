@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 20
+CACHE_SCHEMA_VERSION = 21
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -16,6 +16,13 @@ SCHEMA_PHONE_REGEX = re.compile(
 )
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
+
+# Детекція Server-Side GTM (sGTM) — коли gtm.js або /g/collect вантажиться з кастомного піддомену (ss., sgtm., metrics., data.)
+SGTM_CUSTOM_LOADER_REGEX = re.compile(
+    r'https?://(?!(?:www\.)?(?:googletagmanager|google-analytics|analytics\.google)\.com)'
+    r'[a-zA-Z0-9.-]+/(?:gtm\.js\?id=GTM-[A-Z0-9]+|g/collect\?v=2)',
+    re.IGNORECASE
+)
 
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
 
@@ -110,8 +117,6 @@ HYPHENATED_WORD_PART = (
     rf'{SINGLE_WORD_PART}(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}})?'
 )
 
-# Bug 41 Fix: Якщо прізвище вже подвійне через дефіс (Scharner-Wolff), НЕ приєднуємо третє слово ("Katy" зі списку правління)!
-# Три слова дозволено лише тоді, коли жодне з перших двох слів не містить дефіса (напр. українське Ім'я По-батькові Прізвище).
 NAME_REGEX_PART = (
     rf'({SINGLE_WORD_PART}[ \t]+{SINGLE_WORD_PART}-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}}'
     rf'|{HYPHENATED_WORD_PART}[ \t]+{SINGLE_WORD_PART}'
@@ -154,7 +159,24 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
-# Bug 41 Fix: Розширено список міст та локацій (включно з US/EU хабами та 'katy', 'austin', 'dallas', 'houston')
+# P0 #2 Fix: Інвертований список корпоративних суфіксів та слів-ознак юросіб
+# Блокує "BPO Capital", "GFH Gesellschaft", "YOU Verwaltungs", "XYZ Beteiligungs", "ABC Ventures" тощо
+CORPORATE_ENTITY_TOKENS = {
+    'capital', 'holding', 'holdings', 'group', 'gruppe', 'gesellschaft', 'konzern',
+    'verwaltungs', 'verwaltung', 'beteiligungs', 'beteiligungsgesellschaft', 'stiftung',
+    'gmbh', 'mbh', 'ag', 'kg', 'kgaa', 'se', 'ohg', 'gbr', 'ug', 'ev', 'eg',
+    'sarl', 'sas', 'sasu', 'sa', 'srl', 'spa', 'sl', 'bv', 'nv', 'ab', 'aps', 'as', 'oy',
+    'llc', 'inc', 'ltd', 'plc', 'corp', 'corporation', 'incorporated', 'limited',
+    'ventures', 'venture', 'partners', 'investments', 'investment', 'equity', 'fund',
+    'bank', 'sparkasse', 'versicherung', 'immobilien', 'logistik', 'logistics',
+    'solutions', 'systems', 'technologies', 'technology', 'services', 'service',
+    'consulting', 'consultancy', 'media', 'agency', 'agentur', 'digital', 'international',
+    'global', 'europe', 'deutschland', 'germany', 'austria', 'switzerland', 'schweiz',
+    'commerce', 'retail', 'trading', 'trade', 'handels', 'handel', 'vertriebs',
+    'apotheke', 'versandapotheke', 'pharma', 'healthcare', 'medical', 'klinik',
+    'bpo', 'gfh', 'you', 'otto', 'zalando', 'aboutyou', 'docmorris', 'coolblue'
+}
+
 CITY_NAMES_BLACKLIST = {
     'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
     'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
@@ -207,6 +229,7 @@ DEPARTMENT_PREFIX_BLACKLIST = {
     'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa',
     'laadpalen', 'zonnepanelen', 'energie', 'installatie'
 }
+DEPARTMENT_PREFIX_BLACKLIST.update(CORPORATE_ENTITY_TOKENS)
 
 ROLE_TOKEN_BLACKLIST = {
     'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
@@ -234,6 +257,7 @@ ROLE_TOKEN_BLACKLIST = {
 ROLE_TOKEN_BLACKLIST.update(UI_ACTION_WORDS_BLACKLIST)
 ROLE_TOKEN_BLACKLIST.update(DEPARTMENT_PREFIX_BLACKLIST)
 ROLE_TOKEN_BLACKLIST.update(CITY_NAMES_BLACKLIST)
+ROLE_TOKEN_BLACKLIST.update(CORPORATE_ENTITY_TOKENS)
 
 ROLE_WORDS_IN_CONTEXT = (
     'manager', 'менеджер', 'sales', 'sales manager', 'director', 'директор',
@@ -279,6 +303,8 @@ ROLE_NORMALIZATION_MAP = {
     'директорка': 'Managing Director / CEO',
     'general manager': 'General Manager',
     'managing director': 'Managing Director / CEO',
+    'managing director (geschäftsführer)': 'Managing Director / CEO (Geschäftsführer)',
+    'managing director (geschäftsführerin)': 'Managing Director / CEO (Geschäftsführerin)',
     'geschäftsführer': 'Managing Director / CEO (Geschäftsführer)',
     'geschäftsführerin': 'Managing Director / CEO (Geschäftsführerin)',
     'geschäftsführung': 'Managing Director / CEO (Geschäftsführung)',
@@ -286,6 +312,7 @@ ROLE_NORMALIZATION_MAP = {
     'vorstandsvorsitzende': 'Chief Executive Officer (CEO)',
     'bereichsvorstand': 'Executive Board / CEO',
     'vorstand': 'Executive Board / CEO (Vorstand)',
+    'executive board member (vorstand)': 'Executive Board / CEO (Vorstand)',
     'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
     'président-directeur général': 'Chief Executive Officer (CEO)',
@@ -413,7 +440,8 @@ STOP_NAME_WORDS = {
     'Madrid', 'Barcelona', 'Rome', 'Roma', 'Milan', 'Milano', 'Amsterdam', 'Rotterdam',
     'Brussels', 'Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Lisbon', 'Warsaw',
     'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa',
-    'Katy', 'Austin', 'Dallas', 'Houston'
+    'Katy', 'Austin', 'Dallas', 'Houston', 'Capital', 'Gesellschaft', 'Verwaltungs',
+    'Verwaltung', 'Beteiligungs', 'BPO', 'GFH', 'YOU'
 }
 
 UA_TO_LATIN = {
