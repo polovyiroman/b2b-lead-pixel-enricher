@@ -677,10 +677,6 @@ def extract_valid_phones(
 
 
 def classify_dm_source_type(dm_source_url: str | None) -> str | None:
-    """
-    Issue 26 Fix: Перевіряємо канонічний Impressum та DM_LEGAL_SOURCE_FLAG (/agb, /terms, /oferta)
-    РАНІШЕ за /about та /ueber-uns, щоб /ueber-uns/agb класифікувався як 'legal_or_offer_page'.
-    """
     if not dm_source_url:
         return None
     path_low = urlparse(dm_source_url).path.lower()
@@ -724,6 +720,10 @@ def strip_role_tokens_from_name(candidate: str) -> str:
     if has_cyrillic:
         while words and re.fullmatch(r'[A-Za-z\'-]+', words[0]):
             words.pop(0)
+    # Bug 41 Fix: Якщо друге слово вже є подвійним дефісним прізвищем (Scharner-Wolff),
+    # відтинаємо будь-яке третє слово ("Katy" зі списку членів правління)
+    if len(words) == 3 and ('-' in words[1] or '-' in words[0]):
+        words = words[:2]
     return ' '.join(words)
 
 
@@ -791,20 +791,35 @@ def is_low_trust_legal_offer_page(path: str) -> bool:
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None]:
-    candidate_li_urls = []
-    found_dms: list[dict] = []
-    seen_names: set[str] = set()
+    candidate_li_urls: list[str] = []
+    found_dms_by_name: dict[str, dict] = {}
 
     brand_root = ''
     if pages_with_urls:
         first_host = urlparse(pages_with_urls[0][0]).netloc.lower().replace('www.', '')
         brand_root = first_host.split('.')[0] if first_host else ''
 
+    # Крок 1 (Determinism Fix): Спочатку збираємо ВСІ посилання на особисті профілі LinkedIn з усіх сторінок,
+    # щоб кожен кандидат гарантовано отримав свій matched_li незалежно від порядку обходу сторінок.
+    for page_url, html, _ in pages_with_urls:
+        url_path = urlparse(page_url).path
+        if DM_SOURCE_BLACKLIST.search(url_path):
+            continue
+        soup = BeautifulSoup(html, 'lxml')
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href'].strip()
+            if 'linkedin.com/in/' in href.lower():
+                parsed = urlparse(href)
+                if parsed.scheme in ('http', 'https'):
+                    clean_li = f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+                    if clean_li not in candidate_li_urls:
+                        candidate_li_urls.append(clean_li)
+
     def add_dm_candidate(name: str, role: str | None, page_url: str, is_leg: bool, base_priority: int):
         norm_name = name.strip()
-        if norm_name.lower() in seen_names or norm_name.lower() in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
+        name_key = norm_name.lower()
+        if not norm_name or name_key in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
             return
-        seen_names.add(norm_name.lower())
         clean_src = clean_url_port(page_url) or page_url
         src_type = classify_dm_source_type(clean_src)
         matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(norm_name, u)), None)
@@ -820,7 +835,7 @@ def extract_decision_maker_deep(
         }.get(src_type or '', 5)
 
         role_low = (role or '').lower()
-        if 'supervisory' in role_low or 'aufsichtsrat' in role_low or 'gesellschafterrat' in role_low:
+        if 'supervisory' in role_low or 'aufsichtsrat' in role_low:
             role_bonus = -30
         elif src_type == 'product_or_service_page' and 'ceo' in role_low and 'founder' not in role_low:
             role_bonus = -10
@@ -831,15 +846,25 @@ def extract_decision_maker_deep(
         else:
             role_bonus = 5
 
-        found_dms.append({
-            'name': norm_name,
-            'role': role or 'Executive',
-            'li_url': matched_li,
-            'source_url': clean_src,
-            'source_type': src_type,
-            'is_legal': is_leg,
-            'score': base_priority + type_bonus + role_bonus
-        })
+        # Determinism Fix: Якщо кандидат має верифікований LinkedIn (напр. Benjamin Otto),
+        # він отримує +60 балів і ЗАВЖДИ стає Primary DM.
+        li_bonus = 60 if matched_li else 0
+        total_score = base_priority + type_bonus + role_bonus + li_bonus
+
+        existing = found_dms_by_name.get(name_key)
+        if existing is None or total_score > existing['score']:
+            found_dms_by_name[name_key] = {
+                'name': norm_name,
+                'role': role or (existing['role'] if existing else 'Executive'),
+                'li_url': matched_li or (existing['li_url'] if existing else None),
+                'source_url': clean_src,
+                'source_type': src_type,
+                'is_legal': is_leg,
+                'score': total_score
+            }
+        elif matched_li and not existing.get('li_url'):
+            existing['li_url'] = matched_li
+            existing['score'] += 60
 
     for page_url, html, _ in pages_with_urls:
         url_path = urlparse(page_url).path
@@ -847,15 +872,6 @@ def extract_decision_maker_deep(
             continue
 
         soup = BeautifulSoup(html, 'lxml')
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href'].strip()
-            if 'linkedin.com/in/' in href.lower():
-                parsed = urlparse(href)
-                if parsed.scheme in ('http', 'https'):
-                    clean_li = f"https://www.linkedin.com{parsed.path.rstrip('/')}"
-                    if clean_li not in candidate_li_urls:
-                        candidate_li_urls.append(clean_li)
-
         for script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
             raw_json = script.string
             if not raw_json:
@@ -909,8 +925,6 @@ def extract_decision_maker_deep(
             ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
             if 'aufsichtsrat' in ctx_slice:
                 continue
-            if 'gesellschafterrat' in ctx_slice or 'stiftungskurator' in ctx_slice:
-                cand_role = 'Co-Founder / Managing Partner'
             if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
@@ -922,8 +936,6 @@ def extract_decision_maker_deep(
             ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
             if 'aufsichtsrat' in ctx_slice:
                 continue
-            if 'gesellschafterrat' in ctx_slice or 'stiftungskurator' in ctx_slice:
-                cand_role = 'Co-Founder / Managing Partner'
             if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
 
@@ -937,10 +949,10 @@ def extract_decision_maker_deep(
             if is_valid_person_name(cand_name, brand_root):
                 add_dm_candidate(cand_name, 'Registered Business Owner / ФОП', page_url, is_leg, 10)
 
-    if not found_dms:
+    if not found_dms_by_name:
         return None, None, None, None, False, None, None
 
-    found_dms.sort(key=lambda d: (-d['score'], d['name']))
+    found_dms = sorted(found_dms_by_name.values(), key=lambda d: (-d['score'], d['name']))
     primary = found_dms[0]
     dms_summary_str = '; '.join(
         f"{d['name']} ({d['role']}) [{d['source_url']}]" for d in found_dms[:5]
