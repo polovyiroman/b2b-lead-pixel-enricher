@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 19
+CACHE_SCHEMA_VERSION = 20
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -105,14 +105,17 @@ LOWER_CHAR_CLASS_NO_HYPHEN = (
     r'a-zа-яіїєґà-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧũūŭůűųŵŷźżž\’\''
 )
 
+SINGLE_WORD_PART = rf'[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}}'
 HYPHENATED_WORD_PART = (
-    rf'[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}}'
-    rf'(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}})?'
+    rf'{SINGLE_WORD_PART}(?:-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}})?'
 )
 
+# Bug 41 Fix: Якщо прізвище вже подвійне через дефіс (Scharner-Wolff), НЕ приєднуємо третє слово ("Katy" зі списку правління)!
+# Три слова дозволено лише тоді, коли жодне з перших двох слів не містить дефіса (напр. українське Ім'я По-батькові Прізвище).
 NAME_REGEX_PART = (
-    rf'({HYPHENATED_WORD_PART}'
-    rf'(?:\s+{HYPHENATED_WORD_PART}){{1,2}})'
+    rf'({SINGLE_WORD_PART}[ \t]+{SINGLE_WORD_PART}-[{UPPER_CHAR_CLASS}][{LOWER_CHAR_CLASS_NO_HYPHEN}]{{2,20}}'
+    rf'|{HYPHENATED_WORD_PART}[ \t]+{SINGLE_WORD_PART}'
+    rf'|{SINGLE_WORD_PART}[ \t]+{SINGLE_WORD_PART}[ \t]+{HYPHENATED_WORD_PART})'
 )
 
 NAME_BEFORE_ROLE_PATTERN = re.compile(
@@ -125,11 +128,10 @@ ROLE_BEFORE_NAME_PATTERN = re.compile(
 )
 FOP_OWNER_PATTERN = re.compile(
     rf'(?:ФОП|Фізична особа[\s-]підприємець|Einzelunternehmen|Inh\.|Inhaber:?)\s+'
-    rf'({HYPHENATED_WORD_PART}\s+{HYPHENATED_WORD_PART})',
+    rf'({HYPHENATED_WORD_PART}[ \t]+{HYPHENATED_WORD_PART})',
     re.UNICODE
 )
 
-# Проблема 3 Fix: Розширений патерн для Impressum та AGB (включно з "Vorstand: Gundula Koele-Pabst" та "Geschäftsführer: ...")
 VERTRETEN_DURCH_PATTERN = re.compile(
     rf'(?:Vertreten\s+durch(?:\s+den\s+Vorstand|\s+die\s+Geschäftsführung|\s+den\s+Aufsichtsrat)?|'
     rf'Vorstandsvorsitzende[r]?|Bereichsvorstand|'
@@ -152,18 +154,30 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
+# Bug 41 Fix: Розширено список міст та локацій (включно з US/EU хабами та 'katy', 'austin', 'dallas', 'houston')
 CITY_NAMES_BLACKLIST = {
     'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
     'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
     'nürnberg', 'nuremberg', 'essen', 'dortmund', 'bonn', 'mannheim', 'karlsruhe',
+    'aachen', 'heerlen', 'venlo', 'gütersloh', 'guetersloh', 'walldorf', 'herzogenaurach',
     'wien', 'vienna', 'zürich', 'zurich', 'geneva', 'genf', 'basel', 'bern',
-    'london', 'paris', 'lyon', 'madrid', 'barcelona', 'rome', 'roma', 'milan', 'milano',
-    'amsterdam', 'rotterdam', 'utrecht', 'eindhoven', 'brussels', 'antwerp', 'stockholm',
-    'gothenburg', 'oslo', 'copenhagen', 'helsinki', 'lisbon', 'porto', 'warsaw', 'warszawa',
-    'krakow', 'kraków', 'wroclaw', 'wrocław', 'poznan', 'poznań', 'gdansk', 'gdańsk',
-    'prague', 'praha', 'budapest', 'bucharest', 'dublin', 'athens',
-    'kyiv', 'kiev', 'lviv', 'kharkiv', 'odesa', 'odessa', 'dnipro', 'vinnytsia',
-    'київ', 'львів', 'харків', 'одеса', 'дніпро', 'вінниця'
+    'london', 'manchester', 'birmingham', 'edinburgh', 'glasgow', 'bristol', 'leeds',
+    'paris', 'lyon', 'marseille', 'lille', 'roubaix', 'bordeaux', 'nantes', 'toulouse',
+    'madrid', 'barcelona', 'valencia', 'sevilla', 'bilbao', 'rome', 'roma', 'milan', 'milano',
+    'turin', 'torino', 'bologna', 'florence', 'firenze', 'naples', 'napoli',
+    'amsterdam', 'rotterdam', 'utrecht', 'eindhoven', 'the hague', 'den haag', 'tilburg',
+    'brussels', 'bruxelles', 'antwerp', 'antwerpen', 'ghent', 'gent',
+    'stockholm', 'gothenburg', 'göteborg', 'malmö', 'malmo', 'oslo', 'bergen',
+    'copenhagen', 'københavn', 'aarhus', 'helsinki', 'espoo', 'tampere',
+    'lisbon', 'lisboa', 'porto', 'warsaw', 'warszawa', 'krakow', 'kraków', 'wroclaw',
+    'wrocław', 'poznan', 'poznań', 'gdansk', 'gdańsk', 'lodz', 'łódź', 'katowice',
+    'prague', 'praha', 'brno', 'budapest', 'bucharest', 'bucuresti', 'cluj', 'dublin', 'athens',
+    'kyiv', 'kiev', 'lviv', 'kharkiv', 'odesa', 'odessa', 'dnipro', 'vinnytsia', 'zaporizhzhia',
+    'київ', 'львів', 'харків', 'одеса', 'дніпро', 'вінниця', 'запоріжжя',
+    'new york', 'los angeles', 'chicago', 'houston', 'phoenix', 'philadelphia',
+    'san antonio', 'san diego', 'dallas', 'austin', 'san jose', 'san francisco',
+    'seattle', 'denver', 'boston', 'atlanta', 'miami', 'katy', 'irving', 'plano',
+    'wilmington', 'dover', 'delaware', 'california', 'texas', 'florida', 'limassol', 'nicosia'
 }
 
 UI_ACTION_WORDS_BLACKLIST = {
@@ -398,7 +412,8 @@ STOP_NAME_WORDS = {
     'Nürnberg', 'Nuremberg', 'Wien', 'Vienna', 'Zürich', 'Zurich', 'London', 'Paris',
     'Madrid', 'Barcelona', 'Rome', 'Roma', 'Milan', 'Milano', 'Amsterdam', 'Rotterdam',
     'Brussels', 'Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Lisbon', 'Warsaw',
-    'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa'
+    'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa',
+    'Katy', 'Austin', 'Dallas', 'Houston'
 }
 
 UA_TO_LATIN = {
