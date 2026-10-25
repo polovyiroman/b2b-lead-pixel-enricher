@@ -1,16 +1,20 @@
+import json
 import re
 from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MARKETPLACE_TEXT_MARKERS,
+    ROLE_NORMALIZATION_MAP,
     compute_snapshot_age_days,
     truncate_error_msg,
 )
 from .contacts import (
+    build_decision_makers_json_from_summary,
     classify_dm_source_type,
     classify_email_type,
     verify_person_email_match,
     verify_person_linkedin_match,
 )
+from .tech_detector import build_evidence_json_from_cached_record
 
 
 def is_marketplace_platform(canonical_domain: str, page_title: str, meta_desc: str) -> bool:
@@ -181,39 +185,148 @@ def compute_data_quality_score(
     dm_linkedin_url: str | None,
     primary_phone: str | None,
     scan_completeness: str = 'full',
-    is_cached_or_seed: bool = False
+    is_cached_or_seed: bool = False,
+    company_category: str = '',
+    is_manual_seed: bool = False,
+    is_same_person_email: bool = False,
 ) -> int:
+    """
+    P0 #6 Fix: Калібрована формула data_quality_score (0-100):
+    - Agency ('B2B Agency / Marketing Media') = жорстка стеля max 40 (партнерський пайплайн, не клієнт).
+    - Non-Profit = max 15.
+    - manual_seed (напр. rozetka) = жорстка стеля max 65 (щоб не маскувався під живий 90-бальний лід).
+    - Відсутній/неповний тех-стек (scan_completeness != 'full' або techs_count == 0) = -15 балів.
+    - Верифікований персональний email ЛПР (is_same_person_email=True) = +20 балів.
+    """
+    if company_category == 'Non-Profit / Education / Institution':
+        return 10
+
     score = 0
     t_str = contact_quality_tier or ''
-    if 'Tier A' in t_str or 'Agency Tier A' in t_str:
+    if is_same_person_email:
+        score += 45 + 20
+    elif 'Tier A-' in t_str or 'Agency Tier A' in t_str:
+        score += 40
+    elif 'Tier A' in t_str:
         score += 45
     elif 'Tier B+' in t_str or 'Agency Tier B+' in t_str:
-        score += 38
+        score += 34
     elif 'Tier B' in t_str:
-        score += 32
+        score += 28
     elif 'Tier C' in t_str or 'Agency Tier C' in t_str:
-        score += 20
+        score += 18
     elif 'Tier D' in t_str:
-        score += 8
+        score += 6
 
     if dm_name:
         score += 15
     if dm_linkedin_url:
         score += 10
     if primary_phone:
-        score += 10
+        score += 8
 
     if techs_count >= 4:
-        score += 20
+        score += 22
     elif techs_count >= 2:
         score += 15
     elif techs_count == 1:
-        score += 8
+        score += 6
 
-    if scan_completeness != 'full' and techs_count == 0 and not is_cached_or_seed:
-        score = max(0, score - 10)
+    if scan_completeness != 'full' or techs_count == 0:
+        score -= 15
 
-    return min(100, score)
+    score = max(0, min(100, score))
+
+    if company_category == 'B2B Agency / Marketing Media':
+        return min(40, score)
+    if is_manual_seed:
+        return min(65, score)
+
+    return score
+
+
+def build_sales_hook(
+    canonical_domain: str,
+    company_category: str,
+    tech_info: dict,
+    dm_name: str | None,
+    dm_role: str | None,
+    dm_linkedin_url: str | None,
+    best_email: str | None,
+) -> str:
+    """
+    P1 #10: Генерує конкретний 15-секундний opener (sales_hook) для SDR на основі Tech Gap Analysis
+    замість загального шаблону.
+    """
+    brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
+    if company_category == 'Non-Profit / Education / Institution':
+        return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
+    if company_category == 'B2B Agency / Marketing Media':
+        dm_part = f' (Exec: {dm_name}, {dm_role})' if dm_name else ''
+        return (
+            f'{brand} — B2B Agency{dm_part}. Partner Hook: '
+            f'"Are you open to white-label analytics/sGTM implementation or lead-data partnership for your e-com clients?"'
+        )
+
+    techs = tech_info.get('detected_technologies_list') or []
+    cms = tech_info.get('detected_cms')
+    has_gtm = bool(tech_info.get('has_gtm'))
+    has_sgtm = bool(tech_info.get('has_sgtm'))
+    has_ga4 = bool(tech_info.get('has_ga4'))
+    has_meta = bool(tech_info.get('has_meta_pixel'))
+    has_gads = bool(tech_info.get('has_google_ads'))
+    has_tiktok = bool(tech_info.get('has_tiktok_pixel'))
+    has_li = bool(tech_info.get('has_linkedin_pixel'))
+    has_consent = bool(tech_info.get('has_cookie_banner'))
+
+    dm_intro = f'{dm_name} ({dm_role})' if dm_name else 'Marketing Lead'
+    li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
+    stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
+    cms_str = f' on {cms}' if cms else ''
+
+    # Gap 1: Є клієнтський GTM + платні пікселі (Meta/Google Ads/TikTok), але НЕМАЄ Server-Side GTM (sGTM)
+    if (has_meta or has_gads or has_tiktok) and not has_sgtm:
+        paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
+        paid_str = ' + '.join(paid_channels)
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str}. Gap: Active {paid_str} client-side tracking without Server-Side GTM (sGTM). "
+            f"Opening Hook: \"Noticed {brand} runs {paid_str} via client-side tags without sGTM — "
+            f"how are you recovering the 15-25% conversion signal loss from iOS 14.5+ and ad-blockers?\""
+        )
+
+    # Gap 2: Є Meta/TikTok, але немає Google Ads Conversion
+    if (has_meta or has_tiktok) and not has_gads:
+        social_ch = 'Meta & TikTok' if (has_meta and has_tiktok) else ('Meta Pixel' if has_meta else 'TikTok Pixel')
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str}. Gap: Paid social ({social_ch}) active, but zero Google Ads Conversion tags detected. "
+            f"Opening Hook: \"Saw {brand} scaling paid social ({social_ch}) — are you intentionally holding off on "
+            f"Google Shopping/PMax capture, or routing search attribution server-side?\""
+        )
+
+    # Gap 3: Є GTM або GA4, але 0 платних пікселів (або закриті Cookie Consent)
+    if has_gtm or has_ga4:
+        if has_consent:
+            return (
+                f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+                f"Stack: {stack_str} (strict CMP consent banner active). "
+                f"Opening Hook: \"With {brand}'s strict EU cookie banner gating ad pixels prior to consent, "
+                f"have you benchmarked how much paid attribution is dropping before Consent Mode v2 modeling kicks in?\""
+            )
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str} (analytics active, zero paid ad pixels in HTML). "
+            f"Opening Hook: \"Noticed {brand} has GA4/GTM configured without Meta or Google Ads remarketing pixels — "
+            f"is paid acquisition handled via a separate performance agency or server-side container?\""
+        )
+
+    return (
+        f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+        f"Stack: {stack_str}. "
+        f"Opening Hook: \"Reaching out regarding {brand}'s digital analytics & attribution setup — "
+        f"who currently oversees marketing measurement and CRO benchmarks on your team?\""
+    )
 
 
 def evaluate_qualification_v180(
@@ -248,6 +361,8 @@ def evaluate_qualification_v180(
         analytics_tags.append('GA4')
     if tech_info.get('has_gtm'):
         analytics_tags.append('GTM')
+    if tech_info.get('has_sgtm'):
+        analytics_tags.append('sGTM')
 
     detected_list = tech_info.get('detected_technologies_list', [])
     for ux_tool in ('Microsoft Clarity', 'Hotjar', 'HubSpot', 'Klaviyo'):
@@ -346,7 +461,6 @@ def evaluate_qualification_v180(
         contact_quality = f'Tier A- (Decision-Maker Found: {dm_name} + Direct Marketing Role Inbox: {best_email})'
         enrichment_status = 'decision_maker_found_plus_marketing_role_inbox'
         confidence_warning = f'Note: Executive identified on site and paired with dedicated marketing@ department inbox.{source_extra_note}'
-    # Bug 11 & 12 Fix: Верифікований DM + комерційний B2B/Sales інбокс (sales@ringostat, corporate@macpaw, partner@rozetka, partnerwerden@docmorris) + підтверджений стек -> Tier A- (Hot)
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and len(all_signals) >= 1:
         contact_quality = (
             f'Tier A- (Decision-Maker Found: {dm_name} + Commercial B2B/Sales Channel: {best_email})'
@@ -597,7 +711,8 @@ def build_manual_seed_record(
     best_email_type = seed.get('best_email_type') or classify_email_type(best_email, brand_token)
     primary_phone = seed.get('primary_phone')
     dm_name = seed.get('decision_maker_name')
-    dm_role = seed.get('decision_maker_role')
+    raw_role = seed.get('decision_maker_role')
+    dm_role = ROLE_NORMALIZATION_MAP.get((raw_role or '').lower(), raw_role)
     dm_src = seed.get('decision_maker_source_url')
     dm_src_type = seed.get('decision_maker_source_type') or classify_dm_source_type(dm_src)
     li_url = seed.get('linkedin_url')
@@ -615,6 +730,7 @@ def build_manual_seed_record(
         'has_klaviyo': ('Klaviyo' in seed_tech_set) or bool(seed.get('has_klaviyo', False)),
         'has_ga4': ('Google Analytics (GA4)' in seed_tech_set) or bool(seed.get('has_ga4', True)),
         'has_gtm': ('Google Tag Manager' in seed_tech_set) or bool(seed.get('has_gtm', True)),
+        'has_sgtm': ('Server-Side GTM (sGTM)' in seed_tech_set) or bool(seed.get('has_sgtm', False)),
         'all_ga4_ids': seed.get('all_ga4_ids'),
         'ga4_detection_confidence': seed.get('ga4_detection_confidence', 'Verified (Manual Audit Seed)'),
         'detected_cms_list': [x.strip() for x in (seed.get('detected_cms') or '').split(';') if x.strip()],
@@ -623,6 +739,7 @@ def build_manual_seed_record(
         'detected_technologies_list': seed_tech_list,
         'technology_evidence': seed.get('technology_evidence', 'Verified via manual_seed'),
         'technology_evidence_summary': seed.get('technology_evidence_summary', 'GTM, GA4, Meta Pixel (Manual Seed)'),
+        'technology_evidence_json': build_evidence_json_from_cached_record(seed, source_label='manual_seed'),
         'tech_scan_completeness': 'full'
     }
 
@@ -652,6 +769,16 @@ def build_manual_seed_record(
         'not_attempted_manual_seed'
     )
 
+    sales_hook = build_sales_hook(
+        canonical_domain,
+        cat,
+        tech_info,
+        dm_name,
+        dm_role,
+        seed.get('decision_maker_linkedin_url'),
+        best_email
+    )
+
     deliv_str = seed.get(
         'email_deliverability_check',
         'domain_accepts_email (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
@@ -667,6 +794,12 @@ def build_manual_seed_record(
         if seed_emails_list else None
     )
 
+    dms_found_str = seed.get('decision_makers_found') or (
+        f'{dm_name} ({dm_role}) [{dm_src}]' if dm_name else None
+    )
+    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, seed.get('decision_maker_linkedin_url'))
+
+    # P0 #6 Fix: manual_seed має чесну стелю <= 65 балів
     dq_score = compute_data_quality_score(
         contact_quality_tier,
         len(seed_tech_list),
@@ -674,7 +807,10 @@ def build_manual_seed_record(
         seed.get('decision_maker_linkedin_url'),
         primary_phone,
         'full',
-        True
+        True,
+        company_category=cat,
+        is_manual_seed=True,
+        is_same_person_email=verify_person_email_match(dm_name, best_email),
     )
 
     return {
@@ -731,9 +867,8 @@ def build_manual_seed_record(
         'decision_maker_role': dm_role,
         'decision_maker_source_url': dm_src,
         'decision_maker_source_type': dm_src_type,
-        'decision_makers_found': seed.get('decision_makers_found') or (
-            f'{dm_name} ({dm_role}) [{dm_src}]' if dm_name else None
-        ),
+        'decision_makers_found': dms_found_str,
+        'decision_makers_json': dms_json_str,
         'decision_maker_linkedin_url': seed.get('decision_maker_linkedin_url'),
         'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat),
         'linkedin_url': li_url,
@@ -748,10 +883,12 @@ def build_manual_seed_record(
         'consent_mode_likely': bool(seed.get('consent_mode_likely', False)),
         'ga4_detection_confidence': tech_info['ga4_detection_confidence'],
         'has_google_ads_confidence': 'verified_present' if tech_info['has_google_ads'] else 'verified_absent',
+        'sales_hook': sales_hook,
         'sales_opportunity': sales_opportunity,
         'next_best_action': next_best_action,
         'technology_evidence_summary': tech_info['technology_evidence_summary'],
         'technology_evidence': tech_info['technology_evidence'],
+        'technology_evidence_json': tech_info['technology_evidence_json'],
         'has_meta_pixel': tech_info['has_meta_pixel'],
         'has_tiktok_pixel': tech_info['has_tiktok_pixel'],
         'has_google_ads': tech_info['has_google_ads'],
@@ -761,6 +898,7 @@ def build_manual_seed_record(
         'has_klaviyo': tech_info['has_klaviyo'],
         'has_ga4': tech_info['has_ga4'],
         'has_gtm': tech_info['has_gtm'],
+        'has_sgtm': tech_info['has_sgtm'],
         'all_ga4_ids': tech_info['all_ga4_ids'],
         'detected_technologies': seed.get('detected_technologies'),
         'all_emails': seed.get('all_emails', best_email),
