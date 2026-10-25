@@ -11,6 +11,7 @@ from .config import (
     B2B_PARTNERSHIP_PREFIXES,
     B2B_PHONE_KEYWORDS,
     CITY_NAMES_BLACKLIST,
+    CORPORATE_ENTITY_TOKENS,
     DEPARTMENT_OR_ADMISSIONS_PREFIXES,
     DEPARTMENT_PREFIX_BLACKLIST,
     DM_LEGAL_SOURCE_FLAG,
@@ -63,6 +64,16 @@ SENDER_SUBDOMAIN_PREFIXES = (
     'mail.', 'e.', 'email.', 'news.', 'newsletter.', 'newsletters.',
     'bounce.', 'bounces.', 'crm.', 'mktg.', 'em.', 'mailing.'
 )
+
+EU_DIACRITIC_MAP = {
+    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss',
+    'á': 'a', 'à': 'a', 'â': 'a', 'ã': 'a', 'å': 'a', 'ą': 'a',
+    'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e', 'ę': 'e',
+    'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
+    'ó': 'o', 'ò': 'o', 'ô': 'o', 'õ': 'o', 'ø': 'o', 'ł': 'l',
+    'ú': 'u', 'ù': 'u', 'û': 'u', 'ń': 'n', 'ñ': 'n',
+    'ć': 'c', 'č': 'c', 'ç': 'c', 'ś': 's', 'š': 's', 'ź': 'z', 'ż': 'z', 'ž': 'z',
+}
 
 
 def decode_cf_email(encoded_str: str) -> str:
@@ -150,30 +161,63 @@ def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
 
 
 def transliterate_ua_to_latin(text: str) -> str:
-    return ''.join(UA_TO_LATIN.get(ch, ch) for ch in text.lower())
+    out = []
+    for ch in text.lower():
+        if ch in UA_TO_LATIN:
+            out.append(UA_TO_LATIN[ch])
+        elif ch in EU_DIACRITIC_MAP:
+            out.append(EU_DIACRITIC_MAP[ch])
+        else:
+            out.append(ch)
+    return ''.join(out)
 
 
 def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
+    """
+    P1 #9: Personal email match v2.
+    Підтримує: first.last, flast, firstlast, last.first, lfirst, а також точний збіг імені (first@domain)
+    або прізвища (last@domain), якщо токен не входить у NON_PERSON_TOKENS.
+    """
     if not full_name or not email or '@' not in email:
         return False
-    local = email.split('@', 1)[0].lower()
+    local = email.split('@', 1)[0].lower().strip()
+    if local in NON_PERSON_TOKENS:
+        return False
+
     name_parts = [p.strip() for p in full_name.split() if len(p.strip()) >= 2]
     if len(name_parts) < 2:
         return False
 
-    first_lat = transliterate_ua_to_latin(name_parts[0])
-    last_lat = transliterate_ua_to_latin(name_parts[-1])
-    if len(last_lat) < 3 or not first_lat:
+    first_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[0]))
+    last_raw = name_parts[-1].split('-')[0]
+    last_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(last_raw))
+    if len(last_lat) < 3 or len(first_lat) < 2:
         return False
 
+    norm_local = re.sub(r'[^a-z]', '', local)
     first_init = first_lat[0]
+    last_init = last_lat[0]
     last_prefix = last_lat[:5] if len(last_lat) >= 5 else last_lat
 
+    # 1. Exact first+last або last+first
+    if norm_local in (f'{first_lat}{last_lat}', f'{last_lat}{first_lat}'):
+        return True
+
+    # 2. Substring both first & last prefix
     if len(first_lat) >= 3 and first_lat in local and last_prefix in local:
         return True
 
-    pattern = rf'^(?:{re.escape(first_init)}[._-]?{re.escape(last_prefix)}|{re.escape(last_prefix)}[._-]?{re.escape(first_init)})'
+    # 3. Initial + last_prefix або last_prefix + initial (flast, f.last, last.f)
+    pattern = (
+        rf'^(?:{re.escape(first_init)}[._-]?{re.escape(last_prefix)}'
+        rf'|{re.escape(last_prefix)}[._-]?{re.escape(first_init)}'
+        rf'|{re.escape(first_lat)}[._-]?{re.escape(last_init)})$'
+    )
     if re.search(pattern, local):
+        return True
+
+    # 4. Exact first_name@domain або last_name@domain (для founder/exec пошт типу benjamin@ або kosovan@)
+    if (local == first_lat and len(first_lat) >= 4) or (local == last_lat and len(last_lat) >= 4):
         return True
 
     return False
@@ -183,15 +227,16 @@ def verify_person_linkedin_match(full_name: str | None, linkedin_url: str | None
     if not full_name or not linkedin_url or '/in/' not in linkedin_url.lower():
         return False
     slug = linkedin_url.lower().split('/in/', 1)[1].split('/')[0].split('?')[0]
+    slug_clean = re.sub(r'[^a-z]', '', slug)
     name_parts = [p.strip() for p in full_name.split() if len(p.strip()) >= 2]
     if len(name_parts) < 2:
         return False
 
-    first_lat = transliterate_ua_to_latin(name_parts[0])
-    last_lat = transliterate_ua_to_latin(name_parts[-1])
+    first_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[0]))
+    last_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[-1].split('-')[0]))
 
-    has_last = len(last_lat) >= 4 and last_lat[:4] in slug
-    has_first = len(first_lat) >= 3 and first_lat[:3] in slug
+    has_last = len(last_lat) >= 4 and last_lat[:4] in slug_clean
+    has_first = len(first_lat) >= 3 and first_lat[:3] in slug_clean
     return has_last and has_first
 
 
@@ -706,6 +751,8 @@ def strip_role_tokens_from_name(candidate: str) -> str:
         words[0].lower() in ROLE_TOKEN_BLACKLIST
         or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or words[0].lower() in CITY_NAMES_BLACKLIST
+        or words[0].lower() in CORPORATE_ENTITY_TOKENS
+        or words[0].isupper()
         or re.fullmatch(ROLES_REGEX_PART, words[0], re.IGNORECASE)
     ):
         words.pop(0)
@@ -713,6 +760,8 @@ def strip_role_tokens_from_name(candidate: str) -> str:
         words[-1].lower() in ROLE_TOKEN_BLACKLIST
         or words[-1].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or words[-1].lower() in CITY_NAMES_BLACKLIST
+        or words[-1].lower() in CORPORATE_ENTITY_TOKENS
+        or words[-1].isupper()
         or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
     ):
         words.pop(-1)
@@ -720,36 +769,43 @@ def strip_role_tokens_from_name(candidate: str) -> str:
     if has_cyrillic:
         while words and re.fullmatch(r'[A-Za-z\'-]+', words[0]):
             words.pop(0)
-    # Bug 41 Fix: Якщо друге слово вже є подвійним дефісним прізвищем (Scharner-Wolff),
-    # відтинаємо будь-яке третє слово ("Katy" зі списку членів правління)
     if len(words) == 3 and ('-' in words[1] or '-' in words[0]):
         words = words[:2]
     return ' '.join(words)
 
 
 def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
+    """
+    P0 #2 Fix: Відсікає корпоративні сутності (BPO Capital, GFH Gesellschaft, YOU Verwaltungs)
+    та будь-які токени з капс-абревіатурами або суфіксами юросіб.
+    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     if len(words) not in (2, 3):
         return False
     if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
         return False
-    words_low = [w.lower() for w in words]
-    if words_low[0] in DEPARTMENT_PREFIX_BLACKLIST or words_low[0] in CITY_NAMES_BLACKLIST:
+    # Якщо будь-яке слово повністю у верхньому регістрі (BPO, GFH, YOU, AG, SE) — це юрособа/абревіатура, не людина
+    if any(w.isupper() for w in words):
         return False
+    words_low = [w.lower() for w in words]
     if any(
         wl in _STOP_NAME_WORDS_LOWER
         or wl in ROLE_TOKEN_BLACKLIST
         or wl in DEPARTMENT_PREFIX_BLACKLIST
         or wl in CITY_NAMES_BLACKLIST
+        or wl in CORPORATE_ENTITY_TOKENS
         for wl in words_low
     ):
+        return False
+    # Перевірка на типові німецькі корпоративні закінчення (-gesellschaft, -verwaltung, -beteiligung, -stiftung)
+    if any(wl.endswith(('gesellschaft', 'verwaltung', 'verwaltungs', 'beteiligung', 'stiftung', 'holding', 'konzern')) for wl in words_low):
         return False
     if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
         return False
     if brand_root:
         b_low = brand_root.lower()
         joined_low = ''.join(words_low)
-        if joined_low == b_low or (b_low in words_low and any(w in ('group', 'gruppe', 'holding', 'gmbh', 'ag') for w in words_low)):
+        if joined_low == b_low or b_low in words_low:
             return False
     return True
 
@@ -788,9 +844,55 @@ def is_low_trust_legal_offer_page(path: str) -> bool:
     return bool(DM_LEGAL_SOURCE_FLAG.search(path))
 
 
+def build_decision_makers_json_from_summary(
+    dms_summary_str: str | None,
+    primary_li_url: str | None = None
+) -> str | None:
+    """
+    Конвертує semicolon-рядок decision_makers_found (або кешований запис) у валідний JSON-масив,
+    відфільтровуючи будь-які застарілі корпоративні сутності (BPO Capital, GFH Gesellschaft, YOU Verwaltungs).
+    """
+    if not dms_summary_str:
+        return None
+    items = []
+    seen = set()
+    for part in dms_summary_str.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', part)
+        if not m:
+            continue
+        raw_name, raw_role, src_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        clean_name = strip_role_tokens_from_name(raw_name)
+        if not is_valid_person_name(clean_name):
+            continue
+        if clean_name.lower() in seen:
+            continue
+        seen.add(clean_name.lower())
+        norm_role = normalize_executive_role(raw_role) or raw_role
+        src_type = classify_dm_source_type(src_url)
+        matched_li = primary_li_url if (primary_li_url and verify_person_linkedin_match(clean_name, primary_li_url)) else None
+        conf = 'high' if (matched_li or src_type in ('impressum_page', 'team_page', 'about_page')) else 'medium'
+        items.append({
+            'name': clean_name,
+            'role': norm_role,
+            'linkedin_url': matched_li,
+            'source_url': src_url,
+            'source_type': src_type,
+            'confidence': conf,
+            'is_verified_person': True
+        })
+    return json.dumps(items, ensure_ascii=False) if items else None
+
+
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
-) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None, str | None]:
+    """
+    Повертає 8 значень:
+    (dm_name, dm_role, dm_linkedin_url, dm_source_url, dm_source_is_legal, dm_source_type, dms_summary_str, dms_json_str)
+    """
     candidate_li_urls: list[str] = []
     found_dms_by_name: dict[str, dict] = {}
 
@@ -799,8 +901,6 @@ def extract_decision_maker_deep(
         first_host = urlparse(pages_with_urls[0][0]).netloc.lower().replace('www.', '')
         brand_root = first_host.split('.')[0] if first_host else ''
 
-    # Крок 1 (Determinism Fix): Спочатку збираємо ВСІ посилання на особисті профілі LinkedIn з усіх сторінок,
-    # щоб кожен кандидат гарантовано отримав свій matched_li незалежно від порядку обходу сторінок.
     for page_url, html, _ in pages_with_urls:
         url_path = urlparse(page_url).path
         if DM_SOURCE_BLACKLIST.search(url_path):
@@ -816,55 +916,59 @@ def extract_decision_maker_deep(
                         candidate_li_urls.append(clean_li)
 
     def add_dm_candidate(name: str, role: str | None, page_url: str, is_leg: bool, base_priority: int):
-        norm_name = name.strip()
+        norm_name = strip_role_tokens_from_name(name)
+        if not is_valid_person_name(norm_name, brand_root):
+            return
         name_key = norm_name.lower()
-        if not norm_name or name_key in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
+        if name_key in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
             return
         clean_src = clean_url_port(page_url) or page_url
         src_type = classify_dm_source_type(clean_src)
         matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(norm_name, u)), None)
+        norm_role = normalize_executive_role(role) or 'Executive'
 
         type_bonus = {
+            'impressum_page': 32,
             'team_page': 30,
             'about_page': 25,
-            'impressum_page': 25,
             'homepage': 15,
             'product_or_service_page': 10,
             'blog_or_press_page': 5,
-            'legal_or_offer_page': 0
+            'legal_or_offer_page': 8
         }.get(src_type or '', 5)
 
-        role_low = (role or '').lower()
+        role_low = norm_role.lower()
         if 'supervisory' in role_low or 'aufsichtsrat' in role_low:
             role_bonus = -30
         elif src_type == 'product_or_service_page' and 'ceo' in role_low and 'founder' not in role_low:
             role_bonus = -10
         elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
-            role_bonus = 20
+            role_bonus = 22
         elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner', 'managing director')):
-            role_bonus = 15
+            role_bonus = 18
         else:
             role_bonus = 5
 
-        # Determinism Fix: Якщо кандидат має верифікований LinkedIn (напр. Benjamin Otto),
-        # він отримує +60 балів і ЗАВЖДИ стає Primary DM.
         li_bonus = 60 if matched_li else 0
         total_score = base_priority + type_bonus + role_bonus + li_bonus
+        conf = 'high' if (matched_li or src_type in ('impressum_page', 'team_page', 'about_page')) else 'medium'
 
         existing = found_dms_by_name.get(name_key)
         if existing is None or total_score > existing['score']:
             found_dms_by_name[name_key] = {
                 'name': norm_name,
-                'role': role or (existing['role'] if existing else 'Executive'),
+                'role': norm_role,
                 'li_url': matched_li or (existing['li_url'] if existing else None),
                 'source_url': clean_src,
                 'source_type': src_type,
+                'confidence': conf,
                 'is_legal': is_leg,
                 'score': total_score
             }
         elif matched_li and not existing.get('li_url'):
             existing['li_url'] = matched_li
             existing['score'] += 60
+            existing['confidence'] = 'high'
 
     for page_url, html, _ in pages_with_urls:
         url_path = urlparse(page_url).path
@@ -950,13 +1054,27 @@ def extract_decision_maker_deep(
                 add_dm_candidate(cand_name, 'Registered Business Owner / ФОП', page_url, is_leg, 10)
 
     if not found_dms_by_name:
-        return None, None, None, None, False, None, None
+        return None, None, None, None, False, None, None, None
 
     found_dms = sorted(found_dms_by_name.values(), key=lambda d: (-d['score'], d['name']))
     primary = found_dms[0]
+    top_dms = found_dms[:5]
     dms_summary_str = '; '.join(
-        f"{d['name']} ({d['role']}) [{d['source_url']}]" for d in found_dms[:5]
+        f"{d['name']} ({d['role']}) [{d['source_url']}]" for d in top_dms
     )
+    dms_json_list = [
+        {
+            'name': d['name'],
+            'role': d['role'],
+            'linkedin_url': d['li_url'],
+            'source_url': d['source_url'],
+            'source_type': d['source_type'],
+            'confidence': d['confidence'],
+            'is_verified_person': True
+        }
+        for d in top_dms
+    ]
+    dms_json_str = json.dumps(dms_json_list, ensure_ascii=False)
     return (
         primary['name'],
         primary['role'],
@@ -964,5 +1082,6 @@ def extract_decision_maker_deep(
         primary['source_url'],
         primary['is_legal'],
         primary['source_type'],
-        dms_summary_str
+        dms_summary_str,
+        dms_json_str
     )
