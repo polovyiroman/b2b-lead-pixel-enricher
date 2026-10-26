@@ -32,7 +32,7 @@ GTAG_CONFIG_GA4_REGEX = re.compile(
 )
 GA4_SCRIPT_SRC_REGEX = re.compile(
     r"googletagmanager\.com/gtag/js\?[^'\"\s>]*?\bid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
-    re.IGNORECASE
+        re.IGNORECASE
 )
 GA4_WIRE_REGEX = re.compile(
     r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
@@ -159,8 +159,8 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
-# P0 #2 Fix: Інвертований список корпоративних суфіксів та слів-ознак юросіб
-# Блокує "BPO Capital", "GFH Gesellschaft", "YOU Verwaltungs", "XYZ Beteiligungs", "ABC Ventures" тощо
+# Завдання 1 P0 Fix: Видалено 'you', 'otto', 'zalando', 'aboutyou', 'docmorris', 'coolblue',
+# щоб "Benjamin Otto" не відсікався як корпоративна сутність.
 CORPORATE_ENTITY_TOKENS = {
     'capital', 'holding', 'holdings', 'group', 'gruppe', 'gesellschaft', 'konzern',
     'verwaltungs', 'verwaltung', 'beteiligungs', 'beteiligungsgesellschaft', 'stiftung',
@@ -174,7 +174,7 @@ CORPORATE_ENTITY_TOKENS = {
     'global', 'europe', 'deutschland', 'germany', 'austria', 'switzerland', 'schweiz',
     'commerce', 'retail', 'trading', 'trade', 'handels', 'handel', 'vertriebs',
     'apotheke', 'versandapotheke', 'pharma', 'healthcare', 'medical', 'klinik',
-    'bpo', 'gfh', 'you', 'otto', 'zalando', 'aboutyou', 'docmorris', 'coolblue'
+    'bpo', 'gfh'
 }
 
 CITY_NAMES_BLACKLIST = {
@@ -441,7 +441,7 @@ STOP_NAME_WORDS = {
     'Brussels', 'Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Lisbon', 'Warsaw',
     'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa',
     'Katy', 'Austin', 'Dallas', 'Houston', 'Capital', 'Gesellschaft', 'Verwaltungs',
-    'Verwaltung', 'Beteiligungs', 'BPO', 'GFH', 'YOU'
+    'Verwaltung', 'Beteiligungs', 'BPO', 'GFH'
 }
 
 UA_TO_LATIN = {
