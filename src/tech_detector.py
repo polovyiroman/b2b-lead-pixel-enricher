@@ -119,7 +119,10 @@ def detect_tech_with_evidence(
             'ids': [],
         }
 
-    # P3 #19: Server-Side GTM (sGTM) detection
+    # Task 3-close (P0): Server-Side GTM (sGTM) positive detection.
+    # Verified against positive fixture: tests/fixtures/sgtm_positive.html (see tests/test_sgtm_positive.py).
+    # Positive-only semantics: returns True when custom sGTM loader/transport endpoint is observed,
+    # otherwise None (since sGTM may be routed inside compiled GTM or server-side CAPI without static HTML signature).
     sgtm_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
     has_sgtm = bool(sgtm_match)
     if has_sgtm and sgtm_match:
@@ -279,7 +282,7 @@ def detect_tech_with_evidence(
         'has_klaviyo': 'Klaviyo' in found_tech,
         'has_ga4': 'Google Analytics (GA4)' in found_tech,
         'has_gtm': 'Google Tag Manager' in found_tech,
-        'has_sgtm': has_sgtm,
+        'has_sgtm': True if has_sgtm else None,
         'all_ga4_ids': '; '.join(all_ga4_set) if all_ga4_set else None,
         'ga4_detection_confidence': ga4_confidence,
         'detected_cms_list': detected_cms_list,
