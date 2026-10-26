@@ -382,7 +382,6 @@ def _derive_human_contact_tier(contact_quality_tier: str | None, company_categor
     return 'No Contact'
 
 
-# Завдання 2 P0 Fix: При partial_cached / partial_blocked не ставимо 'verified_present' (повертаємо 'unknown')
 def compute_google_ads_confidence(
     has_ads: bool | None,
     scan_completeness: str,
@@ -509,7 +508,11 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
-        tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
+        if flag_key == 'has_sgtm':
+            # Task 3-close (P0): sGTM cannot be proven absent from static HTML alone (positive-only: True or None)
+            tech_info[flag_key] = True if is_found else None
+        else:
+            tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     tech_info['detected_technologies_list'] = techs_list
 
@@ -546,9 +549,45 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
-        cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
+        if flag_key == 'has_sgtm':
+            # Task 3-close (P0): Positive-only semantics for sGTM (True if confirmed, None otherwise)
+            cached_copy[flag_key] = True if is_found else None
+        else:
+            cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
+
+
+def _run_startup_sgtm_selftest() -> None:
+    """
+    Task 3-close (P0): Виконує вбудовану верифікацію sGTM детектора на старті в Apify
+    і друкує результат у лог актора для аудиту.
+    """
+    pos_html = (
+        '<html><head>'
+        '<script src="https://metrics.custom-domain.io/gtm.js?id=GTM-TEST123"></script>'
+        '<script>fetch("https://ss.cdn.example/g/collect?v=2&tid=G-TEST123456");</script>'
+        '</head><body></body></html>'
+    )
+    neg_html = (
+        '<html><head>'
+        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
+        '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
+        '</head><body></body></html>'
+    )
+    pos_res = detect_tech_with_evidence(pos_html, '', ['GTM-TEST123'], 'https://example.com/', 'full')
+    normalize_tech_info_booleans(pos_res)
+
+    neg_res = detect_tech_with_evidence(neg_html, '', ['GTM-RINGO01'], 'https://ringostat.com/', 'full')
+    normalize_tech_info_booleans(neg_res)
+
+    assert pos_res['has_sgtm'] is True, f"Expected has_sgtm=True on positive fixture, got {pos_res['has_sgtm']}"
+    assert neg_res['has_sgtm'] is None, f"Expected has_sgtm=None on negative fixture, got {neg_res['has_sgtm']}"
+    Actor.log.info(
+        f"[SGTM SELF-TEST PASS] positive_fixture={pos_res['has_sgtm']} "
+        f"(Server-Side GTM in list={'Server-Side GTM (sGTM)' in pos_res['detected_technologies_list']}), "
+        f"negative_fixture={neg_res['has_sgtm']} (positive-only semantics verified)"
+    )
 
 
 async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None:
@@ -835,7 +874,6 @@ async def process_domain(
                         has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
                         cached_copy['tech_rescan_needed'] = True
 
-                        # Завдання 2 P0 Fix: Кешований запис при заблокованому живому скані НІКОЛИ не отримує 'full'
                         if cached_copy.get('tech_scan_completeness', 'full') == 'full':
                             cached_copy['tech_scan_completeness'] = 'partial_cached'
 
@@ -1268,7 +1306,6 @@ async def process_domain(
             scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
             tech_info['tech_scan_completeness'] = scan_comp_flag
 
-        # Завдання 2 P0 Fix: Cache recovery НЕ виставляє 'full', якщо живий Playwright не відрендерив чисто
         cache_tech_recovered = False
         if not tech_info['has_ga4'] and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
@@ -1300,7 +1337,7 @@ async def process_domain(
                             'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info['has_klaviyo']),
                             'has_ga4': has_ga4_merged,
                             'has_gtm': bool(c_rec.get('has_gtm') or tech_info['has_gtm']),
-                            'has_sgtm': bool(c_rec.get('has_sgtm') or tech_info.get('has_sgtm')),
+                            'has_sgtm': True if (c_rec.get('has_sgtm') is True or tech_info.get('has_sgtm') is True) else None,
                             'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'),
                             'ga4_detection_confidence': c_rec.get('ga4_detection_confidence') or tech_info.get('ga4_detection_confidence'),
                             'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()] or tech_info['detected_cms_list'],
@@ -1579,7 +1616,6 @@ async def process_domain(
             pw_status_str
         )
 
-        # Завдання 2 P0 Fix: Додаємо чесне попередження у data_confidence_warning, коли тех-стек відновлено з кешу
         if cache_tech_recovered or tech_info.get('tech_scan_completeness') == 'partial_cached':
             cache_warn = 'Note: Tech stack recovered from verified cache; live scan blocked — do not cite as current state.'
             if confidence_warning and confidence_warning != 'None':
@@ -1893,6 +1929,7 @@ async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
 async def main() -> None:
     async with Actor:
         _remaining_run_seconds()
+        _run_startup_sgtm_selftest()
         if not is_playwright_available():
             Actor.log.warning(
                 'PLAYWRIGHT NOT INSTALLED: Browser SPA fallback disabled. '
