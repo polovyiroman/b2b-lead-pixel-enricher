@@ -21,6 +21,7 @@ from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MIN_COMPATIBLE_CACHE_SCHEMA,
     PUBLIC_WEBMAIL_DOMAINS,
+    SGTM_CUSTOM_LOADER_REGEX,
     clean_url_port,
     compute_snapshot_age_days,
     is_valid_gtm_id,
@@ -152,6 +153,17 @@ def _build_compliance_note(canonical_domain: str, country_hint: str) -> str:
     if dom_low.endswith('.de') or (country_hint or '').upper() == 'DE':
         return COMPLIANCE_DE_UWG_NOTE
     return COMPLIANCE_DEFAULT_NOTE
+
+
+def _has_verified_sgtm_in_cache(c_rec: dict) -> bool:
+    """
+    Перевіряє, чи кешований прапорець has_sgtm спирається на справжній кастомний /gtm.js?id=GTM-... лоадер,
+    відсікаючи хибні спрацювання v20.6 на stats.g.doubleclick.net/g/collect.
+    """
+    if not c_rec.get('has_sgtm'):
+        return False
+    ev_str = str(c_rec.get('technology_evidence') or '')
+    return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
 
 
 def _sanitize_cached_dms(
@@ -482,6 +494,10 @@ def detect_country_hint(
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
+    """
+    Завдання 3-close-metrics (P1): Для всіх тегів (включно з has_sgtm) при scan_comp == 'full'
+    виставляється явний False, якщо тег не знайдено, і None лише при частковому скані (is_hard_partial).
+    """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
@@ -508,19 +524,21 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
-        if flag_key == 'has_sgtm':
-            # Task 3-close (P0): sGTM cannot be proven absent from static HTML alone (positive-only: True or None)
-            tech_info[flag_key] = True if is_found else None
-        else:
-            tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
+        tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     tech_info['detected_technologies_list'] = techs_list
 
 
 def normalize_cached_record_booleans(cached_copy: dict) -> None:
     raw_tech_str = cached_copy.get('detected_technologies') or ''
-    techs_list = [x.strip() for x in raw_tech_str.split(';') if x.strip()]
+    valid_sgtm = _has_verified_sgtm_in_cache(cached_copy)
+    techs_list = [
+        x.strip() for x in raw_tech_str.split(';')
+        if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_sgtm)
+    ]
     techs_set = set(techs_list)
+    if not valid_sgtm:
+        cached_copy['has_sgtm'] = False
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
@@ -549,44 +567,60 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = tech_label in techs_set
-        if flag_key == 'has_sgtm':
-            # Task 3-close (P0): Positive-only semantics for sGTM (True if confirmed, None otherwise)
-            cached_copy[flag_key] = True if is_found else None
-        else:
-            cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
+        cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
 
 
 def _run_startup_sgtm_selftest() -> None:
     """
-    Task 3-close (P0): Виконує вбудовану верифікацію sGTM детектора на старті в Apify
-    і друкує результат у лог актора для аудиту.
+    Завдання 3-close-fix (P0): Верифікує SGTM_CUSTOM_LOADER_REGEX на 1 позитивній
+    та 3 негативних фікстурах (включно з stats.g.doubleclick.net/g/collect?v=2 та кастомним доменом без gtm.js).
     """
     pos_html = (
         '<html><head>'
         '<script src="https://metrics.custom-domain.io/gtm.js?id=GTM-TEST123"></script>'
-        '<script>fetch("https://ss.cdn.example/g/collect?v=2&tid=G-TEST123456");</script>'
+        '<script src="https://www.googletagmanager.com/gtag/js?id=G-12345678AB"></script>'
         '</head><body></body></html>'
     )
-    neg_html = (
-        '<html><head>'
-        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
-        '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
-        '</head><body></body></html>'
-    )
+    neg_fixtures = [
+        (
+            '<html><head>'
+            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTER01"></script>'
+            '<script src="https://www.googletagmanager.com/gtag/js?id=G-INTER12345"></script>'
+            '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XXXX")</script>'
+            '</head><body></body></html>'
+        ),
+        (
+            '<html><head>'
+            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
+            '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
+            '<script>https://www.google-analytics.com/g/collect?v=2&tid=G-YYYY</script>'
+            '</head><body></body></html>'
+        ),
+        (
+            '<html><head>'
+            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-COMP01"></script>'
+            '<script src="https://www.googletagmanager.com/gtag/js?id=G-COMP12345"></script>'
+            '<script>https://metrics.company.com/g/collect?v=2</script>'
+            '</head><body></body></html>'
+        ),
+    ]
+
     pos_res = detect_tech_with_evidence(pos_html, '', ['GTM-TEST123'], 'https://example.com/', 'full')
     normalize_tech_info_booleans(pos_res)
+    assert pos_res['has_sgtm'] is True, f"Expected positive fixture has_sgtm=True, got {pos_res['has_sgtm']}"
 
-    neg_res = detect_tech_with_evidence(neg_html, '', ['GTM-RINGO01'], 'https://ringostat.com/', 'full')
-    normalize_tech_info_booleans(neg_res)
+    neg_results = []
+    for idx, nf_html in enumerate(neg_fixtures, start=1):
+        nf_res = detect_tech_with_evidence(nf_html, '', [f'GTM-NEG00{idx}'], 'https://example.com/', 'full')
+        normalize_tech_info_booleans(nf_res)
+        assert nf_res['has_sgtm'] is False, f"Expected negative_{idx} has_sgtm=False, got {nf_res['has_sgtm']}"
+        neg_results.append(nf_res['has_sgtm'])
 
-    assert pos_res['has_sgtm'] is True, f"Expected has_sgtm=True on positive fixture, got {pos_res['has_sgtm']}"
-    assert neg_res['has_sgtm'] is None, f"Expected has_sgtm=None on negative fixture, got {neg_res['has_sgtm']}"
     Actor.log.info(
-        f"[SGTM SELF-TEST PASS] positive_fixture={pos_res['has_sgtm']} "
-        f"(Server-Side GTM in list={'Server-Side GTM (sGTM)' in pos_res['detected_technologies_list']}), "
-        f"negative_fixture={neg_res['has_sgtm']} (positive-only semantics verified)"
+        f"[SGTM SELF-TEST PASS] positive={pos_res['has_sgtm']}, "
+        f"negative_1={neg_results[0]}, negative_2={neg_results[1]}, negative_3={neg_results[2]}"
     )
 
 
@@ -1313,7 +1347,11 @@ async def process_domain(
                     c_rec = await cache_store.get_value(c_key)
                     if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies')):
                         raw_t = c_rec.get('detected_technologies') or ''
-                        cached_techs = [x.strip() for x in raw_t.split(';') if x.strip()]
+                        valid_cached_sgtm = _has_verified_sgtm_in_cache(c_rec)
+                        cached_techs = [
+                            x.strip() for x in raw_t.split(';')
+                            if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
+                        ]
                         if not cached_techs:
                             continue
                         merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
@@ -1337,7 +1375,7 @@ async def process_domain(
                             'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info['has_klaviyo']),
                             'has_ga4': has_ga4_merged,
                             'has_gtm': bool(c_rec.get('has_gtm') or tech_info['has_gtm']),
-                            'has_sgtm': True if (c_rec.get('has_sgtm') is True or tech_info.get('has_sgtm') is True) else None,
+                            'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
                             'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'),
                             'ga4_detection_confidence': c_rec.get('ga4_detection_confidence') or tech_info.get('ga4_detection_confidence'),
                             'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()] or tech_info['detected_cms_list'],
@@ -1345,7 +1383,7 @@ async def process_domain(
                             'has_cookie_banner': bool(c_rec.get('consent_mode_likely') or tech_info['has_cookie_banner']),
                             'detected_technologies_list': merged_techs,
                             'technology_evidence': c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache',
-                            'technology_evidence_summary': build_summary_from_cached_record({'detected_technologies': '; '.join(merged_techs), 'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids')}),
+                            'technology_evidence_summary': build_summary_from_cached_record({'detected_technologies': '; '.join(merged_techs), 'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'), 'technology_evidence': c_rec.get('technology_evidence')}),
                             'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
                             'tech_scan_completeness': merged_comp
                         }
