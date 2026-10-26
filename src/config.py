@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 21
+CACHE_SCHEMA_VERSION = 22
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 
@@ -17,10 +17,14 @@ SCHEMA_PHONE_REGEX = re.compile(
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Детекція Server-Side GTM (sGTM) — коли gtm.js або /g/collect вантажиться з кастомного піддомену (ss., sgtm., metrics., data.)
+# Завдання 3-close-fix (P0): Детекція Server-Side GTM (sGTM) ТІЛЬКИ за кастомним завантажувачем контейнера /gtm.js?id=GTM-...
+# Без /g/collect?v=2 (який давав false-positive на stats.g.doubleclick.net/g/collect).
 SGTM_CUSTOM_LOADER_REGEX = re.compile(
-    r'https?://(?!(?:www\.)?(?:googletagmanager|google-analytics|analytics\.google)\.com)'
-    r'[a-zA-Z0-9.-]+/(?:gtm\.js\?id=GTM-[A-Z0-9]+|g/collect\?v=2)',
+    r'https?://(?!(?:[a-z0-9-]+\.)?'
+    r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
+    r'doubleclick\.net|googleadservices\.com|googlesyndication\.com|'
+    r'google\.com|googleapis\.com|gstatic\.com)\b)'
+    r'[a-zA-Z0-9.-]+/gtm\.js\?id=GTM-[A-Z0-9]+',
     re.IGNORECASE
 )
 
@@ -32,7 +36,7 @@ GTAG_CONFIG_GA4_REGEX = re.compile(
 )
 GA4_SCRIPT_SRC_REGEX = re.compile(
     r"googletagmanager\.com/gtag/js\?[^'\"\s>]*?\bid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
-        re.IGNORECASE
+    re.IGNORECASE
 )
 GA4_WIRE_REGEX = re.compile(
     r"google-analytics\.com/g/collect\?[^'\"\s>]*?(?:^|[?&])tid=(G-(?=[A-Z0-9]*\d)[A-Z0-9]{6,12})\b",
@@ -159,8 +163,6 @@ FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
 }
 
-# Завдання 1 P0 Fix: Видалено 'you', 'otto', 'zalando', 'aboutyou', 'docmorris', 'coolblue',
-# щоб "Benjamin Otto" не відсікався як корпоративна сутність.
 CORPORATE_ENTITY_TOKENS = {
     'capital', 'holding', 'holdings', 'group', 'gruppe', 'gesellschaft', 'konzern',
     'verwaltungs', 'verwaltung', 'beteiligungs', 'beteiligungsgesellschaft', 'stiftung',
