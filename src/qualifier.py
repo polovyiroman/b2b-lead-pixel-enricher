@@ -190,14 +190,6 @@ def compute_data_quality_score(
     is_manual_seed: bool = False,
     is_same_person_email: bool = False,
 ) -> int:
-    """
-    P0 #6 Fix: Калібрована формула data_quality_score (0-100):
-    - Agency ('B2B Agency / Marketing Media') = жорстка стеля max 40 (партнерський пайплайн, не клієнт).
-    - Non-Profit = max 15.
-    - manual_seed (напр. rozetka) = жорстка стеля max 65 (щоб не маскувався під живий 90-бальний лід).
-    - Відсутній/неповний тех-стек (scan_completeness != 'full' або techs_count == 0) = -15 балів.
-    - Верифікований персональний email ЛПР (is_same_person_email=True) = +20 балів.
-    """
     if company_category == 'Non-Profit / Education / Institution':
         return 10
 
@@ -255,8 +247,9 @@ def build_sales_hook(
     best_email: str | None,
 ) -> str:
     """
-    P1 #10: Генерує конкретний 15-секундний opener (sales_hook) для SDR на основі Tech Gap Analysis
-    замість загального шаблону.
+    Завдання 3 (P1): Генерує чесний 15-секундний opener (sales_hook) без непідтвердженого негативного твердження
+    'without sGTM' (оскільки sGTM часто маскується за стандартним gtm.js або CAPI-маршрутизацією).
+    Якщо has_sgtm=True підтверджено позитивно — явно відзначає це.
     """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
@@ -284,18 +277,19 @@ def build_sales_hook(
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
-    # Gap 1: Є клієнтський GTM + платні пікселі (Meta/Google Ads/TikTok), але НЕМАЄ Server-Side GTM (sGTM)
-    if (has_meta or has_gads or has_tiktok) and not has_sgtm:
-        paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
+    paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
+
+    # 1. Підтверджений Server-Side GTM (has_sgtm == True)
+    if has_sgtm and paid_channels:
         paid_str = ' + '.join(paid_channels)
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str}. Gap: Active {paid_str} client-side tracking without Server-Side GTM (sGTM). "
-            f"Opening Hook: \"Noticed {brand} runs {paid_str} via client-side tags without sGTM — "
-            f"how are you recovering the 15-25% conversion signal loss from iOS 14.5+ and ad-blockers?\""
+            f"Stack: {stack_str} (Server-Side GTM verified). "
+            f"Opening Hook: \"Saw {brand} running {paid_str} with Server-Side GTM already in place — "
+            f"how are you currently benchmarking CAPI event match quality and incremental ROAS across channels?\""
         )
 
-    # Gap 2: Є Meta/TikTok, але немає Google Ads Conversion
+    # 2. Gap 2: Є Meta/TikTok, але немає Google Ads Conversion
     if (has_meta or has_tiktok) and not has_gads:
         social_ch = 'Meta & TikTok' if (has_meta and has_tiktok) else ('Meta Pixel' if has_meta else 'TikTok Pixel')
         return (
@@ -305,7 +299,17 @@ def build_sales_hook(
             f"Google Shopping/PMax capture, or routing search attribution server-side?\""
         )
 
-    # Gap 3: Є GTM або GA4, але 0 платних пікселів (або закриті Cookie Consent)
+    # 3. Активний multi-channel paid стек (без ризикованого 'without sGTM' false-claim)
+    if paid_channels:
+        paid_str = ' + '.join(paid_channels)
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str}. Active multi-channel paid acquisition ({paid_str}) detected. "
+            f"Opening Hook: \"Saw {brand} running active {paid_str} campaigns alongside GA4 — "
+            f"how are you currently benchmarking cross-channel attribution and server-side signal recovery across your funnel?\""
+        )
+
+    # 4. Gap 3: Є GTM або GA4, але 0 платних пікселів (або закриті Cookie Consent)
     if has_gtm or has_ga4:
         if has_consent:
             return (
@@ -799,7 +803,6 @@ def build_manual_seed_record(
     )
     dms_json_str = build_decision_makers_json_from_summary(dms_found_str, seed.get('decision_maker_linkedin_url'))
 
-    # P0 #6 Fix: manual_seed має чесну стелю <= 65 балів
     dq_score = compute_data_quality_score(
         contact_quality_tier,
         len(seed_tech_list),
