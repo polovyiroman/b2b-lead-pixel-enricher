@@ -51,6 +51,7 @@ from .qualifier import (
     evaluate_qualification_v180,
     is_marketplace_platform,
 )
+from .regression_gate import run_startup_regression_gate
 from .scraper import (
     classify_failure_status,
     close_shared_playwright_browser,
@@ -87,14 +88,6 @@ TECH_FLAG_TO_NAME_MAP = (
     ('has_gtm', 'Google Tag Manager'),
     ('has_sgtm', 'Server-Side GTM (sGTM)'),
 )
-
-AD_PIXEL_LABELS = {
-    'Meta Pixel',
-    'TikTok Pixel',
-    'Google Ads Conversion',
-    'LinkedIn Insight Tag',
-    'Pinterest Tag',
-}
 
 COMPLIANCE_DEFAULT_NOTE = (
     'Enriched for legitimate B2B interest from public site data; '
@@ -156,14 +149,40 @@ def _build_compliance_note(canonical_domain: str, country_hint: str) -> str:
 
 
 def _has_verified_sgtm_in_cache(c_rec: dict) -> bool:
-    """
-    Перевіряє, чи кешований прапорець has_sgtm спирається на справжній кастомний /gtm.js?id=GTM-... лоадер,
-    відсікаючи хибні спрацювання v20.6 на stats.g.doubleclick.net/g/collect.
-    """
     if not c_rec.get('has_sgtm'):
         return False
     ev_str = str(c_rec.get('technology_evidence') or '')
     return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
+
+
+def _normalize_pw_empty_status(raw_status: str, html_str: str | None) -> str:
+    """
+    Завдання 6 (P2): Уніфікує 'launched_empty' та 'rendered' з порожньою оболонкою (<2500B)
+    у єдиний канонічний статус 'launched_empty_shell'.
+    """
+    if raw_status == 'launched_empty':
+        return 'launched_empty_shell'
+    if raw_status == 'rendered' and (not html_str or len(html_str) < MIN_VALID_RESCUE_HTML_BYTES):
+        return 'launched_empty_shell'
+    return raw_status
+
+
+def resolve_cache_merged_completeness(
+    has_ga4_merged: bool,
+    pw_used_flag: bool,
+    pw_had_timeout_or_block: bool,
+    live_found_something: bool,
+    current_comp: str,
+) -> str:
+    """
+    Завдання 2 & 6: Визначає tech_scan_completeness при відновленні технологій із кешу.
+    Повертає 'full' ТІЛЬКИ якщо Playwright чисто відрендерив сторінку І живий скан сам знайшов теги.
+    Інакше повертає 'partial_cached'.
+    """
+    if has_ga4_merged:
+        live_was_clean = pw_used_flag and not pw_had_timeout_or_block and live_found_something
+        return 'full' if live_was_clean else 'partial_cached'
+    return current_comp if current_comp != 'full' else 'partial_gtm'
 
 
 def _sanitize_cached_dms(
@@ -172,10 +191,13 @@ def _sanitize_cached_dms(
     raw_dms_found: str | None,
     brand_root: str = ''
 ) -> tuple[str | None, str | None, str | None]:
+    """
+    P3 Cleanup: Очищує кешовані DMs без жодного хардкоду конкретних імен —
+    використовує загальні правила strip_role_tokens_from_name() та is_valid_person_name().
+    """
     clean_primary_name = None
     if raw_dm_name:
-        cand = re.sub(r'\b(Petra\s+Scharner-Wolff)\s+Katy\b', r'\1', str(raw_dm_name))
-        cand = strip_role_tokens_from_name(cand)
+        cand = strip_role_tokens_from_name(str(raw_dm_name))
         if is_valid_person_name(cand, brand_root):
             clean_primary_name = cand
 
@@ -192,8 +214,7 @@ def _sanitize_cached_dms(
             if not m:
                 continue
             c_name_raw, c_role_raw, c_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-            c_name = re.sub(r'\b(Petra\s+Scharner-Wolff)\s+Katy\b', r'\1', c_name_raw)
-            c_name = strip_role_tokens_from_name(c_name)
+            c_name = strip_role_tokens_from_name(c_name_raw)
             if not is_valid_person_name(c_name, brand_root):
                 continue
             if c_name.lower() in seen_names:
@@ -495,8 +516,8 @@ def detect_country_hint(
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
     """
-    Завдання 3-close-metrics (P1): Для всіх тегів (включно з has_sgtm) при scan_comp == 'full'
-    виставляється явний False, якщо тег не знайдено, і None лише при частковому скані (is_hard_partial).
+    Завдання 5 (P2): Якщо techs_set порожній (0 знайдених технологій, як на unicredit.it / bol.com),
+    tech_scan_completeness не може залишатися 'full' — переводиться у 'partial_empty_render'.
     """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
@@ -513,12 +534,14 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
     has_gtm_found = 'Google Tag Manager' in techs_set
     has_cookie = bool(tech_info.get('has_cookie_banner'))
 
-    if not has_ga4_found and (has_gtm_found or has_cookie) and tech_info.get('tech_scan_completeness') == 'full':
+    if not techs_set and tech_info.get('tech_scan_completeness') == 'full':
+        tech_info['tech_scan_completeness'] = 'partial_empty_render'
+    elif not has_ga4_found and (has_gtm_found or has_cookie) and tech_info.get('tech_scan_completeness') == 'full':
         tech_info['tech_scan_completeness'] = 'partial_gtm'
 
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
     is_hard_partial = (
-        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm')
+        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm', 'partial_empty_render')
         or not techs_set
     )
 
@@ -552,7 +575,9 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
     has_gtm_found = 'Google Tag Manager' in techs_set
     has_cookie = bool(cached_copy.get('consent_mode_likely'))
 
-    if not has_ga4_found and (has_gtm_found or has_cookie) and cached_copy.get('tech_scan_completeness', 'full') == 'full':
+    if not techs_set and cached_copy.get('tech_scan_completeness', 'full') == 'full':
+        cached_copy['tech_scan_completeness'] = 'partial_empty_render'
+    elif not has_ga4_found and (has_gtm_found or has_cookie) and cached_copy.get('tech_scan_completeness', 'full') == 'full':
         cached_copy['tech_scan_completeness'] = 'partial_gtm'
 
     has_cached_tech = bool(has_gtm_found or has_ga4_found)
@@ -561,7 +586,7 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
 
     scan_comp = cached_copy.get('tech_scan_completeness', 'full')
     is_hard_partial = (
-        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm')
+        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm', 'partial_empty_render')
         or not techs_set
     )
 
@@ -570,58 +595,6 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
         cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
 
     cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
-
-
-def _run_startup_sgtm_selftest() -> None:
-    """
-    Завдання 3-close-fix (P0): Верифікує SGTM_CUSTOM_LOADER_REGEX на 1 позитивній
-    та 3 негативних фікстурах (включно з stats.g.doubleclick.net/g/collect?v=2 та кастомним доменом без gtm.js).
-    """
-    pos_html = (
-        '<html><head>'
-        '<script src="https://metrics.custom-domain.io/gtm.js?id=GTM-TEST123"></script>'
-        '<script src="https://www.googletagmanager.com/gtag/js?id=G-12345678AB"></script>'
-        '</head><body></body></html>'
-    )
-    neg_fixtures = [
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTER01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-INTER12345"></script>'
-            '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XXXX")</script>'
-            '</head><body></body></html>'
-        ),
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
-            '<script>https://www.google-analytics.com/g/collect?v=2&tid=G-YYYY</script>'
-            '</head><body></body></html>'
-        ),
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-COMP01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-COMP12345"></script>'
-            '<script>https://metrics.company.com/g/collect?v=2</script>'
-            '</head><body></body></html>'
-        ),
-    ]
-
-    pos_res = detect_tech_with_evidence(pos_html, '', ['GTM-TEST123'], 'https://example.com/', 'full')
-    normalize_tech_info_booleans(pos_res)
-    assert pos_res['has_sgtm'] is True, f"Expected positive fixture has_sgtm=True, got {pos_res['has_sgtm']}"
-
-    neg_results = []
-    for idx, nf_html in enumerate(neg_fixtures, start=1):
-        nf_res = detect_tech_with_evidence(nf_html, '', [f'GTM-NEG00{idx}'], 'https://example.com/', 'full')
-        normalize_tech_info_booleans(nf_res)
-        assert nf_res['has_sgtm'] is False, f"Expected negative_{idx} has_sgtm=False, got {nf_res['has_sgtm']}"
-        neg_results.append(nf_res['has_sgtm'])
-
-    Actor.log.info(
-        f"[SGTM SELF-TEST PASS] positive={pos_res['has_sgtm']}, "
-        f"negative_1={neg_results[0]}, negative_2={neg_results[1]}, negative_3={neg_results[2]}"
-    )
 
 
 async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None:
@@ -694,7 +667,8 @@ async def process_domain(
                     start_residential=(status != 0),
                 )
                 pw_attempts_count += pw_rescue_attempts
-                if pw_rescue_status == 'rendered' and pw_rescue_html and len(pw_rescue_html) >= MIN_VALID_RESCUE_HTML_BYTES:
+                pw_rescue_status = _normalize_pw_empty_status(pw_rescue_status, pw_rescue_html)
+                if pw_rescue_status == 'rendered' and pw_rescue_html:
                     Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                     status = 200
                     html = pw_rescue_html
@@ -707,7 +681,7 @@ async def process_domain(
                     if pw_rescue_inc and len(pw_rescue_html) < 15_000:
                         pw_had_timeout_or_block = True
                 else:
-                    pw_status_str = 'launched_empty_shell' if (pw_rescue_status == 'rendered' and pw_rescue_html) else pw_rescue_status
+                    pw_status_str = pw_rescue_status
                     pw_had_timeout_or_block = True
 
         parsed_final = urlparse(final_url)
@@ -1251,12 +1225,14 @@ async def process_domain(
                     max_attempts=remaining_pw_budget,
                 )
                 pw_attempts_count += pw_main_attempts
-                if pw_incomplete:
+                # Завдання 6 (P2): Уніфікуємо 'launched_empty' -> 'launched_empty_shell' і в основному блоці PW
+                pw_status_str = _normalize_pw_empty_status(pw_status_str, pw_html)
+                if pw_incomplete or pw_status_str == 'launched_empty_shell':
                     pw_had_timeout_or_block = True
                 Actor.log.info(
                     f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
                 )
-                if pw_status_str == 'rendered' and pw_html and len(pw_html) >= MIN_VALID_RESCUE_HTML_BYTES:
+                if pw_status_str == 'rendered' and pw_html:
                     pw_used_flag = True
                     pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
                         thread_pool, parse_html_sync, pw_html, pw_url, effective_region
@@ -1354,14 +1330,17 @@ async def process_domain(
                         ]
                         if not cached_techs:
                             continue
+                        live_ev_json = json.loads(tech_info['technology_evidence_json']) if tech_info.get('technology_evidence_json') else {}
+                        live_found_something = bool(live_ev_json) or bool(tech_info.get('detected_technologies_list'))
                         merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
                         has_ga4_merged = bool(c_rec.get('has_ga4') or tech_info['has_ga4'])
-                        if has_ga4_merged:
-                            live_was_clean = pw_used_flag and not pw_had_timeout_or_block
-                            merged_comp = 'full' if live_was_clean else 'partial_cached'
-                        else:
-                            merged_comp = tech_info['tech_scan_completeness'] if tech_info['tech_scan_completeness'] != 'full' else 'partial_gtm'
-                        live_ev_json = json.loads(tech_info['technology_evidence_json']) if tech_info.get('technology_evidence_json') else {}
+                        merged_comp = resolve_cache_merged_completeness(
+                            has_ga4_merged,
+                            pw_used_flag,
+                            pw_had_timeout_or_block,
+                            live_found_something,
+                            tech_info['tech_scan_completeness'],
+                        )
                         for ct in cached_techs:
                             if ct not in live_ev_json:
                                 live_ev_json[ct] = {'source': 'cache'}
@@ -1661,6 +1640,13 @@ async def process_domain(
                     confidence_warning = f'{confidence_warning} | {cache_warn}'
             else:
                 confidence_warning = cache_warn
+        elif tech_info.get('tech_scan_completeness') == 'partial_empty_render':
+            empty_warn = 'Note: Zero tracking tags observed in HTML/JS shell (consent-gated or custom loader — tag absence unverified).'
+            if confidence_warning and confidence_warning != 'None':
+                if 'tag absence unverified' not in confidence_warning:
+                    confidence_warning = f'{confidence_warning} | {empty_warn}'
+            else:
+                confidence_warning = empty_warn
 
         sales_hook = build_sales_hook(
             canonical_domain,
@@ -1967,7 +1953,12 @@ async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
 async def main() -> None:
     async with Actor:
         _remaining_run_seconds()
-        _run_startup_sgtm_selftest()
+        # Завдання 4 (P1): Блокуючий CI/Regression Gate на старті контейнера в Apify (6 тестів)
+        run_startup_regression_gate(
+            log_fn=Actor.log.info,
+            normalize_tech_fn=normalize_tech_info_booleans,
+            resolve_cache_comp_fn=resolve_cache_merged_completeness,
+        )
         if not is_playwright_available():
             Actor.log.warning(
                 'PLAYWRIGHT NOT INSTALLED: Browser SPA fallback disabled. '
