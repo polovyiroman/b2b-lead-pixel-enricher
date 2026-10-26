@@ -246,11 +246,6 @@ def build_sales_hook(
     dm_linkedin_url: str | None,
     best_email: str | None,
 ) -> str:
-    """
-    Завдання 3 (P1): Генерує чесний 15-секундний opener (sales_hook) без непідтвердженого негативного твердження
-    'without sGTM' (оскільки sGTM часто маскується за стандартним gtm.js або CAPI-маршрутизацією).
-    Якщо has_sgtm=True підтверджено позитивно — явно відзначає це.
-    """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
         return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
@@ -279,7 +274,6 @@ def build_sales_hook(
 
     paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
 
-    # 1. Підтверджений Server-Side GTM (has_sgtm == True)
     if has_sgtm and paid_channels:
         paid_str = ' + '.join(paid_channels)
         return (
@@ -289,7 +283,6 @@ def build_sales_hook(
             f"how are you currently benchmarking CAPI event match quality and incremental ROAS across channels?\""
         )
 
-    # 2. Gap 2: Є Meta/TikTok, але немає Google Ads Conversion
     if (has_meta or has_tiktok) and not has_gads:
         social_ch = 'Meta & TikTok' if (has_meta and has_tiktok) else ('Meta Pixel' if has_meta else 'TikTok Pixel')
         return (
@@ -299,7 +292,6 @@ def build_sales_hook(
             f"Google Shopping/PMax capture, or routing search attribution server-side?\""
         )
 
-    # 3. Активний multi-channel paid стек (без ризикованого 'without sGTM' false-claim)
     if paid_channels:
         paid_str = ' + '.join(paid_channels)
         return (
@@ -309,7 +301,6 @@ def build_sales_hook(
             f"how are you currently benchmarking cross-channel attribution and server-side signal recovery across your funnel?\""
         )
 
-    # 4. Gap 3: Є GTM або GA4, але 0 платних пікселів (або закриті Cookie Consent)
     if has_gtm or has_ga4:
         if has_consent:
             return (
@@ -348,36 +339,42 @@ def evaluate_qualification_v180(
     had_marketplace_pollution: bool = False,
     pw_status_str: str = 'not_needed'
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
+    detected_list = tech_info.get('detected_technologies_list', [])
     ad_tags = []
-    if tech_info.get('has_meta_pixel'):
+    if tech_info.get('has_meta_pixel') or 'Meta Pixel' in detected_list:
         ad_tags.append('Meta Pixel')
-    if tech_info.get('has_google_ads'):
+    if tech_info.get('has_google_ads') or 'Google Ads Conversion' in detected_list:
         ad_tags.append('Google Ads Conversion')
-    if tech_info.get('has_tiktok_pixel'):
+    if tech_info.get('has_tiktok_pixel') or 'TikTok Pixel' in detected_list:
         ad_tags.append('TikTok Pixel')
-    if tech_info.get('has_linkedin_pixel'):
+    if tech_info.get('has_linkedin_pixel') or 'LinkedIn Insight Tag' in detected_list:
         ad_tags.append('LinkedIn Insight Tag')
-    if tech_info.get('has_pinterest_tag'):
+    if tech_info.get('has_pinterest_tag') or 'Pinterest Tag' in detected_list:
         ad_tags.append('Pinterest Tag')
 
     analytics_tags = []
-    if tech_info.get('has_ga4'):
+    if tech_info.get('has_ga4') or 'Google Analytics (GA4)' in detected_list:
         analytics_tags.append('GA4')
-    if tech_info.get('has_gtm'):
+    if tech_info.get('has_gtm') or 'Google Tag Manager' in detected_list:
         analytics_tags.append('GTM')
-    if tech_info.get('has_sgtm'):
+    # Завдання 7 (P3): sGTM гарантовано потрапляє в analytics_tags та detected_signals
+    if tech_info.get('has_sgtm') or 'Server-Side GTM (sGTM)' in detected_list:
         analytics_tags.append('sGTM')
 
-    detected_list = tech_info.get('detected_technologies_list', [])
-    for ux_tool in ('Microsoft Clarity', 'Hotjar', 'HubSpot', 'Klaviyo'):
-        if ux_tool in detected_list:
+    for ux_tool in ('Microsoft Clarity', 'Hotjar', 'HubSpot', 'Klaviyo', 'Intercom'):
+        if ux_tool in detected_list and ux_tool not in analytics_tags:
             analytics_tags.append(ux_tool)
 
     all_signals = ad_tags + analytics_tags
     detected_cms = tech_info.get('detected_cms_list', [])
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    pw_blocked_by_waf = pw_status_str.startswith('launched_blocked') or pw_status_str == 'skipped_hopeless_waf'
+
+    # Завдання 6 (P2): Уніфікована перевірка статусів порожньої оболонки та WAF-блокування
+    pw_blocked_by_waf = (
+        pw_status_str.startswith('launched_blocked')
+        or pw_status_str in ('skipped_hopeless_waf', 'launched_empty_shell', 'launched_empty')
+    )
 
     if all_signals:
         detected_signals_str = ', '.join(all_signals)
@@ -548,7 +545,10 @@ def evaluate_qualification_v180(
             confidence_warning = 'Warning: External third-party brand emails filtered out (marketplace_pollution); locate internal DM via LinkedIn.'
         elif pw_blocked_by_waf:
             enrichment_status = 'playwright_blocked_by_waf_needs_residential_proxy'
-            confidence_warning = f'Warning: Deep browser scan blocked by WAF ({pw_status_str}); retry with residential proxy or enrich via LinkedIn.'
+            confidence_warning = (
+                f'Warning: Deep browser scan returned empty shell or was blocked by WAF ({pw_status_str}); '
+                f'retry with residential proxy or enrich via LinkedIn.'
+            )
         elif pw_status_str == 'rendered':
             enrichment_status = 'lead_form_only_no_public_contacts'
             confidence_warning = (
