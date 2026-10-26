@@ -44,6 +44,11 @@ def extract_code_snippet(source_text: str, match_str: str, max_len: int = 80) ->
     return raw
 
 
+def _is_valid_cached_sgtm(rec: dict) -> bool:
+    ev_str = str(rec.get('technology_evidence') or '')
+    return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
+
+
 def build_summary_from_cached_record(rec: dict) -> str | None:
     parts = []
     raw_tech = rec.get('detected_technologies') or ''
@@ -52,6 +57,8 @@ def build_summary_from_cached_record(rec: dict) -> str | None:
     first_ga4 = ga4_ids_str.split(';')[0].strip() if ga4_ids_str else ''
 
     for t in tech_list:
+        if t == 'Server-Side GTM (sGTM)' and not _is_valid_cached_sgtm(rec):
+            continue
         short = SHORT_SUMMARY_LABELS.get(t, t)
         if t == 'Google Analytics (GA4)':
             if first_ga4:
@@ -71,11 +78,13 @@ def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache
     ga4_ids = [x.strip() for x in (rec.get('all_ga4_ids') or '').split(';') if x.strip()]
     evidence_map: dict[str, dict] = {}
     for t in tech_list:
+        if t == 'Server-Side GTM (sGTM)' and not _is_valid_cached_sgtm(rec):
+            continue
         entry: dict = {'source': source_label}
         if t == 'Google Analytics (GA4)' and ga4_ids:
             entry['ids'] = ga4_ids
         evidence_map[t] = entry
-    return json.dumps(evidence_map, ensure_ascii=False)
+    return json.dumps(evidence_map, ensure_ascii=False) if evidence_map else None
 
 
 def detect_tech_with_evidence(
@@ -119,10 +128,8 @@ def detect_tech_with_evidence(
             'ids': [],
         }
 
-    # Task 3-close (P0): Server-Side GTM (sGTM) positive detection.
-    # Verified against positive fixture: tests/fixtures/sgtm_positive.html (see tests/test_sgtm_positive.py).
-    # Positive-only semantics: returns True when custom sGTM loader/transport endpoint is observed,
-    # otherwise None (since sGTM may be routed inside compiled GTM or server-side CAPI without static HTML signature).
+    # Завдання 3-close-fix (P0): Server-Side GTM (sGTM) strict detection.
+    # Matches ONLY custom-domain /gtm.js?id=GTM-XXXX loaders (excludes Google/DoubleClick & g/collect).
     sgtm_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
     has_sgtm = bool(sgtm_match)
     if has_sgtm and sgtm_match:
@@ -282,7 +289,7 @@ def detect_tech_with_evidence(
         'has_klaviyo': 'Klaviyo' in found_tech,
         'has_ga4': 'Google Analytics (GA4)' in found_tech,
         'has_gtm': 'Google Tag Manager' in found_tech,
-        'has_sgtm': True if has_sgtm else None,
+        'has_sgtm': has_sgtm,
         'all_ga4_ids': '; '.join(all_ga4_set) if all_ga4_set else None,
         'ga4_detection_confidence': ga4_confidence,
         'detected_cms_list': detected_cms_list,
