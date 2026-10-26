@@ -21,7 +21,6 @@ from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MIN_COMPATIBLE_CACHE_SCHEMA,
     PUBLIC_WEBMAIL_DOMAINS,
-    ROLE_NORMALIZATION_MAP,
     clean_url_port,
     compute_snapshot_age_days,
     is_valid_gtm_id,
@@ -161,12 +160,6 @@ def _sanitize_cached_dms(
     raw_dms_found: str | None,
     brand_root: str = ''
 ) -> tuple[str | None, str | None, str | None]:
-    """
-    P0 #2 & #5 Fix: Очищує кешовані записи від:
-    1) Корпоративних сутностей ('BPO Capital', 'GFH Gesellschaft', 'YOU Verwaltungs')
-    2) Склеєних третіх токенів ('Petra Scharner-Wolff Katy' -> 'Petra Scharner-Wolff')
-    3) Застарілих ролей без 'CEO' ('Executive Board Member (Vorstand)' -> 'Executive Board / CEO (Vorstand)')
-    """
     clean_primary_name = None
     if raw_dm_name:
         cand = re.sub(r'\b(Petra\s+Scharner-Wolff)\s+Katy\b', r'\1', str(raw_dm_name))
@@ -373,10 +366,6 @@ def _derive_pii_fields(
 
 
 def _derive_human_contact_tier(contact_quality_tier: str | None, company_category: str = '') -> str:
-    """
-    P0 #6 Fix: Агенції отримують окремий лейбл 'Partner (Agency)',
-    щоб не змішуватися з клієнтськими лідами у фільтрі 'Hot' / 'Warm'.
-    """
     if company_category == 'B2B Agency / Marketing Media':
         return 'Partner (Agency)'
     if not contact_quality_tier:
@@ -393,6 +382,7 @@ def _derive_human_contact_tier(contact_quality_tier: str | None, company_categor
     return 'No Contact'
 
 
+# Завдання 2 P0 Fix: При partial_cached / partial_blocked не ставимо 'verified_present' (повертаємо 'unknown')
 def compute_google_ads_confidence(
     has_ads: bool | None,
     scan_completeness: str,
@@ -400,7 +390,7 @@ def compute_google_ads_confidence(
     consent_mode_likely: bool = False,
     pw_rendered: bool = False
 ) -> str:
-    if has_ads is True:
+    if has_ads is True and scan_completeness == 'full':
         return 'verified_present'
     if has_ads is None:
         return 'unknown'
@@ -493,12 +483,6 @@ def detect_country_hint(
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
-    """
-    P0 #1 Fix (AboutYou false-full fix):
-    Якщо є Google Tag Manager або Cookie Banner, але GA4 не виявлено (напр. при неповному рендері або CMP-блоці),
-    ми НЕ дозволяємо ставити has_ga4=False (брехливе твердження про відсутність GA4).
-    Натомість scan_completeness переводиться у 'partial_gtm' / 'partial_timeout', а невиявлені прапорці стають None.
-    """
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
@@ -637,7 +621,6 @@ async def process_domain(
                     start_residential=(status != 0),
                 )
                 pw_attempts_count += pw_rescue_attempts
-                # P0 #5 Fix: 161-байтна порожня оболонка (як на docmorris.de) НЕ вважається успішним рендером!
                 if pw_rescue_status == 'rendered' and pw_rescue_html and len(pw_rescue_html) >= MIN_VALID_RESCUE_HTML_BYTES:
                     Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                     status = 200
@@ -779,8 +762,8 @@ async def process_domain(
                             f'Live {short_err_msg}; snapshot from {prev_time or "prior run"}'
                         )
                         cached_copy['data_confidence_warning'] = (
-                            f'Note: Live scan encountered {short_err_msg}; returning cached snapshot '
-                            f'({cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d) from {prev_time}.'
+                            f'Note: Tech stack recovered from verified cache; live scan blocked ({short_err_msg}) — '
+                            f'do not cite as current state (source={cached_copy["cached_snapshot_source"]}, age={cached_copy["cached_snapshot_age_days"]}d).'
                         )
                         cached_copy['playwright_available'] = is_playwright_available()
                         cached_copy['playwright_used'] = False
@@ -809,7 +792,7 @@ async def process_domain(
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
                         cached_copy.setdefault('ga4_detection_confidence', None)
-                        cached_copy.setdefault('tech_scan_completeness', 'full')
+                        cached_copy.setdefault('tech_scan_completeness', 'partial_cached')
                         cached_copy.setdefault('category_confidence', 'high')
                         cached_copy.setdefault(
                             'marketplace_platform',
@@ -850,16 +833,17 @@ async def process_domain(
                             cached_copy['all_emails_deliverability'] = None
 
                         has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
-                        cached_copy['tech_rescan_needed'] = not has_cached_tech
+                        cached_copy['tech_rescan_needed'] = True
 
-                        if cached_copy['tech_rescan_needed'] and cached_copy.get('tech_scan_completeness') == 'full':
+                        # Завдання 2 P0 Fix: Кешований запис при заблокованому живому скані НІКОЛИ не отримує 'full'
+                        if cached_copy.get('tech_scan_completeness', 'full') == 'full':
                             cached_copy['tech_scan_completeness'] = 'partial_cached'
 
                         _cached_tech_list = [x.strip() for x in (cached_copy.get('detected_technologies') or '').split(';') if x.strip()]
                         _cached_tech_count = len(_cached_tech_list)
                         cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
                             cached_copy.get('has_google_ads'),
-                            cached_copy.get('tech_scan_completeness', 'full'),
+                            cached_copy.get('tech_scan_completeness', 'partial_cached'),
                             _cached_tech_count,
                             bool(cached_copy.get('consent_mode_likely')),
                             False
@@ -891,7 +875,7 @@ async def process_domain(
                             cached_copy.get('decision_maker_name'),
                             cached_copy.get('decision_maker_linkedin_url'),
                             cached_copy.get('primary_phone'),
-                            cached_copy.get('tech_scan_completeness', 'full'),
+                            cached_copy.get('tech_scan_completeness', 'partial_cached'),
                             True,
                             company_category=_cat,
                             is_manual_seed=False,
@@ -1280,12 +1264,12 @@ async def process_domain(
                                         if chk_em or phone_map:
                                             break
 
-        # P0 #1 Fix (AboutYou ordering fix):
-        # Спочатку визначаємо, чи був живий скан неповним, ПЕРЕД тим як робити cache recovery.
         if pw_had_timeout_or_block and not (tech_info['has_ga4'] and tech_info['has_gtm']):
             scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
             tech_info['tech_scan_completeness'] = scan_comp_flag
 
+        # Завдання 2 P0 Fix: Cache recovery НЕ виставляє 'full', якщо живий Playwright не відрендерив чисто
+        cache_tech_recovered = False
         if not tech_info['has_ga4'] and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
@@ -1297,10 +1281,11 @@ async def process_domain(
                             continue
                         merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
                         has_ga4_merged = bool(c_rec.get('has_ga4') or tech_info['has_ga4'])
-                        # Ставимо 'full' ТІЛЬКИ якщо реально відновлено GA4! Якщо GA4 немає (як у AboutYou), залишаємо partial_gtm / partial_timeout.
-                        merged_comp = 'full' if has_ga4_merged else (
-                            tech_info['tech_scan_completeness'] if tech_info['tech_scan_completeness'] != 'full' else 'partial_gtm'
-                        )
+                        if has_ga4_merged:
+                            live_was_clean = pw_used_flag and not pw_had_timeout_or_block
+                            merged_comp = 'full' if live_was_clean else 'partial_cached'
+                        else:
+                            merged_comp = tech_info['tech_scan_completeness'] if tech_info['tech_scan_completeness'] != 'full' else 'partial_gtm'
                         live_ev_json = json.loads(tech_info['technology_evidence_json']) if tech_info.get('technology_evidence_json') else {}
                         for ct in cached_techs:
                             if ct not in live_ev_json:
@@ -1327,6 +1312,7 @@ async def process_domain(
                             'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
                             'tech_scan_completeness': merged_comp
                         }
+                        cache_tech_recovered = (merged_comp == 'partial_cached')
                         break
                 except Exception:
                     pass
@@ -1446,7 +1432,6 @@ async def process_domain(
             thread_pool, extract_decision_maker_deep, pages_with_urls
         )
 
-        # P0 #2 & #5 Fix: Санітизація кешованих DMs перед merge (видаляє BPO Capital, GFH Gesellschaft, YOU Verwaltungs, Katy та оновлює роль Vorstand -> CEO)
         if cache_store is not None:
             for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                 try:
@@ -1594,6 +1579,15 @@ async def process_domain(
             pw_status_str
         )
 
+        # Завдання 2 P0 Fix: Додаємо чесне попередження у data_confidence_warning, коли тех-стек відновлено з кешу
+        if cache_tech_recovered or tech_info.get('tech_scan_completeness') == 'partial_cached':
+            cache_warn = 'Note: Tech stack recovered from verified cache; live scan blocked — do not cite as current state.'
+            if confidence_warning and confidence_warning != 'None':
+                if 'recovered from verified cache' not in confidence_warning:
+                    confidence_warning = f'{confidence_warning} | {cache_warn}'
+            else:
+                confidence_warning = cache_warn
+
         sales_hook = build_sales_hook(
             canonical_domain,
             company_category,
@@ -1638,7 +1632,7 @@ async def process_domain(
             dm_linkedin_url,
             primary_phone,
             tech_info['tech_scan_completeness'],
-            False,
+            cache_tech_recovered,
             company_category=company_category,
             is_manual_seed=False,
             is_same_person_email=verify_person_email_match(dm_name, best_email),
