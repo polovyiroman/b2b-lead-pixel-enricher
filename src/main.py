@@ -373,7 +373,15 @@ async def process_domain(
                         _jur = derive_gdpr_jurisdiction(canonical_domain, cached_copy.get('primary_phone'), _c_hint, '')
                         cached_copy['gdpr_jurisdiction'] = _jur
                         cached_copy['gdpr_eu_domain'] = _jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-                        _cat = cached_copy.get('company_category', '')
+                        _cat, _cat_conf = classify_company_category(
+                            canonical_domain,
+                            cached_copy.get('page_title') or '',
+                            cached_copy.get('meta_description') or '',
+                            _cached_tech_list,
+                            ''
+                        )
+                        cached_copy['company_category'] = _cat
+                        cached_copy['category_confidence'] = _cat_conf
                         cached_copy['contact_quality_tier_human'] = derive_human_contact_tier(
                             cached_copy.get('contact_quality_tier'), _cat
                         )
@@ -648,6 +656,7 @@ async def process_domain(
                     pw_had_timeout_or_block = True
                 if pw_status_str == 'rendered' and pw_html:
                     pw_used_flag = True
+                    html = pw_html
                     pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
                         thread_pool, parse_html_sync, pw_html, pw_url, effective_region
                     )
@@ -715,11 +724,22 @@ async def process_domain(
             tech_info['tech_scan_completeness'] = scan_comp_flag
 
         cache_tech_recovered = False
-        if not tech_info['has_ga4'] and cache_store is not None:
+        if (not tech_info['has_ga4'] or not tech_info.get('detected_cms')) and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies')):
+                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
+                        # Якщо GA4 вже знайдено live, але під час partial_timeout втрачено CMS (напр. Shopify на Glossier) — підтягуємо лише CMS
+                        if tech_info['has_ga4'] and not tech_info.get('detected_cms') and c_rec.get('detected_cms'):
+                            c_cms_str = c_rec.get('detected_cms')
+                            c_cms_list = [x.strip() for x in c_cms_str.split(';') if x.strip()]
+                            tech_info['detected_cms'] = c_cms_str
+                            tech_info['detected_cms_list'] = c_cms_list
+                            for cms_item in c_cms_list:
+                                if cms_item not in tech_info['detected_technologies_list']:
+                                    tech_info['detected_technologies_list'].append(cms_item)
+                            break
+
                         raw_t = c_rec.get('detected_technologies') or ''
                         valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
                         cached_techs = [
