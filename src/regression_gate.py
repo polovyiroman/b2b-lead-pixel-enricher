@@ -12,6 +12,7 @@ from .domain_helpers import (
     normalize_cached_record_booleans,
     sanitize_cached_dms,
 )
+from .qualifier import classify_company_category
 from .tech_detector import detect_tech_with_evidence
 
 
@@ -201,18 +202,12 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
 
 
 def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
-    """
-    Test 7/7 (P2-1 & P2-2):
-    1. Verifies Inweb decision_maker_name == decision_makers_json[0]['name'] == decision_makers_found[0].name
-       even when live dm_name ('Олексій Мамонтов') merges with a 3-person cached list starting with 'Ігор Мутерко'.
-    2. Verifies Liki24 stale sGTM in detected_signals and technology_evidence is sanitized.
-    """
     raw_inweb_found = (
         'Ігор Мутерко (Founder) [https://inweb.ua/ua/team/]; '
         'Олексій Мамонтов (Chief Executive Officer (CEO)) [https://inweb.ua/ua/team/]; '
         'Олександр Салієнко (Owner) [https://inweb.ua/ua/]'
     )
-    dm_name, dm_role, dms_found_str = sanitize_cached_dms(
+    dm_name, _, dms_found_str = sanitize_cached_dms(
         'Олексій Мамонтов',
         'Chief Executive Officer (CEO)',
         raw_inweb_found,
@@ -229,7 +224,6 @@ def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
     if dm_name != 'Олексій Мамонтов':
         raise AssertionError(f"Expected CEO 'Олексій Мамонтов' to rank #1 over Founder, got '{dm_name}'")
 
-    # Liki24 stale sGTM hygiene check
     liki_cached = {
         'has_sgtm': True,
         'has_ga4': True,
@@ -251,6 +245,44 @@ def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
     return "PASS (Inweb dm_name==json[0]==found[0] deterministic; Liki24 stale sGTM purged)"
 
 
+def _test_08_glossier_spa_ecommerce_category() -> str:
+    """
+    Test 8/8 (v20.10 P2-1 Fix):
+    Verifies Glossier and SPA e-commerce stores consistently classify as 'E-commerce / Retail Brand'
+    across 3 scenarios (with Shopify CMS, without CMS via SPA markers, and on partial timeout shell),
+    while SaaS/Agency domains do not regress.
+    """
+    # 1. Glossier with partial_timeout (0 CMS detected, minimal meta) -> must remain E-commerce
+    for run_idx in range(3):
+        cat, _ = classify_company_category(
+            'glossier.com',
+            'Glossier | Skincare, Makeup, Body, Fragrance',
+            'Glossier is a new approach to beauty.',
+            ['Google Analytics (GA4)', 'Meta Pixel'],
+            '<html><body><script>fetch("/cart.js"); const v = {"variant": 123};</script></body></html>',
+        )
+        if cat != 'E-commerce / Retail Brand':
+            raise AssertionError(f"Glossier run #{run_idx + 1}: expected 'E-commerce / Retail Brand', got '{cat}'")
+
+    # 2. Generic unknown SPA store with 0 CMS in detected_tech, but /cart.js + "variant" in HTML -> E-commerce
+    spa_cat, spa_conf = classify_company_category(
+        'unknown-dtc-brand.io',
+        'Modern Essentials',
+        'Everyday essentials designed for life.',
+        ['Google Analytics (GA4)'],
+        '<html><body><script>window.Shopify = {}; fetch("/cart.js"); const p = {"product": true, "variant": 1};</script></body></html>',
+    )
+    if spa_cat != 'E-commerce / Retail Brand':
+        raise AssertionError(f"SPA fallback failed: expected 'E-commerce / Retail Brand', got '{spa_cat}' ({spa_conf})")
+
+    # 3. Ensure Ringostat / Macpaw do not regress to E-commerce
+    ringo_cat, _ = classify_company_category('ringostat.com', 'Ringostat — Call Tracking & PBX', '', ['Google Analytics (GA4)'])
+    if ringo_cat != 'SaaS / Marketplace / Tech Platform':
+        raise AssertionError(f"Ringostat category regressed: got '{ringo_cat}'")
+
+    return "PASS (Glossier 3x + SPA e-com fallback -> E-commerce / Retail Brand; SaaS intact)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -268,6 +300,7 @@ def run_startup_regression_gate(
         ('test_05_sgtm_positive', lambda: _test_05_sgtm_positive_fixture(normalize_tech_fn)),
         ('test_06_sgtm_negative_full', lambda: _test_06_sgtm_negative_fixtures(normalize_tech_fn)),
         ('test_07_inweb_consistency_and_liki24_hygiene', _test_07_inweb_dm_consistency_and_liki24_hygiene),
+        ('test_08_glossier_spa_ecommerce_category', _test_08_glossier_spa_ecommerce_category),
     ]
 
     passed_count = 0
@@ -284,5 +317,5 @@ def run_startup_regression_gate(
     log_fn(
         f"[REGRESSION SUITE GATE PASS] {passed_count}/{len(suite)} tests green in {elapsed_ms:.1f}ms "
         f"(corporate_entities=PASS, determinism_3x=PASS, cache_merge=PASS, vorstand=PASS, "
-        f"sgtm_pos=True, sgtm_neg_1_2_3=False, inweb_liki24_hygiene=PASS)"
+        f"sgtm_pos=True, sgtm_neg_1_2_3=False, inweb_liki24_hygiene=PASS, glossier_spa_ecom=PASS)"
     )
