@@ -98,20 +98,29 @@ def _test_02_determinism_ottogroup_3x() -> str:
 
 def _test_03_cache_merge_completeness_and_empty_render(
     normalize_tech_fn: Callable[[dict], None],
-    resolve_cache_comp_fn: Callable[[bool, bool, bool, bool, str], str],
+    resolve_cache_comp_fn: Callable[..., str],
 ) -> str:
-    comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked')
+    # Case A: Cache has GA4=True, live scan failed (has_ga4_live=False, pw_used=False) -> MUST be 'partial_cached'
+    comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked', False)
     if comp_comfy != 'partial_cached':
         raise AssertionError(f"Comfy case: expected 'partial_cached', got '{comp_comfy}'")
 
-    comp_liki = resolve_cache_comp_fn(True, True, False, False, 'full')
+    # Case B: PW rendered shell (pw_used=True), but live_found_something=False & has_ga4_live=False -> MUST be 'partial_cached'
+    comp_liki = resolve_cache_comp_fn(True, True, False, False, 'full', False)
     if comp_liki != 'partial_cached':
         raise AssertionError(f"Liki24 cache-only case: expected 'partial_cached', got '{comp_liki}'")
 
-    comp_clean = resolve_cache_comp_fn(True, True, False, True, 'full')
-    if comp_clean != 'full':
-        raise AssertionError(f"Clean live case: expected 'full', got '{comp_clean}'")
+    # Case C (v20.11 P0 Fix): Macpaw/Kasta curl succeeded (pw_used=False, pw_had_timeout=False, has_ga4_live=True) -> MUST be 'full'
+    comp_macpaw_curl = resolve_cache_comp_fn(True, False, False, True, 'full', True)
+    if comp_macpaw_curl != 'full':
+        raise AssertionError(f"Macpaw curl-clean live case: expected 'full', got '{comp_macpaw_curl}'")
 
+    # Case D: PW rendered clean AND has_ga4_live=True -> 'full'
+    comp_pw_clean = resolve_cache_comp_fn(True, True, False, True, 'full', True)
+    if comp_pw_clean != 'full':
+        raise AssertionError(f"Clean PW live case: expected 'full', got '{comp_pw_clean}'")
+
+    # Case E: 0 techs detected with 'full' -> must downgrade to 'partial_empty_render'
     empty_tech_info = {
         'detected_technologies_list': [],
         'tech_scan_completeness': 'full',
@@ -126,7 +135,7 @@ def _test_03_cache_merge_completeness_and_empty_render(
     if empty_tech_info.get('has_ga4') is not None:
         raise AssertionError(f"Expected has_ga4=None on partial_empty_render, got {empty_tech_info.get('has_ga4')}")
 
-    return "PASS (partial_cached enforced on failed/empty live; partial_empty_render on 0-tech scan)"
+    return "PASS (Macpaw curl-clean->full; Comfy/Liki24 cache->partial_cached; 0-tech->partial_empty_render)"
 
 
 def _test_04_vorstand_role_extraction() -> str:
@@ -246,13 +255,6 @@ def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
 
 
 def _test_08_glossier_spa_ecommerce_category() -> str:
-    """
-    Test 8/8 (v20.10 P2-1 Fix):
-    Verifies Glossier and SPA e-commerce stores consistently classify as 'E-commerce / Retail Brand'
-    across 3 scenarios (with Shopify CMS, without CMS via SPA markers, and on partial timeout shell),
-    while SaaS/Agency domains do not regress.
-    """
-    # 1. Glossier with partial_timeout (0 CMS detected, minimal meta) -> must remain E-commerce
     for run_idx in range(3):
         cat, _ = classify_company_category(
             'glossier.com',
@@ -264,7 +266,6 @@ def _test_08_glossier_spa_ecommerce_category() -> str:
         if cat != 'E-commerce / Retail Brand':
             raise AssertionError(f"Glossier run #{run_idx + 1}: expected 'E-commerce / Retail Brand', got '{cat}'")
 
-    # 2. Generic unknown SPA store with 0 CMS in detected_tech, but /cart.js + "variant" in HTML -> E-commerce
     spa_cat, spa_conf = classify_company_category(
         'unknown-dtc-brand.io',
         'Modern Essentials',
@@ -275,7 +276,6 @@ def _test_08_glossier_spa_ecommerce_category() -> str:
     if spa_cat != 'E-commerce / Retail Brand':
         raise AssertionError(f"SPA fallback failed: expected 'E-commerce / Retail Brand', got '{spa_cat}' ({spa_conf})")
 
-    # 3. Ensure Ringostat / Macpaw do not regress to E-commerce
     ringo_cat, _ = classify_company_category('ringostat.com', 'Ringostat — Call Tracking & PBX', '', ['Google Analytics (GA4)'])
     if ringo_cat != 'SaaS / Marketplace / Tech Platform':
         raise AssertionError(f"Ringostat category regressed: got '{ringo_cat}'")
@@ -283,10 +283,32 @@ def _test_08_glossier_spa_ecommerce_category() -> str:
     return "PASS (Glossier 3x + SPA e-com fallback -> E-commerce / Retail Brand; SaaS intact)"
 
 
+def _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn: Callable[[dict], None]) -> str:
+    """
+    Test 9/9 (v20.11 P0 Guard):
+    Verifies a custom site without CMS (like macpaw.com, readdle.com, kasta.ua) where curl found GTM+GA4
+    (pw_used_flag=False) stays tech_scan_completeness == 'full' and never gets downgraded to 'partial_cached'.
+    """
+    html = (
+        '<html><head>'
+        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-KW4BC5"></script>'
+        '<script src="https://www.googletagmanager.com/gtag/js?id=G-1QQT66XX0W"></script>'
+        '</head><body>MacPaw</body></html>'
+    )
+    info = detect_tech_with_evidence(html, '', ['GTM-KW4BC5'], 'https://macpaw.com/', 'full')
+    normalize_tech_fn(info)
+    if info.get('has_ga4') is not True or info.get('detected_cms') is not None:
+        raise AssertionError(f"Unexpected initial Macpaw fixture state: {info}")
+    if info.get('tech_scan_completeness') != 'full':
+        raise AssertionError(f"Expected 'full' completeness for curl-clean Macpaw fixture, got '{info.get('tech_scan_completeness')}'")
+
+    return "PASS (Custom site with live GTM+GA4 and detected_cms=None stays 'full')"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
-    resolve_cache_comp_fn: Callable[[bool, bool, bool, bool, str], str],
+    resolve_cache_comp_fn: Callable[..., str],
 ) -> None:
     t0 = time.monotonic()
     suite = [
@@ -301,6 +323,7 @@ def run_startup_regression_gate(
         ('test_06_sgtm_negative_full', lambda: _test_06_sgtm_negative_fixtures(normalize_tech_fn)),
         ('test_07_inweb_consistency_and_liki24_hygiene', _test_07_inweb_dm_consistency_and_liki24_hygiene),
         ('test_08_glossier_spa_ecommerce_category', _test_08_glossier_spa_ecommerce_category),
+        ('test_09_curl_clean_live_without_cms_stays_full', lambda: _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn)),
     ]
 
     passed_count = 0
@@ -315,7 +338,5 @@ def run_startup_regression_gate(
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     log_fn(
-        f"[REGRESSION SUITE GATE PASS] {passed_count}/{len(suite)} tests green in {elapsed_ms:.1f}ms "
-        f"(corporate_entities=PASS, determinism_3x=PASS, cache_merge=PASS, vorstand=PASS, "
-        f"sgtm_pos=True, sgtm_neg_1_2_3=False, inweb_liki24_hygiene=PASS, glossier_spa_ecom=PASS)"
+        f"[REGRESSION SUITE GATE PASS] {passed_count}/{len(suite)} tests green in {elapsed_ms:.1f}ms"
     )
