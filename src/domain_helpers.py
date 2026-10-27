@@ -108,10 +108,6 @@ def sanitize_stale_sgtm_strings(
     detected_signals: str | None,
     technology_evidence: str | None
 ) -> tuple[str | None, str | None]:
-    """
-    P2-2 Fix (Liki24 hygiene): Видаляє застарілі згадки 'sGTM' із текстових полів
-    detected_signals та technology_evidence, якщо кеш був записаний у v20.6 до виправлення регулярки.
-    """
     clean_sig = detected_signals
     if clean_sig and 'sGTM' in clean_sig:
         clean_sig = re.sub(r'(?:,\s*sGTM\b|\bsGTM\s*,\s*|\bsGTM\b)', '', clean_sig).strip(', ')
@@ -150,13 +146,7 @@ def resolve_cache_merged_completeness(
     return current_comp if current_comp != 'full' else 'partial_gtm'
 
 
-def _dm_ deterministic_sort_key(item: tuple[str, str, str], primary_li_url: str | None) -> tuple[int, int, str]:
-    """
-    Детерміноване сортування кандидатів у кеші та живому списку:
-    1. Наявність верифікованого LinkedIn URL (+60)
-    2. Вага ролі: Marketing/CMO (24) > CEO/Managing Director (20) > Founder/Co-Founder (18) > Owner (16) > Інші (5)
-    3. Алфавітний порядок імені (tie-breaker)
-    """
+def _dm_deterministic_sort_key(item: tuple[str, str, str], primary_li_url: str | None) -> tuple[int, int, str]:
     name, role, _ = item
     has_li = 1 if (primary_li_url and verify_person_linkedin_match(name, primary_li_url)) else 0
     role_low = (role or '').lower()
@@ -182,11 +172,6 @@ def sanitize_cached_dms(
     brand_root: str = '',
     primary_li_url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
-    """
-    P2-1 Fix (Single Source of Truth):
-    Очищує та детерміновано сортує список DMs, гарантуючи строгий інваріант:
-    decision_maker_name == clean_parts[0].name == decision_makers_json[0].name.
-    """
     clean_primary_name = None
     if raw_dm_name:
         cand = strip_role_tokens_from_name(str(raw_dm_name))
@@ -221,7 +206,6 @@ def sanitize_cached_dms(
 
     if clean_parts:
         clean_parts = sorted(clean_parts, key=lambda item: _dm_deterministic_sort_key(item, primary_li_url))
-        # СТРОГИЙ ІНВАРІАНТ: Primary DM завжди дорівнює першому елементу відсортованого списку!
         clean_primary_name = clean_parts[0][0]
         clean_primary_role = clean_parts[0][1]
         clean_dms_str = '; '.join(f'{n} ({r}) [{u}]' for n, r, u in clean_parts)
@@ -484,7 +468,6 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
     techs_set = set(techs_list)
     if not valid_sgtm:
         cached_copy['has_sgtm'] = False
-        # P2-2 Fix: Очищуємо застарілі рядки detected_signals та technology_evidence від sGTM
         clean_sig, clean_ev = sanitize_stale_sgtm_strings(
             cached_copy.get('detected_signals'),
             cached_copy.get('technology_evidence')
