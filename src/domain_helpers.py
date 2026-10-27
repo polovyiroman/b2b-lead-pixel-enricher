@@ -14,6 +14,7 @@ from .contacts import (
     is_valid_person_name,
     normalize_executive_role,
     strip_role_tokens_from_name,
+    verify_person_linkedin_match,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -103,6 +104,31 @@ def has_verified_sgtm_in_cache(c_rec: dict) -> bool:
     return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
 
 
+def sanitize_stale_sgtm_strings(
+    detected_signals: str | None,
+    technology_evidence: str | None
+) -> tuple[str | None, str | None]:
+    """
+    P2-2 Fix (Liki24 hygiene): Видаляє застарілі згадки 'sGTM' із текстових полів
+    detected_signals та technology_evidence, якщо кеш був записаний у v20.6 до виправлення регулярки.
+    """
+    clean_sig = detected_signals
+    if clean_sig and 'sGTM' in clean_sig:
+        clean_sig = re.sub(r'(?:,\s*sGTM\b|\bsGTM\s*,\s*|\bsGTM\b)', '', clean_sig).strip(', ')
+        if not clean_sig:
+            clean_sig = 'None detected'
+
+    clean_ev = technology_evidence
+    if clean_ev and 'Server-Side GTM (sGTM):' in clean_ev:
+        parts = [
+            p.strip() for p in clean_ev.split('|')
+            if p.strip() and not p.strip().startswith('Server-Side GTM (sGTM):')
+        ]
+        clean_ev = ' | '.join(parts) if parts else None
+
+    return clean_sig, clean_ev
+
+
 def normalize_pw_empty_status(raw_status: str, html_str: str | None) -> str:
     if raw_status == 'launched_empty':
         return 'launched_empty_shell'
@@ -124,12 +150,43 @@ def resolve_cache_merged_completeness(
     return current_comp if current_comp != 'full' else 'partial_gtm'
 
 
+def _dm_ deterministic_sort_key(item: tuple[str, str, str], primary_li_url: str | None) -> tuple[int, int, str]:
+    """
+    Детерміноване сортування кандидатів у кеші та живому списку:
+    1. Наявність верифікованого LinkedIn URL (+60)
+    2. Вага ролі: Marketing/CMO (24) > CEO/Managing Director (20) > Founder/Co-Founder (18) > Owner (16) > Інші (5)
+    3. Алфавітний порядок імені (tie-breaker)
+    """
+    name, role, _ = item
+    has_li = 1 if (primary_li_url and verify_person_linkedin_match(name, primary_li_url)) else 0
+    role_low = (role or '').lower()
+    if 'supervisory' in role_low or 'aufsichtsrat' in role_low:
+        r_weight = -30
+    elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
+        r_weight = 24
+    elif any(k in role_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president')):
+        r_weight = 20
+    elif any(k in role_low for k in ('founder', 'co-founder')):
+        r_weight = 18
+    elif 'owner' in role_low:
+        r_weight = 16
+    else:
+        r_weight = 5
+    return (-has_li, -r_weight, name)
+
+
 def sanitize_cached_dms(
     raw_dm_name: str | None,
     raw_dm_role: str | None,
     raw_dms_found: str | None,
-    brand_root: str = ''
+    brand_root: str = '',
+    primary_li_url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
+    """
+    P2-1 Fix (Single Source of Truth):
+    Очищує та детерміновано сортує список DMs, гарантуючи строгий інваріант:
+    decision_maker_name == clean_parts[0].name == decision_makers_json[0].name.
+    """
     clean_primary_name = None
     if raw_dm_name:
         cand = strip_role_tokens_from_name(str(raw_dm_name))
@@ -138,8 +195,8 @@ def sanitize_cached_dms(
 
     clean_primary_role = normalize_executive_role(raw_dm_role) if raw_dm_role else None
 
-    clean_parts = []
-    seen_names = set()
+    clean_parts: list[tuple[str, str, str]] = []
+    seen_names: set[str] = set()
     if raw_dms_found:
         for chunk in str(raw_dms_found).split(';'):
             chunk = chunk.strip()
@@ -158,14 +215,19 @@ def sanitize_cached_dms(
             c_role = normalize_executive_role(c_role_raw) or c_role_raw
             clean_parts.append((c_name, c_role, c_url))
 
-    if not clean_primary_name and clean_parts:
+    if clean_primary_name and clean_primary_name.lower() not in seen_names:
+        clean_parts.insert(0, (clean_primary_name, clean_primary_role or 'Executive', ''))
+        seen_names.add(clean_primary_name.lower())
+
+    if clean_parts:
+        clean_parts = sorted(clean_parts, key=lambda item: _dm_deterministic_sort_key(item, primary_li_url))
+        # СТРОГИЙ ІНВАРІАНТ: Primary DM завжди дорівнює першому елементу відсортованого списку!
         clean_primary_name = clean_parts[0][0]
         clean_primary_role = clean_parts[0][1]
+        clean_dms_str = '; '.join(f'{n} ({r}) [{u}]' for n, r, u in clean_parts)
+        return clean_primary_name, clean_primary_role, clean_dms_str
 
-    clean_dms_str = '; '.join(f'{n} ({r}) [{u}]' for n, r, u in clean_parts) if clean_parts else (
-        f'{clean_primary_name} ({clean_primary_role or "Executive"}) []' if clean_primary_name else None
-    )
-    return clean_primary_name, clean_primary_role, clean_dms_str
+    return None, None, None
 
 
 def contact_link_priority(url: str) -> tuple[int, int]:
@@ -422,6 +484,13 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
     techs_set = set(techs_list)
     if not valid_sgtm:
         cached_copy['has_sgtm'] = False
+        # P2-2 Fix: Очищуємо застарілі рядки detected_signals та technology_evidence від sGTM
+        clean_sig, clean_ev = sanitize_stale_sgtm_strings(
+            cached_copy.get('detected_signals'),
+            cached_copy.get('technology_evidence')
+        )
+        cached_copy['detected_signals'] = clean_sig
+        cached_copy['technology_evidence'] = clean_ev
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
