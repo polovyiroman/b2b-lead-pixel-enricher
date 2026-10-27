@@ -3,9 +3,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
-import os
 import re
-import time
 from urllib.parse import urlparse
 from apify import Actor
 from curl_cffi.requests import AsyncSession
@@ -14,14 +12,11 @@ from .config import (
     CACHE_SCHEMA_VERSION,
     DEFAULT_MANUAL_SEEDS,
     DM_SOURCE_BLACKLIST,
-    EU_GDPR_TLDS,
     EVERGREEN_MAX_AGE_DAYS,
     GTM_ID_REGEX,
-    KNOWN_JURISDICTION_HINTS,
     KNOWN_MARKETPLACE_DOMAINS,
     MIN_COMPATIBLE_CACHE_SCHEMA,
     PUBLIC_WEBMAIL_DOMAINS,
-    SGTM_CUSTOM_LOADER_REGEX,
     clean_url_port,
     compute_snapshot_age_days,
     is_valid_gtm_id,
@@ -35,12 +30,31 @@ from .contacts import (
     classify_email_type,
     extract_decision_maker_deep,
     extract_named_email_owner_hint,
-    is_valid_person_name,
-    normalize_executive_role,
     rank_and_clean_emails,
-    strip_role_tokens_from_name,
     verify_email_deliverability_deep,
     verify_person_email_match,
+)
+from .domain_helpers import (
+    KNOWN_PW_HOPELESS,
+    PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN,
+    build_compliance_note,
+    build_timeout_stub,
+    compute_google_ads_confidence,
+    contact_link_priority,
+    derive_gdpr_jurisdiction,
+    derive_human_contact_tier,
+    derive_pii_fields,
+    detect_country_hint,
+    domain_weight,
+    guess_region_from_domain,
+    has_verified_sgtm_in_cache,
+    normalize_cached_record_booleans,
+    normalize_pw_empty_status,
+    normalize_tech_info_booleans,
+    remaining_run_seconds,
+    resolve_cache_merged_completeness,
+    resolve_effective_phone_region,
+    sanitize_cached_dms,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -75,526 +89,6 @@ from .tech_detector import (
     build_summary_from_cached_record,
     detect_tech_with_evidence,
 )
-
-TECH_FLAG_TO_NAME_MAP = (
-    ('has_meta_pixel', 'Meta Pixel'),
-    ('has_tiktok_pixel', 'TikTok Pixel'),
-    ('has_google_ads', 'Google Ads Conversion'),
-    ('has_linkedin_pixel', 'LinkedIn Insight Tag'),
-    ('has_pinterest_tag', 'Pinterest Tag'),
-    ('has_hubspot', 'HubSpot'),
-    ('has_klaviyo', 'Klaviyo'),
-    ('has_ga4', 'Google Analytics (GA4)'),
-    ('has_gtm', 'Google Tag Manager'),
-    ('has_sgtm', 'Server-Side GTM (sGTM)'),
-)
-
-COMPLIANCE_DEFAULT_NOTE = (
-    'Enriched for legitimate B2B interest from public site data; '
-    'jurisdiction hint reflects operational/market HQ (verify registered legal entity for DPA); '
-    'deletion on request via support'
-)
-
-COMPLIANCE_DE_UWG_NOTE = (
-    'DE Market Notice (GDPR + German UWG §7): Unsolicited B2B cold email requires prior express consent in Germany; '
-    'prioritize LinkedIn outbound or telephone discovery (presumed consent for B2B relevance). '
-    'Deletion on request via support'
-)
-
-EU_PHONE_PREFIXES = (
-    '+49', '+33', '+39', '+34', '+31', '+32', '+43', '+48', '+46',
-    '+45', '+358', '+351', '+420', '+36', '+40', '+421', '+353',
-    '+30', '+359', '+385', '+370', '+371', '+372', '+386', '+352'
-)
-
-KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
-    'bol.com': 'NL',
-    'coolblue.nl': 'NL',
-    'liki24.com': 'UA',
-    'ringostat.com': 'UA',
-    'cher17.com': 'UA',
-    'ottogroup.com': 'DE',
-    'aboutyou.de': 'DE',
-    'zalando.de': 'DE',
-    'otto.de': 'DE',
-    'docmorris.de': 'DE',
-    'asos.com': 'GB',
-    'laredoute.fr': 'FR',
-    'unicredit.it': 'IT',
-}
-
-KNOWN_PW_HOPELESS = {
-    'coolblue.nl',
-    'otto.de',
-}
-
-PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
-MIN_VALID_RESCUE_HTML_BYTES = 2500
-
-
-def _domain_weight(item: tuple[str, str, list[str]]) -> tuple[int, str]:
-    domain_key = item[0].lower()
-    is_heavy = (
-        domain_key.endswith(('.de', '.fr', '.it', '.nl', '.uk', '.co.uk'))
-        or domain_key in {'bol.com', 'asos.com', 'grammarly.com', 'glossier.com', 'rozetka.com.ua', 'comfy.ua', 'intertop.ua', 'liki24.com'}
-    )
-    return (1 if is_heavy else 0, domain_key)
-
-
-def _build_compliance_note(canonical_domain: str, country_hint: str) -> str:
-    dom_low = (canonical_domain or '').lower()
-    if dom_low.endswith('.de') or (country_hint or '').upper() == 'DE':
-        return COMPLIANCE_DE_UWG_NOTE
-    return COMPLIANCE_DEFAULT_NOTE
-
-
-def _has_verified_sgtm_in_cache(c_rec: dict) -> bool:
-    if not c_rec.get('has_sgtm'):
-        return False
-    ev_str = str(c_rec.get('technology_evidence') or '')
-    return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
-
-
-def _normalize_pw_empty_status(raw_status: str, html_str: str | None) -> str:
-    """
-    Завдання 6 (P2): Уніфікує 'launched_empty' та 'rendered' з порожньою оболонкою (<2500B)
-    у єдиний канонічний статус 'launched_empty_shell'.
-    """
-    if raw_status == 'launched_empty':
-        return 'launched_empty_shell'
-    if raw_status == 'rendered' and (not html_str or len(html_str) < MIN_VALID_RESCUE_HTML_BYTES):
-        return 'launched_empty_shell'
-    return raw_status
-
-
-def resolve_cache_merged_completeness(
-    has_ga4_merged: bool,
-    pw_used_flag: bool,
-    pw_had_timeout_or_block: bool,
-    live_found_something: bool,
-    current_comp: str,
-) -> str:
-    """
-    Завдання 2 & 6: Визначає tech_scan_completeness при відновленні технологій із кешу.
-    Повертає 'full' ТІЛЬКИ якщо Playwright чисто відрендерив сторінку І живий скан сам знайшов теги.
-    Інакше повертає 'partial_cached'.
-    """
-    if has_ga4_merged:
-        live_was_clean = pw_used_flag and not pw_had_timeout_or_block and live_found_something
-        return 'full' if live_was_clean else 'partial_cached'
-    return current_comp if current_comp != 'full' else 'partial_gtm'
-
-
-def _sanitize_cached_dms(
-    raw_dm_name: str | None,
-    raw_dm_role: str | None,
-    raw_dms_found: str | None,
-    brand_root: str = ''
-) -> tuple[str | None, str | None, str | None]:
-    """
-    P3 Cleanup: Очищує кешовані DMs без жодного хардкоду конкретних імен —
-    використовує загальні правила strip_role_tokens_from_name() та is_valid_person_name().
-    """
-    clean_primary_name = None
-    if raw_dm_name:
-        cand = strip_role_tokens_from_name(str(raw_dm_name))
-        if is_valid_person_name(cand, brand_root):
-            clean_primary_name = cand
-
-    clean_primary_role = normalize_executive_role(raw_dm_role) if raw_dm_role else None
-
-    clean_parts = []
-    seen_names = set()
-    if raw_dms_found:
-        for chunk in str(raw_dms_found).split(';'):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', chunk)
-            if not m:
-                continue
-            c_name_raw, c_role_raw, c_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-            c_name = strip_role_tokens_from_name(c_name_raw)
-            if not is_valid_person_name(c_name, brand_root):
-                continue
-            if c_name.lower() in seen_names:
-                continue
-            seen_names.add(c_name.lower())
-            c_role = normalize_executive_role(c_role_raw) or c_role_raw
-            clean_parts.append((c_name, c_role, c_url))
-
-    if not clean_primary_name and clean_parts:
-        clean_primary_name = clean_parts[0][0]
-        clean_primary_role = clean_parts[0][1]
-
-    clean_dms_str = '; '.join(f'{n} ({r}) [{u}]' for n, r, u in clean_parts) if clean_parts else (
-        f'{clean_primary_name} ({clean_primary_role or "Executive"}) []' if clean_primary_name else None
-    )
-    return clean_primary_name, clean_primary_role, clean_dms_str
-
-
-def _contact_link_priority(url: str) -> tuple[int, int]:
-    path = urlparse(url).path.lower()
-    if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
-        return (0, len(path))
-    if any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto', 'get-in-touch')):
-        return (1, len(path))
-    if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'zespol', 'equipe')):
-        return (2, len(path))
-    if any(k in path for k in ('about', 'ueber-uns', 'uber-uns', 'pro-nas', 'o-nas', 'qui-sommes-nous', 'chi-siamo', 'over-ons')):
-        return (3, len(path))
-    return (4, len(path))
-
-
-def _guess_region_from_domain(canonical_domain: str, html_sample: str = '') -> str | None:
-    dom_low = (canonical_domain or '').lower()
-    if dom_low in KNOWN_DOMAIN_COUNTRY_HINTS:
-        return KNOWN_DOMAIN_COUNTRY_HINTS[dom_low]
-    if dom_low.endswith('.ua'):
-        return 'UA'
-    if dom_low.endswith('.de'):
-        return 'DE'
-    if dom_low.endswith('.at'):
-        return 'AT'
-    if dom_low.endswith('.ch'):
-        return 'CH'
-    if dom_low.endswith('.it'):
-        return 'IT'
-    if dom_low.endswith('.fr'):
-        return 'FR'
-    if dom_low.endswith('.es'):
-        return 'ES'
-    if dom_low.endswith('.nl'):
-        return 'NL'
-    if dom_low.endswith('.be'):
-        return 'BE'
-    if dom_low.endswith('.pl'):
-        return 'PL'
-    if dom_low.endswith('.pt'):
-        return 'PT'
-    if dom_low.endswith('.se'):
-        return 'SE'
-    if dom_low.endswith('.no'):
-        return 'NO'
-    if dom_low.endswith('.dk'):
-        return 'DK'
-    if dom_low.endswith('.fi'):
-        return 'FI'
-    if dom_low.endswith('.cz'):
-        return 'CZ'
-    if dom_low.endswith('.ro'):
-        return 'RO'
-    if dom_low.endswith('.hu'):
-        return 'HU'
-    if dom_low.endswith('.ie'):
-        return 'IE'
-    if dom_low.endswith(('.uk', '.co.uk')):
-        return 'GB'
-
-    if html_sample:
-        html_head = html_sample[:2000].lower()
-        lang_match = re.search(r'<html[^>]+lang=["\']([a-z]{2})(?:[-_]([a-z]{2}))?', html_head)
-        if lang_match:
-            lang = lang_match.group(1).upper()
-            country_sub = (lang_match.group(2) or '').upper()
-            if country_sub in ('UA', 'DE', 'AT', 'CH', 'IT', 'FR', 'ES', 'NL', 'BE', 'PL', 'PT', 'SE', 'NO', 'DK', 'FI', 'GB', 'US'):
-                return country_sub
-            if lang in ('UK', 'UA'):
-                return 'UA'
-            if lang == 'DE':
-                return 'DE'
-            if lang == 'IT':
-                return 'IT'
-            if lang == 'FR':
-                return 'FR'
-            if lang == 'ES':
-                return 'ES'
-            if lang == 'NL':
-                return 'NL'
-            if lang == 'PL':
-                return 'PL'
-            if lang == 'PT':
-                return 'PT'
-            if lang == 'SV':
-                return 'SE'
-    return None
-
-
-def _resolve_effective_phone_region(
-    canonical_domain: str,
-    default_region: str,
-    html_sample: str = ''
-) -> str:
-    guessed = _guess_region_from_domain(canonical_domain, html_sample)
-    if guessed:
-        return guessed
-    return default_region if default_region else 'US'
-
-
-def _derive_gdpr_jurisdiction(
-    canonical_domain: str,
-    phone: str | None = None,
-    content_lang_hint: str = '',
-    html_sample: str = ''
-) -> str:
-    dom_low = (canonical_domain or '').lower()
-    if dom_low in KNOWN_JURISDICTION_HINTS:
-        return KNOWN_JURISDICTION_HINTS[dom_low]
-    if dom_low.endswith(('.uk', '.co.uk')):
-        return 'UK_GDPR'
-    if dom_low.endswith('.ch'):
-        return 'CH_FADP'
-    if dom_low.endswith(EU_GDPR_TLDS):
-        return 'EU_EEA_GDPR'
-    if dom_low.endswith('.ua'):
-        return 'UA_PDP'
-
-    phone_str = (phone or '').strip()
-    if phone_str.startswith('+44'):
-        return 'UK_GDPR'
-    if phone_str.startswith('+41'):
-        return 'CH_FADP'
-    if phone_str.startswith(EU_PHONE_PREFIXES):
-        return 'EU_EEA_GDPR'
-    if phone_str.startswith('+380'):
-        return 'UA_PDP'
-
-    hint_up = (content_lang_hint or '').upper().strip()
-    if hint_up in ('DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'PL', 'PT', 'SE', 'NO', 'DK', 'FI', 'CZ', 'RO', 'HU', 'SK', 'IE'):
-        return 'EU_EEA_GDPR'
-    if hint_up in ('GB', 'UK'):
-        return 'UK_GDPR'
-    if hint_up == 'CH':
-        return 'CH_FADP'
-    if hint_up == 'UA':
-        return 'UA_PDP'
-
-    if html_sample:
-        html_low = html_sample[:25000].lower()
-        if any(m in html_low for m in ('registered in england', 'london, uk', 'england and wales', 'asos.com limited')):
-            return 'UK_GDPR'
-        if any(m in html_low for m in ('impressum', 'handelsregister', 'amtsgericht', 'umsatzsteuer-id', 'gmbh & co. kg', 'otto group')):
-            return 'EU_EEA_GDPR'
-
-    return 'NON_EU_GLOBAL'
-
-
-def _derive_pii_fields(
-    best_email: str | None,
-    best_email_type: str | None,
-    dm_name: str | None,
-    primary_phone: str | None,
-    dm_linkedin_url: str | None
-) -> str:
-    fields = []
-    if dm_name:
-        fields.append('decision_maker_name')
-    if dm_linkedin_url:
-        fields.append('decision_maker_linkedin_url')
-    if best_email and best_email_type == 'personal_or_named_inbox':
-        fields.append('best_email (named_staff)')
-    if primary_phone:
-        fields.append('primary_phone (public_b2b)')
-    return '; '.join(fields) if fields else 'none (corporate_role_contacts_only)'
-
-
-def _derive_human_contact_tier(contact_quality_tier: str | None, company_category: str = '') -> str:
-    if company_category == 'B2B Agency / Marketing Media':
-        return 'Partner (Agency)'
-    if not contact_quality_tier:
-        return 'No Contact'
-    t_str = contact_quality_tier
-    if 'Tier A' in t_str:
-        return 'Hot'
-    if 'Tier B' in t_str:
-        return 'Warm'
-    if 'Tier C' in t_str:
-        return 'Cold'
-    if 'Tier D' in t_str:
-        return 'Do Not Contact'
-    return 'No Contact'
-
-
-def compute_google_ads_confidence(
-    has_ads: bool | None,
-    scan_completeness: str,
-    techs_found_count: int = 0,
-    consent_mode_likely: bool = False,
-    pw_rendered: bool = False
-) -> str:
-    if has_ads is True and scan_completeness == 'full':
-        return 'verified_present'
-    if has_ads is None:
-        return 'unknown'
-    if scan_completeness != 'full' or techs_found_count == 0:
-        return 'unknown'
-    if consent_mode_likely and not pw_rendered:
-        return 'not_observed_consent_gated'
-    return 'verified_absent'
-
-
-def detect_country_hint(
-    canonical_domain: str,
-    page_title: str,
-    meta_desc: str,
-    primary_phone: str | None,
-    html_sample: str = ''
-) -> str:
-    dom_low = canonical_domain.lower()
-    if dom_low in KNOWN_DOMAIN_COUNTRY_HINTS:
-        return KNOWN_DOMAIN_COUNTRY_HINTS[dom_low]
-    if dom_low.endswith('.ua'):
-        return 'UA'
-    if dom_low.endswith(('.de', '.at', '.ch')):
-        return 'DE'
-    if dom_low.endswith('.pl'):
-        return 'PL'
-    if dom_low.endswith('.fr'):
-        return 'FR'
-    if dom_low.endswith('.es'):
-        return 'ES'
-    if dom_low.endswith('.it'):
-        return 'IT'
-    if dom_low.endswith(('.nl', '.be')):
-        return 'NL'
-    if dom_low.endswith('.pt'):
-        return 'PT'
-    if dom_low.endswith(('.se', '.no', '.dk', '.fi')):
-        return 'SE'
-    if dom_low.endswith(('.uk', '.co.uk')):
-        return 'GB'
-
-    phone_str = primary_phone or ''
-    if phone_str.startswith('+380'):
-        return 'UA'
-    if phone_str.startswith(('+49', '+43', '+41')):
-        return 'DE'
-    if phone_str.startswith('+48'):
-        return 'PL'
-    if phone_str.startswith('+33'):
-        return 'FR'
-    if phone_str.startswith('+34'):
-        return 'ES'
-    if phone_str.startswith('+39'):
-        return 'IT'
-    if phone_str.startswith(('+31', '+32')):
-        return 'NL'
-    if phone_str.startswith('+44'):
-        return 'GB'
-
-    text_combined = f'{page_title} {meta_desc}'
-    if re.search(r'[іїєґІЇЄҐ]', text_combined):
-        return 'UA'
-    if re.search(r'[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', text_combined):
-        return 'PL'
-
-    html_head = html_sample[:2000].lower()
-    lang_match = re.search(r'<html[^>]+lang=["\']([a-z]{2})', html_head)
-    if lang_match:
-        lang = lang_match.group(1).upper()
-        if lang in ('UK', 'UA'):
-            return 'UA'
-        if lang == 'DE':
-            return 'DE'
-        if lang == 'PL':
-            return 'PL'
-        if lang == 'FR':
-            return 'FR'
-        if lang == 'ES':
-            return 'ES'
-        if lang == 'IT':
-            return 'IT'
-        if lang == 'NL':
-            return 'NL'
-        if lang == 'PT':
-            return 'PT'
-        if lang in ('SV', 'NO', 'NB', 'NN', 'DA', 'FI'):
-            return 'SE'
-
-    return ''
-
-
-def normalize_tech_info_booleans(tech_info: dict) -> None:
-    """
-    Завдання 5 (P2): Якщо techs_set порожній (0 знайдених технологій, як на unicredit.it / bol.com),
-    tech_scan_completeness не може залишатися 'full' — переводиться у 'partial_empty_render'.
-    """
-    techs_list = tech_info.get('detected_technologies_list') or []
-    techs_set = {t.strip() for t in techs_list if t and t.strip()}
-
-    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
-        is_found = (tech_label in techs_set) or bool(tech_info.get(flag_key))
-        if flag_key == 'has_ga4' and tech_info.get('all_ga4_ids'):
-            is_found = True
-        if is_found and tech_label not in techs_set:
-            techs_list.append(tech_label)
-            techs_set.add(tech_label)
-
-    has_ga4_found = ('Google Analytics (GA4)' in techs_set) or bool(tech_info.get('all_ga4_ids'))
-    has_gtm_found = 'Google Tag Manager' in techs_set
-    has_cookie = bool(tech_info.get('has_cookie_banner'))
-
-    if not techs_set and tech_info.get('tech_scan_completeness') == 'full':
-        tech_info['tech_scan_completeness'] = 'partial_empty_render'
-    elif not has_ga4_found and (has_gtm_found or has_cookie) and tech_info.get('tech_scan_completeness') == 'full':
-        tech_info['tech_scan_completeness'] = 'partial_gtm'
-
-    scan_comp = tech_info.get('tech_scan_completeness', 'full')
-    is_hard_partial = (
-        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm', 'partial_empty_render')
-        or not techs_set
-    )
-
-    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
-        is_found = tech_label in techs_set
-        tech_info[flag_key] = True if is_found else (None if is_hard_partial else False)
-
-    tech_info['detected_technologies_list'] = techs_list
-
-
-def normalize_cached_record_booleans(cached_copy: dict) -> None:
-    raw_tech_str = cached_copy.get('detected_technologies') or ''
-    valid_sgtm = _has_verified_sgtm_in_cache(cached_copy)
-    techs_list = [
-        x.strip() for x in raw_tech_str.split(';')
-        if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_sgtm)
-    ]
-    techs_set = set(techs_list)
-    if not valid_sgtm:
-        cached_copy['has_sgtm'] = False
-
-    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
-        is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
-        if flag_key == 'has_ga4' and cached_copy.get('all_ga4_ids'):
-            is_found = True
-        if is_found and tech_label not in techs_set:
-            techs_list.append(tech_label)
-            techs_set.add(tech_label)
-
-    has_ga4_found = ('Google Analytics (GA4)' in techs_set) or bool(cached_copy.get('all_ga4_ids'))
-    has_gtm_found = 'Google Tag Manager' in techs_set
-    has_cookie = bool(cached_copy.get('consent_mode_likely'))
-
-    if not techs_set and cached_copy.get('tech_scan_completeness', 'full') == 'full':
-        cached_copy['tech_scan_completeness'] = 'partial_empty_render'
-    elif not has_ga4_found and (has_gtm_found or has_cookie) and cached_copy.get('tech_scan_completeness', 'full') == 'full':
-        cached_copy['tech_scan_completeness'] = 'partial_gtm'
-
-    has_cached_tech = bool(has_gtm_found or has_ga4_found)
-    if not has_cached_tech and cached_copy.get('tech_scan_completeness') == 'full':
-        cached_copy['tech_scan_completeness'] = 'partial_cached'
-
-    scan_comp = cached_copy.get('tech_scan_completeness', 'full')
-    is_hard_partial = (
-        scan_comp in ('partial_timeout', 'partial_blocked', 'partial_cached', 'partial_gtm', 'partial_empty_render')
-        or not techs_set
-    )
-
-    for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
-        is_found = tech_label in techs_set
-        cached_copy[flag_key] = True if is_found else (None if is_hard_partial else False)
-
-    cached_copy['detected_technologies'] = '; '.join(techs_list) if techs_list else None
 
 
 async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None:
@@ -647,7 +141,7 @@ async def process_domain(
             else:
                 rescue_url = clean_url_port(root_url) or root_url
                 pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
-                rescue_locale = pw_locale_for_region(_guess_region_from_domain(canonical_domain) or default_region)
+                rescue_locale = pw_locale_for_region(guess_region_from_domain(canonical_domain) or default_region)
                 Actor.log.info(
                     f'HTTP/Curl status={status} for {canonical_domain} ({short_err_msg}); '
                     f'attempting Playwright rescue on {rescue_url} (locale={rescue_locale}, start_res={status != 0})'
@@ -667,7 +161,7 @@ async def process_domain(
                     start_residential=(status != 0),
                 )
                 pw_attempts_count += pw_rescue_attempts
-                pw_rescue_status = _normalize_pw_empty_status(pw_rescue_status, pw_rescue_html)
+                pw_rescue_status = normalize_pw_empty_status(pw_rescue_status, pw_rescue_html)
                 if pw_rescue_status == 'rendered' and pw_rescue_html:
                     Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                     status = 200
@@ -719,41 +213,20 @@ async def process_domain(
                     seed_match.get('primary_phone'),
                     ''
                 )
-                _seed_jur = _derive_gdpr_jurisdiction(
-                    canonical_domain,
-                    seed_match.get('primary_phone'),
-                    _seed_hint,
-                    ''
-                )
+                _seed_jur = derive_gdpr_jurisdiction(canonical_domain, seed_match.get('primary_phone'), _seed_hint, '')
                 _seed_is_eu = _seed_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
                 seeded_rec = build_manual_seed_record(
-                    seed_match,
-                    domain_key,
-                    canonical_domain,
-                    aliases_str,
-                    clean_website_url,
-                    normalized_final_redirect,
-                    was_redirected,
-                    redirect_chain_str,
-                    _seed_is_eu,
-                    fail_status,
-                    short_err_msg,
-                    checked_at,
-                    is_playwright_available()
+                    seed_match, domain_key, canonical_domain, aliases_str, clean_website_url,
+                    normalized_final_redirect, was_redirected, redirect_chain_str, _seed_is_eu,
+                    fail_status, short_err_msg, checked_at, is_playwright_available()
                 )
-                _seed_tech_count = len(
-                    [x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()]
-                )
+                _seed_tech_count = len([x.strip() for x in (seeded_rec.get('detected_technologies') or '').split(';') if x.strip()])
                 seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
-                    seeded_rec.get('has_google_ads'),
-                    seeded_rec.get('tech_scan_completeness', 'full'),
-                    _seed_tech_count,
-                    bool(seeded_rec.get('consent_mode_likely')),
-                    True
+                    seeded_rec.get('has_google_ads'), seeded_rec.get('tech_scan_completeness', 'full'),
+                    _seed_tech_count, bool(seeded_rec.get('consent_mode_likely')), True
                 )
-                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
-                    seeded_rec.get('contact_quality_tier'),
-                    seeded_rec.get('company_category', '')
+                seeded_rec['contact_quality_tier_human'] = derive_human_contact_tier(
+                    seeded_rec.get('contact_quality_tier'), seeded_rec.get('company_category', '')
                 )
                 seeded_rec['gdpr_jurisdiction'] = _seed_jur
                 seeded_rec['legal_basis_for_processing'] = (
@@ -763,14 +236,12 @@ async def process_domain(
                 )
                 seeded_rec['data_subject_can_request_deletion'] = True
                 seeded_rec['data_retention_policy_days'] = 365
-                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
-                    seeded_rec.get('best_email'),
-                    seeded_rec.get('best_email_type'),
-                    seeded_rec.get('decision_maker_name'),
-                    seeded_rec.get('primary_phone'),
+                seeded_rec['personal_data_fields_in_record'] = derive_pii_fields(
+                    seeded_rec.get('best_email'), seeded_rec.get('best_email_type'),
+                    seeded_rec.get('decision_maker_name'), seeded_rec.get('primary_phone'),
                     seeded_rec.get('decision_maker_linkedin_url')
                 )
-                seeded_rec['compliance_note'] = _build_compliance_note(canonical_domain, _seed_hint)
+                seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, _seed_hint)
                 return seeded_rec
 
             is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
@@ -823,7 +294,7 @@ async def process_domain(
                         )
                         cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
 
-                        c_dm_name, c_dm_role, c_dms_str = _sanitize_cached_dms(
+                        c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
                             cached_copy.get('decision_maker_name'),
                             cached_copy.get('decision_maker_role'),
                             cached_copy.get('decision_makers_found'),
@@ -859,9 +330,7 @@ async def process_domain(
                         cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                         cached_copy['technology_evidence_json'] = build_evidence_json_from_cached_record(cached_copy, source_label='cache')
 
-                        _cached_all_emails = (
-                            cached_copy.get('all_emails') or cached_copy.get('best_email') or ''
-                        ).split(';')
+                        _cached_all_emails = (cached_copy.get('all_emails') or cached_copy.get('best_email') or '').split(';')
                         _cached_emails_list = [e.strip() for e in _cached_all_emails if e.strip()]
                         if _cached_emails_list:
                             cached_copy['all_emails_classification'] = '; '.join(
@@ -896,40 +365,25 @@ async def process_domain(
                         )
 
                         _c_hint = detect_country_hint(
-                            canonical_domain,
-                            cached_copy.get('page_title') or '',
-                            cached_copy.get('meta_description') or '',
-                            cached_copy.get('primary_phone'),
-                            ''
+                            canonical_domain, cached_copy.get('page_title') or '',
+                            cached_copy.get('meta_description') or '', cached_copy.get('primary_phone'), ''
                         )
-                        _jur = _derive_gdpr_jurisdiction(
-                            canonical_domain,
-                            cached_copy.get('primary_phone'),
-                            _c_hint,
-                            ''
-                        )
+                        _jur = derive_gdpr_jurisdiction(canonical_domain, cached_copy.get('primary_phone'), _c_hint, '')
                         cached_copy['gdpr_jurisdiction'] = _jur
                         cached_copy['gdpr_eu_domain'] = _jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
                         _cat = cached_copy.get('company_category', '')
-                        cached_copy['contact_quality_tier_human'] = _derive_human_contact_tier(
-                            cached_copy.get('contact_quality_tier'),
-                            _cat
+                        cached_copy['contact_quality_tier_human'] = derive_human_contact_tier(
+                            cached_copy.get('contact_quality_tier'), _cat
                         )
                         cached_copy['data_quality_score'] = compute_data_quality_score(
-                            cached_copy.get('contact_quality_tier'),
-                            _cached_tech_count,
-                            cached_copy.get('decision_maker_name'),
-                            cached_copy.get('decision_maker_linkedin_url'),
-                            cached_copy.get('primary_phone'),
-                            cached_copy.get('tech_scan_completeness', 'partial_cached'),
-                            True,
-                            company_category=_cat,
-                            is_manual_seed=False,
+                            cached_copy.get('contact_quality_tier'), _cached_tech_count,
+                            cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_linkedin_url'),
+                            cached_copy.get('primary_phone'), cached_copy.get('tech_scan_completeness', 'partial_cached'),
+                            True, company_category=_cat, is_manual_seed=False,
                             is_same_person_email=verify_person_email_match(cached_copy.get('decision_maker_name'), cached_copy.get('best_email'))
                         )
                         cached_copy['sales_hook'] = build_sales_hook(
-                            canonical_domain,
-                            _cat,
+                            canonical_domain, _cat,
                             {
                                 'detected_technologies_list': _cached_tech_list,
                                 'detected_cms': cached_copy.get('detected_cms'),
@@ -942,10 +396,8 @@ async def process_domain(
                                 'has_linkedin_pixel': cached_copy.get('has_linkedin_pixel'),
                                 'has_cookie_banner': cached_copy.get('consent_mode_likely'),
                             },
-                            cached_copy.get('decision_maker_name'),
-                            cached_copy.get('decision_maker_role'),
-                            cached_copy.get('decision_maker_linkedin_url'),
-                            cached_copy.get('best_email'),
+                            cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_role'),
+                            cached_copy.get('decision_maker_linkedin_url'), cached_copy.get('best_email'),
                         )
                         cached_copy['legal_basis_for_processing'] = (
                             'legitimate_interest_b2b'
@@ -954,14 +406,12 @@ async def process_domain(
                         )
                         cached_copy['data_subject_can_request_deletion'] = True
                         cached_copy['data_retention_policy_days'] = 365
-                        cached_copy['personal_data_fields_in_record'] = _derive_pii_fields(
-                            cached_copy.get('best_email'),
-                            cached_copy.get('best_email_type'),
-                            cached_copy.get('decision_maker_name'),
-                            cached_copy.get('primary_phone'),
+                        cached_copy['personal_data_fields_in_record'] = derive_pii_fields(
+                            cached_copy.get('best_email'), cached_copy.get('best_email_type'),
+                            cached_copy.get('decision_maker_name'), cached_copy.get('primary_phone'),
                             cached_copy.get('decision_maker_linkedin_url')
                         )
-                        cached_copy['compliance_note'] = _build_compliance_note(canonical_domain, _c_hint)
+                        cached_copy['compliance_note'] = build_compliance_note(canonical_domain, _c_hint)
 
                         if not has_cached_tech and (cached_copy.get('best_email') or cached_copy.get('primary_phone')):
                             c_contact = cached_copy.get('best_email') or cached_copy.get('primary_phone')
@@ -975,7 +425,7 @@ async def process_domain(
 
             cat, cat_conf = classify_company_category(domain_key, '', '', [])
             c_hint = detect_country_hint(canonical_domain, '', '', None, '')
-            blocked_jur = _derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
+            blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
             blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
             return {
                 'input_domain': domain_key,
@@ -1009,7 +459,7 @@ async def process_domain(
                 'data_subject_can_request_deletion': True,
                 'data_retention_policy_days': 365,
                 'personal_data_fields_in_record': 'none (site_blocked)',
-                'compliance_note': _build_compliance_note(canonical_domain, c_hint),
+                'compliance_note': build_compliance_note(canonical_domain, c_hint),
                 'playwright_available': is_playwright_available(),
                 'playwright_used': False,
                 'playwright_status': pw_status_str if (pw_attempts_count > 0 or is_pw_hopeless) else 'not_attempted_site_blocked',
@@ -1074,17 +524,12 @@ async def process_domain(
                 'last_checked_at': checked_at
             }
 
-        effective_region = _resolve_effective_phone_region(canonical_domain, default_region, html)
+        effective_region = resolve_effective_phone_region(canonical_domain, default_region, html)
         is_pw_hopeless = (canonical_domain in KNOWN_PW_HOPELESS or domain_key in KNOWN_PW_HOPELESS)
 
         (
-            page_title,
-            meta_desc,
-            main_text,
-            email_sources,
-            phones_with_source,
-            socials_with_source,
-            contact_links
+            page_title, meta_desc, main_text, email_sources,
+            phones_with_source, socials_with_source, contact_links
         ) = await loop.run_in_executor(
             thread_pool, parse_html_sync, html, normalized_final_redirect, effective_region
         )
@@ -1097,10 +542,7 @@ async def process_domain(
         if unpack_gtm:
             gtm_ids, gtm_js = await fetch_gtm_scripts(client, html)
         else:
-            gtm_ids = sorted({
-                m.upper() for m in GTM_ID_REGEX.findall(html)
-                if is_valid_gtm_id(m)
-            })
+            gtm_ids = sorted({m.upper() for m in GTM_ID_REGEX.findall(html) if is_valid_gtm_id(m)})
             gtm_js = ''
 
         tech_info = detect_tech_with_evidence(html, gtm_js, gtm_ids, normalized_final_redirect, 'full')
@@ -1112,24 +554,20 @@ async def process_domain(
 
         pages_with_urls = [(normalized_final_redirect, html, main_text)]
         base_root = f"{scheme}://{re.sub(r':\d+$', '', parsed_final.netloc) or canonical_domain}"
-
         disallowed_paths, crawl_delay = await load_robots_rules(client, base_root)
 
         if scan_contacts and not contact_links:
             contact_links = await discover_links_from_sitemap(client, base_root)
 
         if scan_contacts and effective_region in ('DE', 'AT', 'CH'):
-            has_impressum_link = any('impressum' in u.lower() for u in contact_links)
-            if not has_impressum_link:
+            if not any('impressum' in u.lower() for u in contact_links):
                 contact_links = [f'{base_root}/impressum'] + list(contact_links)
 
         if scan_contacts and contact_links:
-            allowed_sub_links = [
-                u for u in contact_links
-                if is_allowed_by_robots(u, disallowed_paths) and not DM_SOURCE_BLACKLIST.search(urlparse(u).path)
-            ]
-            allowed_sub_links = sorted(allowed_sub_links, key=_contact_link_priority)
-
+            allowed_sub_links = sorted(
+                [u for u in contact_links if is_allowed_by_robots(u, disallowed_paths) and not DM_SOURCE_BLACKLIST.search(urlparse(u).path)],
+                key=contact_link_priority
+            )
             impressum_403_triggered = False
             for sub_url in allowed_sub_links[:4]:
                 await asyncio.sleep(crawl_delay)
@@ -1142,13 +580,9 @@ async def process_domain(
                     )
                     if is_soft_404_page(sub_html, sub_title):
                         continue
-
                     if homepage_was_soft_404:
-                        if not page_title and sub_title:
-                            page_title = sub_title
-                        if not meta_desc and sub_desc:
-                            meta_desc = sub_desc
-
+                        page_title = page_title or sub_title
+                        meta_desc = meta_desc or sub_desc
                     pages_with_urls.append((sub_final_url, sub_html, sub_text))
                     for em, src in sub_e.items():
                         email_sources.setdefault(em, src)
@@ -1185,19 +619,13 @@ async def process_domain(
         needs_pw_tech = bool(tech_info['has_cookie_banner'] and not tech_info['has_gtm'] and not tech_info['has_ga4'])
         needs_pw_empty_shell = bool(not page_title and not tech_info['detected_technologies_list'])
         needs_pw_no_tech_at_all = bool(
-            not tech_info['detected_technologies_list']
-            and not tech_info['has_gtm']
-            and not tech_info['has_ga4']
-            and bool(page_title)
+            not tech_info['detected_technologies_list'] and not tech_info['has_gtm']
+            and not tech_info['has_ga4'] and bool(page_title)
         )
-
         remaining_pw_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
 
         if is_playwright_available() and not pw_used_flag and remaining_pw_budget > 0 and (
-            not has_actionable_contacts
-            or needs_pw_tech
-            or needs_pw_empty_shell
-            or needs_pw_no_tech_at_all
+            not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all
         ):
             if is_pw_hopeless:
                 pw_status_str = 'skipped_hopeless_waf'
@@ -1206,32 +634,16 @@ async def process_domain(
             else:
                 pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
                 pw_locale = pw_locale_for_region(effective_region)
-                Actor.log.info(
-                    f'Playwright triggered for {canonical_domain} '
-                    f'(no_actionable_contacts={not has_actionable_contacts}, consent_tech={needs_pw_tech}, '
-                    f'empty_shell={needs_pw_empty_shell}, zero_static_tech={needs_pw_no_tech_at_all}, locale={pw_locale})'
-                )
                 pw_attempted_paths.append(normalized_final_redirect)
                 (
-                    pw_html,
-                    pw_url,
-                    pw_status_str,
-                    pw_incomplete,
-                    pw_main_attempts
+                    pw_html, pw_url, pw_status_str, pw_incomplete, pw_main_attempts
                 ) = await fetch_html_playwright_fallback(
-                    normalized_final_redirect,
-                    proxy_url=pw_proxy,
-                    locale=pw_locale,
-                    max_attempts=remaining_pw_budget,
+                    normalized_final_redirect, proxy_url=pw_proxy, locale=pw_locale, max_attempts=remaining_pw_budget
                 )
                 pw_attempts_count += pw_main_attempts
-                # Завдання 6 (P2): Уніфікуємо 'launched_empty' -> 'launched_empty_shell' і в основному блоці PW
-                pw_status_str = _normalize_pw_empty_status(pw_status_str, pw_html)
+                pw_status_str = normalize_pw_empty_status(pw_status_str, pw_html)
                 if pw_incomplete or pw_status_str == 'launched_empty_shell':
                     pw_had_timeout_or_block = True
-                Actor.log.info(
-                    f'Playwright result for {canonical_domain}: status={pw_status_str}, bytes={len(pw_html) if pw_html else 0}'
-                )
                 if pw_status_str == 'rendered' and pw_html:
                     pw_used_flag = True
                     pw_title, pw_desc, pw_text, pw_e, pw_p, pw_s, pw_sub_links = await loop.run_in_executor(
@@ -1239,8 +651,7 @@ async def process_domain(
                     )
                     if not page_title and pw_title and not is_soft_404_page(pw_html, pw_title):
                         page_title = pw_title
-                    if not meta_desc and pw_desc:
-                        meta_desc = pw_desc
+                    meta_desc = meta_desc or pw_desc
                     pages_with_urls.append((pw_url, pw_html, pw_text))
                     for em, src in pw_e.items():
                         email_sources.setdefault(em, src)
@@ -1261,34 +672,21 @@ async def process_domain(
                             thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
                         )
                         fallback_pw_paths = [
-                            f'{base_root}/impressum/',
-                            f'{base_root}/kontakt/',
-                            f'{base_root}/contacts/',
-                            f'{base_root}/en/contact-us/',
-                            f'{base_root}/ua/kontakty/',
-                            f'{base_root}/about/'
+                            f'{base_root}/impressum/', f'{base_root}/kontakt/', f'{base_root}/contacts/',
+                            f'{base_root}/en/contact-us/', f'{base_root}/ua/kontakty/', f'{base_root}/about/'
                         ]
-                        combined_pw_subs = []
-                        for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths):
-                            if u not in combined_pw_subs and u != normalized_final_redirect:
-                                combined_pw_subs.append(u)
-                        combined_pw_subs = sorted(combined_pw_subs, key=_contact_link_priority)
-
+                        combined_pw_subs = sorted(
+                            list(dict.fromkeys(
+                                u for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths)
+                                if u != normalized_final_redirect
+                            )),
+                            key=contact_link_priority
+                        )
                         for pw_sub_u in combined_pw_subs[:remaining_sub_budget]:
                             if is_allowed_by_robots(pw_sub_u, disallowed_paths):
                                 pw_attempted_paths.append(pw_sub_u)
-                                (
-                                    sub_pw_html,
-                                    sub_pw_final,
-                                    sub_pw_st,
-                                    _,
-                                    sub_pw_tries
-                                ) = await fetch_html_playwright_fallback(
-                                    pw_sub_u,
-                                    proxy_url=pw_proxy,
-                                    locale=pw_locale,
-                                    accept_consent=False,
-                                    max_attempts=1,
+                                sub_pw_html, sub_pw_final, sub_pw_st, _, sub_pw_tries = await fetch_html_playwright_fallback(
+                                    pw_sub_u, proxy_url=pw_proxy, locale=pw_locale, accept_consent=False, max_attempts=1
                                 )
                                 pw_attempts_count += sub_pw_tries
                                 if sub_pw_st == 'rendered' and sub_pw_html:
@@ -1296,10 +694,8 @@ async def process_domain(
                                         thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
                                     )
                                     if not is_soft_404_page(sub_pw_html, s_t):
-                                        if not page_title and s_t:
-                                            page_title = s_t
-                                        if not meta_desc and s_d:
-                                            meta_desc = s_d
+                                        page_title = page_title or s_t
+                                        meta_desc = meta_desc or s_d
                                         pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
                                         for em, src in s_e.items():
                                             email_sources.setdefault(em, src)
@@ -1323,7 +719,7 @@ async def process_domain(
                     c_rec = await cache_store.get_value(c_key)
                     if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies')):
                         raw_t = c_rec.get('detected_technologies') or ''
-                        valid_cached_sgtm = _has_verified_sgtm_in_cache(c_rec)
+                        valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
                         cached_techs = [
                             x.strip() for x in raw_t.split(';')
                             if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
@@ -1335,11 +731,8 @@ async def process_domain(
                         merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
                         has_ga4_merged = bool(c_rec.get('has_ga4') or tech_info['has_ga4'])
                         merged_comp = resolve_cache_merged_completeness(
-                            has_ga4_merged,
-                            pw_used_flag,
-                            pw_had_timeout_or_block,
-                            live_found_something,
-                            tech_info['tech_scan_completeness'],
+                            has_ga4_merged, pw_used_flag, pw_had_timeout_or_block,
+                            live_found_something, tech_info['tech_scan_completeness']
                         )
                         for ct in cached_techs:
                             if ct not in live_ev_json:
@@ -1375,10 +768,8 @@ async def process_domain(
         detected_tech_list = tech_info['detected_technologies_list']
 
         google_ads_conf = compute_google_ads_confidence(
-            tech_info.get('has_google_ads'),
-            tech_info.get('tech_scan_completeness', 'full'),
-            len(detected_tech_list),
-            bool(tech_info.get('has_cookie_banner')),
+            tech_info.get('has_google_ads'), tech_info.get('tech_scan_completeness', 'full'),
+            len(detected_tech_list), bool(tech_info.get('has_cookie_banner')),
             pw_used_flag and not pw_had_timeout_or_block
         )
 
@@ -1398,16 +789,11 @@ async def process_domain(
                         if not phone_map and c_rec.get('primary_phone'):
                             phone_map[str(c_rec['primary_phone']).strip()] = (50, str(c_rec.get('phone_source_url') or clean_website_url))
                         ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
-                        Actor.log.info(f'[CONTACT MERGE] {canonical_domain}: recovered email {c_em} from cache')
                         break
                 except Exception:
                     pass
 
-        sorted_phones_with_src = sorted(
-            phone_map.items(),
-            key=lambda item: -item[1][0]
-        )[:3]
-
+        sorted_phones_with_src = sorted(phone_map.items(), key=lambda item: -item[1][0])[:3]
         best_email = ranked_emails_with_src[0][0] if ranked_emails_with_src else None
         email_source_url = ranked_emails_with_src[0][1] if ranked_emails_with_src else None
         best_email_type = classify_email_type(best_email, brand_root)
@@ -1423,31 +809,21 @@ async def process_domain(
             if raw_em_dom == canonical_domain or raw_em_dom.endswith(f'.{canonical_domain}'):
                 email_domain = f'{raw_em_dom} (matches_site)'
             elif raw_em_dom in PUBLIC_WEBMAIL_DOMAINS:
-                if brand_root and brand_root in normalized_em_local:
-                    email_domain = f'{raw_em_dom} (brand_webmail)'
-                else:
-                    email_domain = f'{raw_em_dom} (public_webmail)'
+                email_domain = f'{raw_em_dom} (brand_webmail)' if (brand_root and brand_root in normalized_em_local) else f'{raw_em_dom} (public_webmail)'
             elif brand_root and (raw_em_dom.split('.')[0] == brand_root or brand_root in raw_em_dom.split('.')[0]):
                 email_domain = f'{raw_em_dom} (brand_alias_domain)'
             else:
                 email_domain = f'{raw_em_dom} (external_domain)'
 
-        non_legal_pairs = [
-            (em, src) for em, src in ranked_emails_with_src
-            if classify_email_type(em, brand_root) != 'legal_or_hr_inbox'
-        ]
+        non_legal_pairs = [(em, src) for em, src in ranked_emails_with_src if classify_email_type(em, brand_root) != 'legal_or_hr_inbox']
         selected_email_pairs = (non_legal_pairs or ranked_emails_with_src)[:5]
         all_emails_list = [em for em, _ in selected_email_pairs]
 
         top3_pairs = selected_email_pairs[:3]
         if top3_pairs:
-            top3_checks = await asyncio.gather(
-                *(verify_email_deliverability_deep(client, em, src) for em, src in top3_pairs)
-            )
+            top3_checks = await asyncio.gather(*(verify_email_deliverability_deep(client, em, src) for em, src in top3_pairs))
             deliverability_check = top3_checks[0]
-            all_emails_deliverability_str = '; '.join(
-                f'{em}: {chk}' for (em, _), chk in zip(top3_pairs, top3_checks) if chk
-            )
+            all_emails_deliverability_str = '; '.join(f'{em}: {chk}' for (em, _), chk in zip(top3_pairs, top3_checks) if chk)
         else:
             deliverability_check = None
             all_emails_deliverability_str = None
@@ -1462,11 +838,10 @@ async def process_domain(
         phone_availability = 'public' if primary_phone else 'not_public'
         phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
 
-        social_source_url = None
-        for platform in ('linkedin', 'instagram', 'facebook', 'telegram', 'tiktok', 'youtube'):
-            if platform in socials_with_source:
-                social_source_url = socials_with_source[platform][1]
-                break
+        social_source_url = next(
+            (socials_with_source[p][1] for p in ('linkedin', 'instagram', 'facebook', 'telegram', 'tiktok', 'youtube') if p in socials_with_source),
+            None
+        )
 
         company_category, category_confidence = classify_company_category(
             canonical_domain, page_title, meta_desc, detected_tech_list, html
@@ -1474,47 +849,32 @@ async def process_domain(
         is_mp_platform = is_marketplace_platform(canonical_domain, page_title, meta_desc)
 
         (
-            dm_name,
-            dm_role,
-            dm_linkedin_url,
-            dm_source_url,
-            dm_source_is_legal,
-            dm_source_type,
-            decision_makers_found_str,
-            decision_makers_json_str
-        ) = await loop.run_in_executor(
-            thread_pool, extract_decision_maker_deep, pages_with_urls
-        )
+            dm_name, dm_role, dm_linkedin_url, dm_source_url, dm_source_is_legal,
+            dm_source_type, decision_makers_found_str, decision_makers_json_str
+        ) = await loop.run_in_executor(thread_pool, extract_decision_maker_deep, pages_with_urls)
 
         if cache_store is not None:
             for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
                     if isinstance(c_rec, dict) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
-                        c_dm_name, c_dm_role, c_dms_str = _sanitize_cached_dms(
-                            c_rec.get('decision_maker_name'),
-                            c_rec.get('decision_maker_role'),
-                            c_rec.get('decision_makers_found'),
-                            brand_root
+                        c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
+                            c_rec.get('decision_maker_name'), c_rec.get('decision_maker_role'),
+                            c_rec.get('decision_makers_found'), brand_root
                         )
                         if not c_dm_name and not c_dms_str:
                             continue
                         c_dm_li = c_rec.get('decision_maker_linkedin_url')
                         c_dm_src = c_rec.get('decision_maker_source_url')
                         c_dm_src_type = c_rec.get('decision_maker_source_type')
-
                         curr_dms_count = (decision_makers_found_str or '').count(';') + (1 if decision_makers_found_str else 0)
                         cached_dms_count = (c_dms_str or '').count(';') + (1 if c_dms_str else 0)
 
                         if c_dm_li and not dm_linkedin_url and c_dm_name:
-                            dm_name = c_dm_name
-                            dm_role = c_dm_role
-                            dm_linkedin_url = c_dm_li
-                            dm_source_url = c_dm_src
-                            dm_source_type = c_dm_src_type
+                            dm_name, dm_role, dm_linkedin_url = c_dm_name, c_dm_role, c_dm_li
+                            dm_source_url, dm_source_type = c_dm_src, c_dm_src_type
                             if cached_dms_count >= curr_dms_count and c_dms_str:
                                 decision_makers_found_str = c_dms_str
-                            Actor.log.info(f'[DM MERGE DETERMINISTIC] {canonical_domain}: promoted LinkedIn-verified {dm_name} from cache')
                             break
                         elif not dm_name or cached_dms_count > curr_dms_count:
                             decision_makers_found_str = c_dms_str or decision_makers_found_str
@@ -1523,52 +883,29 @@ async def process_domain(
                             dm_linkedin_url = dm_linkedin_url or c_dm_li
                             dm_source_url = dm_source_url or c_dm_src
                             dm_source_type = dm_source_type or c_dm_src_type
-                            Actor.log.info(f'[DM MERGE] {canonical_domain}: recovered {cached_dms_count} clean DMs from cache')
                             break
                 except Exception:
                     pass
 
-        dm_name, dm_role, decision_makers_found_str = _sanitize_cached_dms(
+        dm_name, dm_role, decision_makers_found_str = sanitize_cached_dms(
             dm_name, dm_role, decision_makers_found_str, brand_root
         )
-        decision_makers_json_str = build_decision_makers_json_from_summary(
-            decision_makers_found_str, dm_linkedin_url
-        )
+        decision_makers_json_str = build_decision_makers_json_from_summary(decision_makers_found_str, dm_linkedin_url)
 
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
-
-        gdpr_jurisdiction = _derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
+        gdpr_jurisdiction = derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
         is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
         seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
         if isinstance(seed_match, dict):
             seed_tech_count = len([x.strip() for x in (seed_match.get('detected_technologies') or '').split(';') if x.strip()])
             seed_has_dm = bool(seed_match.get('decision_maker_name'))
-            live_is_weaker = (
-                (seed_has_dm and not dm_name)
-                or (len(detected_tech_list) < seed_tech_count)
-                or (not best_email and bool(seed_match.get('best_email')))
-            )
-            if live_is_weaker:
-                Actor.log.info(
-                    f'[SEED MERGE] {canonical_domain}: manual_seed is richer than live scan '
-                    f'(live_dm={dm_name}, live_techs={len(detected_tech_list)} vs seed_techs={seed_tech_count}); applying seed'
-                )
+            if (seed_has_dm and not dm_name) or (len(detected_tech_list) < seed_tech_count) or (not best_email and bool(seed_match.get('best_email'))):
                 seeded_rec = build_manual_seed_record(
-                    seed_match,
-                    domain_key,
-                    canonical_domain,
-                    aliases_str,
-                    clean_website_url,
-                    normalized_final_redirect,
-                    was_redirected,
-                    redirect_chain_str,
-                    is_eu_gdpr,
-                    'success',
-                    'live_scan_partial_enriched_by_seed',
-                    checked_at,
-                    is_playwright_available(),
+                    seed_match, domain_key, canonical_domain, aliases_str, clean_website_url,
+                    normalized_final_redirect, was_redirected, redirect_chain_str, is_eu_gdpr,
+                    'success', 'live_scan_partial_enriched_by_seed', checked_at, is_playwright_available()
                 )
                 seeded_rec['status'] = 'success (seed_merged)'
                 seeded_rec['playwright_used'] = pw_used_flag
@@ -1578,15 +915,11 @@ async def process_domain(
                 seeded_rec['error_message'] = ''
                 seeded_rec['data_confidence_warning'] = 'Note: Live scan augmented with verified manual_seed (B2B partnership channel + executive & full stack).'
                 seeded_rec['has_google_ads_confidence'] = compute_google_ads_confidence(
-                    seeded_rec.get('has_google_ads'),
-                    seeded_rec.get('tech_scan_completeness', 'full'),
-                    seed_tech_count,
-                    bool(seeded_rec.get('consent_mode_likely')),
-                    True
+                    seeded_rec.get('has_google_ads'), seeded_rec.get('tech_scan_completeness', 'full'),
+                    seed_tech_count, bool(seeded_rec.get('consent_mode_likely')), True
                 )
-                seeded_rec['contact_quality_tier_human'] = _derive_human_contact_tier(
-                    seeded_rec.get('contact_quality_tier'),
-                    seeded_rec.get('company_category', '')
+                seeded_rec['contact_quality_tier_human'] = derive_human_contact_tier(
+                    seeded_rec.get('contact_quality_tier'), seeded_rec.get('company_category', '')
                 )
                 seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
                 seeded_rec['legal_basis_for_processing'] = (
@@ -1596,106 +929,58 @@ async def process_domain(
                 )
                 seeded_rec['data_subject_can_request_deletion'] = True
                 seeded_rec['data_retention_policy_days'] = 365
-                seeded_rec['personal_data_fields_in_record'] = _derive_pii_fields(
-                    seeded_rec.get('best_email'),
-                    seeded_rec.get('best_email_type'),
-                    seeded_rec.get('decision_maker_name'),
-                    seeded_rec.get('primary_phone'),
+                seeded_rec['personal_data_fields_in_record'] = derive_pii_fields(
+                    seeded_rec.get('best_email'), seeded_rec.get('best_email_type'),
+                    seeded_rec.get('decision_maker_name'), seeded_rec.get('primary_phone'),
                     seeded_rec.get('decision_maker_linkedin_url')
                 )
-                seeded_rec['compliance_note'] = _build_compliance_note(canonical_domain, country_hint)
+                seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, country_hint)
                 return seeded_rec
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
         (
-            sales_readiness_verdict,
-            icp_fit_tier,
-            technical_signal_strength,
-            contact_quality_tier,
-            enrichment_status,
-            confidence_warning,
-            detected_signals,
-            sales_opportunity,
-            next_best_action
+            sales_readiness_verdict, icp_fit_tier, technical_signal_strength,
+            contact_quality_tier, enrichment_status, confidence_warning,
+            detected_signals, sales_opportunity, next_best_action
         ) = evaluate_qualification_v180(
-            company_category,
-            tech_info,
-            best_email,
-            best_email_type,
-            primary_phone,
-            dm_name,
-            dm_role,
-            dm_linkedin_url,
-            dm_source_is_legal,
-            dm_source_type,
-            linkedin_url,
-            had_marketplace_pollution,
-            pw_status_str
+            company_category, tech_info, best_email, best_email_type, primary_phone,
+            dm_name, dm_role, dm_linkedin_url, dm_source_is_legal, dm_source_type,
+            linkedin_url, had_marketplace_pollution, pw_status_str
         )
 
         if cache_tech_recovered or tech_info.get('tech_scan_completeness') == 'partial_cached':
             cache_warn = 'Note: Tech stack recovered from verified cache; live scan blocked — do not cite as current state.'
-            if confidence_warning and confidence_warning != 'None':
-                if 'recovered from verified cache' not in confidence_warning:
-                    confidence_warning = f'{confidence_warning} | {cache_warn}'
-            else:
-                confidence_warning = cache_warn
+            confidence_warning = f'{confidence_warning} | {cache_warn}' if (confidence_warning and confidence_warning != 'None' and 'recovered from verified cache' not in confidence_warning) else cache_warn
         elif tech_info.get('tech_scan_completeness') == 'partial_empty_render':
             empty_warn = 'Note: Zero tracking tags observed in HTML/JS shell (consent-gated or custom loader — tag absence unverified).'
-            if confidence_warning and confidence_warning != 'None':
-                if 'tag absence unverified' not in confidence_warning:
-                    confidence_warning = f'{confidence_warning} | {empty_warn}'
-            else:
-                confidence_warning = empty_warn
+            confidence_warning = f'{confidence_warning} | {empty_warn}' if (confidence_warning and confidence_warning != 'None' and 'tag absence unverified' not in confidence_warning) else empty_warn
 
         sales_hook = build_sales_hook(
-            canonical_domain,
-            company_category,
-            tech_info,
-            dm_name,
-            dm_role,
-            dm_linkedin_url,
-            best_email,
+            canonical_domain, company_category, tech_info, dm_name, dm_role, dm_linkedin_url, best_email
         )
 
         if best_email and deliverability_check and any(
-            err_tok in deliverability_check.lower()
-            for err_tok in ('dns_error', 'lookup_failed', 'dns_timeout', 'invalid_no_mx')
+            err_tok in deliverability_check.lower() for err_tok in ('dns_error', 'lookup_failed', 'dns_timeout', 'invalid_no_mx')
         ):
-            dns_warn = (
-                f'Warning: DNS lookup failed for {best_email} '
-                f'(temporary DoH failure or domain has no MX). Verify manually before outbound.'
-            )
-            if confidence_warning and confidence_warning != 'None':
-                confidence_warning = f'{dns_warn} | {confidence_warning}'
-            else:
-                confidence_warning = dns_warn
+            dns_warn = f'Warning: DNS lookup failed for {best_email} (temporary DoH failure or domain has no MX). Verify manually before outbound.'
+            confidence_warning = f'{dns_warn} | {confidence_warning}' if (confidence_warning and confidence_warning != 'None') else dns_warn
 
         has_actionable_final = bool(best_email or primary_phone)
         final_status = 'success' if has_actionable_final else 'no_contacts_found'
         needs_rescan = bool(
-            tech_info['tech_scan_completeness'] != 'full'
-            or not detected_tech_list
+            tech_info['tech_scan_completeness'] != 'full' or not detected_tech_list
             or (not tech_info['has_gtm'] and not tech_info['has_ga4'] and pw_had_timeout_or_block)
         )
 
         all_phones_list = [p for p, _ in sorted_phones_with_src]
-        human_tier = _derive_human_contact_tier(contact_quality_tier, company_category)
+        human_tier = derive_human_contact_tier(contact_quality_tier, company_category)
         legal_basis = 'legitimate_interest_b2b' if (best_email or dm_name or primary_phone) else None
-        pii_fields_str = _derive_pii_fields(
-            best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url
-        )
+        pii_fields_str = derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url)
         dq_score = compute_data_quality_score(
-            contact_quality_tier,
-            len(detected_tech_list),
-            dm_name,
-            dm_linkedin_url,
-            primary_phone,
-            tech_info['tech_scan_completeness'],
-            cache_tech_recovered,
-            company_category=company_category,
-            is_manual_seed=False,
-            is_same_person_email=verify_person_email_match(dm_name, best_email),
+            contact_quality_tier, len(detected_tech_list), dm_name, dm_linkedin_url,
+            primary_phone, tech_info['tech_scan_completeness'], cache_tech_recovered,
+            company_category=company_category, is_manual_seed=False,
+            is_same_person_email=verify_person_email_match(dm_name, best_email)
         )
 
         result_record = {
@@ -1730,7 +1015,7 @@ async def process_domain(
             'data_subject_can_request_deletion': True,
             'data_retention_policy_days': 365,
             'personal_data_fields_in_record': pii_fields_str,
-            'compliance_note': _build_compliance_note(canonical_domain, country_hint),
+            'compliance_note': build_compliance_note(canonical_domain, country_hint),
             'playwright_available': is_playwright_available(),
             'playwright_used': pw_used_flag,
             'playwright_status': pw_status_str,
@@ -1809,161 +1094,26 @@ async def process_domain(
         return result_record
 
 
-def _remaining_run_seconds() -> float | None:
-    raw = os.environ.get('ACTOR_TIMEOUT_AT') or os.environ.get('APIFY_TIMEOUT_AT')
-    if not raw:
-        if not hasattr(_remaining_run_seconds, '_start'):
-            _remaining_run_seconds._start = time.monotonic()
-        return 1140.0 - (time.monotonic() - _remaining_run_seconds._start)
-    try:
-        end = datetime.fromisoformat(raw.replace('Z', '+00:00'))
-        return (end - datetime.now(timezone.utc)).total_seconds()
-    except Exception:
-        return None
-
-
-def _timeout_stub(domain_key: str, aliases: list[str]) -> dict:
-    checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    canonical_domain = domain_key.lower().replace('www.', '')
-    clean_website_url = f'https://{canonical_domain}/'
-    cat, cat_conf = classify_company_category(canonical_domain, '', '', [])
-    c_hint = detect_country_hint(canonical_domain, '', '', None, '')
-    jur = _derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
-    is_eu = jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-    return {
-        'input_domain': domain_key,
-        'canonical_domain': canonical_domain,
-        'aliases': '; '.join(aliases) if aliases else canonical_domain,
-        'input_was_redirected': False,
-        'redirect_chain': None,
-        'website_url': clean_website_url,
-        'final_redirect_url': clean_website_url,
-        'status': 'run_timeout_unfinished',
-        'cached_snapshot_source': 'none (run_timeout)',
-        'cached_snapshot_age_days': None,
-        'error_message': 'Actor run approached global timeout before domain finished; retry in smaller batch',
-        'data_quality_score': 0,
-        'sales_readiness_verdict': 'Unverified (Run Timeout Reached — Retry Domain)',
-        'company_category': cat,
-        'category_confidence': cat_conf,
-        'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
-        'marketplace_platform_pollution_detected': False,
-        'icp_fit_tier': 'Unverified (Run Timeout Reached)',
-        'technical_signal_strength': None,
-        'tech_scan_completeness': 'partial_timeout',
-        'tech_rescan_needed': True,
-        'contact_quality_tier': 'Tier F (Run Timeout)',
-        'contact_quality_tier_human': 'No Contact',
-        'contact_enrichment_status': 'run_timeout_unfinished',
-        'data_confidence_warning': 'Warning: Actor run approached time limit before this domain completed. Re-run with higher timeout.',
-        'gdpr_eu_domain': is_eu,
-        'gdpr_jurisdiction': jur,
-        'legal_basis_for_processing': None,
-        'data_subject_can_request_deletion': True,
-        'data_retention_policy_days': 365,
-        'personal_data_fields_in_record': 'none (run_timeout)',
-        'compliance_note': _build_compliance_note(canonical_domain, c_hint),
-        'playwright_available': is_playwright_available(),
-        'playwright_used': False,
-        'playwright_status': 'aborted_by_run_timeout',
-        'playwright_attempts_count': 0,
-        'playwright_paths_attempted': None,
-        'page_title': '[Run timeout reached before completion]',
-        'meta_description': None,
-        'best_email': None,
-        'email_domain': None,
-        'best_email_type': None,
-        'email_source_type': None,
-        'email_source_note': None,
-        'named_email_owner_role_hint': None,
-        'email_deliverability_check': None,
-        'all_emails_deliverability': None,
-        'all_emails_classification': None,
-        'email_source_url': None,
-        'primary_phone': None,
-        'e164_phone': None,
-        'phone_availability': 'not_checked_timeout',
-        'phone_source_url': None,
-        'decision_maker_name': None,
-        'decision_maker_role': None,
-        'decision_maker_source_url': None,
-        'decision_maker_source_type': None,
-        'decision_makers_found': None,
-        'decision_makers_json': None,
-        'decision_maker_linkedin_url': None,
-        'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat, c_hint),
-        'linkedin_url': None,
-        'instagram_url': None,
-        'facebook_url': None,
-        'telegram_url': None,
-        'tiktok_url': None,
-        'youtube_url': None,
-        'social_source_url': None,
-        'detected_signals': None,
-        'detected_cms': None,
-        'consent_mode_likely': None,
-        'ga4_detection_confidence': None,
-        'has_google_ads_confidence': 'unknown',
-        'sales_hook': None,
-        'sales_opportunity': 'Domain scan interrupted by global run timeout',
-        'next_best_action': 'Re-run domain or use decision_maker_search_query on LinkedIn',
-        'technology_evidence_summary': None,
-        'technology_evidence': None,
-        'technology_evidence_json': None,
-        'has_meta_pixel': None,
-        'has_tiktok_pixel': None,
-        'has_google_ads': None,
-        'has_linkedin_pixel': None,
-        'has_pinterest_tag': None,
-        'has_hubspot': None,
-        'has_klaviyo': None,
-        'has_ga4': None,
-        'has_gtm': None,
-        'has_sgtm': None,
-        'all_ga4_ids': None,
-        'detected_technologies': None,
-        'all_emails': None,
-        'all_phones': None,
-        'last_checked_at': checked_at,
-    }
-
-
 async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
-    rem = _remaining_run_seconds()
-    if rem is not None:
-        budget = max(45.0, rem - 30.0)
-    else:
-        budget = 900.0
-
+    rem = remaining_run_seconds()
+    budget = max(45.0, rem - 30.0) if rem is not None else 900.0
     if rem is not None and rem <= 20.0:
         coro.close()
-        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: only {rem:.0f}s remaining, stub')
-        return _timeout_stub(domain_key, aliases)
-
+        return build_timeout_stub(domain_key, aliases)
     try:
         return await asyncio.wait_for(coro, timeout=budget)
-    except asyncio.TimeoutError:
-        Actor.log.warning(f'[TIMEOUT GUARD] {domain_key}: exceeded {budget:.0f}s')
-        return _timeout_stub(domain_key, aliases)
-    except Exception as e:
-        Actor.log.warning(f'[GUARD ERROR] {domain_key}: {e}')
-        return _timeout_stub(domain_key, aliases)
+    except Exception:
+        return build_timeout_stub(domain_key, aliases)
 
 
 async def main() -> None:
     async with Actor:
-        _remaining_run_seconds()
-        # Завдання 4 (P1): Блокуючий CI/Regression Gate на старті контейнера в Apify (6 тестів)
+        remaining_run_seconds()
         run_startup_regression_gate(
             log_fn=Actor.log.info,
             normalize_tech_fn=normalize_tech_info_booleans,
             resolve_cache_comp_fn=resolve_cache_merged_completeness,
         )
-        if not is_playwright_available():
-            Actor.log.warning(
-                'PLAYWRIGHT NOT INSTALLED: Browser SPA fallback disabled. '
-                'Update Dockerfile to `FROM apify/actor-python-playwright:3.12` to enable.'
-            )
 
         actor_input = await Actor.get_input() or {}
         raw_domains = actor_input.get('domains', [])
@@ -1980,12 +1130,10 @@ async def main() -> None:
                 if isinstance(v, dict):
                     manual_seeds[k.lower().strip().replace('www.', '')] = v
 
-        prepared_domains = prepare_domains(raw_domains)
+        prepared_domains = sorted(prepare_domains(raw_domains), key=domain_weight)
         if not prepared_domains:
             Actor.log.warning('No valid domains provided in input!')
             return
-
-        prepared_domains = sorted(prepared_domains, key=_domain_weight)
 
         cache_store = None
         try:
@@ -2010,49 +1158,24 @@ async def main() -> None:
             res_cfg = await Actor.create_proxy_configuration(groups=['RESIDENTIAL'])
         except Exception:
             res_cfg = None
-        configure_pw(
-            escalation_proxy=res_cfg,
-            max_concurrent=actor_input.get('maxBrowserConcurrency', 3),
-        )
+        configure_pw(escalation_proxy=res_cfg, max_concurrent=actor_input.get('maxBrowserConcurrency', 3))
 
         total_domains = len(prepared_domains)
-        Actor.log.info(
-            f'Processing {total_domains} pre-deduped canonical targets '
-            f'(concurrency: {max_concurrency}, GTM unpack: {unpack_gtm}, '
-            f'playwright_available: {is_playwright_available()}, cache schema: v{CACHE_SCHEMA_VERSION}, '
-            f'manual_seeds: {len(manual_seeds)})...'
-        )
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
-
         pushed_canonical_set: set[str] = set()
         metrics_counter = Counter()
 
         try:
-            async with AsyncSession(
-                impersonate='chrome',
-                allow_redirects=True,
-                verify=False,
-                proxy=primary_proxy_url
-            ) as client:
+            async with AsyncSession(impersonate='chrome', allow_redirects=True, verify=False, proxy=primary_proxy_url) as client:
                 tasks = [
                     guarded(
                         process_domain(
-                            client,
-                            domain_key,
-                            root_url,
-                            initial_aliases,
-                            scan_contacts,
-                            unpack_gtm,
-                            default_region,
-                            proxy_config,
-                            cache_store,
-                            manual_seeds,
-                            thread_pool,
-                            semaphore
+                            client, domain_key, root_url, initial_aliases,
+                            scan_contacts, unpack_gtm, default_region, proxy_config,
+                            cache_store, manual_seeds, thread_pool, semaphore
                         ),
-                        domain_key,
-                        initial_aliases,
+                        domain_key, initial_aliases,
                     )
                     for domain_key, root_url, initial_aliases in prepared_domains
                 ]
@@ -2060,13 +1183,9 @@ async def main() -> None:
                 for coro in asyncio.as_completed(tasks):
                     result = await coro
                     cd = result.get('canonical_domain') or result.get('input_domain')
-                    inp_dom = result.get('input_domain', '')
-
                     if cd in pushed_canonical_set:
                         metrics_counter['deduped_canonical_aliases'] += 1
-                        Actor.log.info(f'[DEDUPED LATE REDIRECT] {inp_dom} skipped because {cd} already pushed.')
                         continue
-
                     pushed_canonical_set.add(cd)
                     await Actor.push_data(result)
 
