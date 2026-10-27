@@ -724,22 +724,32 @@ async def process_domain(
             tech_info['tech_scan_completeness'] = scan_comp_flag
 
         cache_tech_recovered = False
-        if (not tech_info['has_ga4'] or not tech_info.get('detected_cms')) and cache_store is not None:
+        cache_sources_count = 0
+        has_ga4_live_before_cache = bool(tech_info.get('has_ga4'))
+
+        # Завдання 1 (v20.11 P0 Fix): Якщо GA4 вже знайдено в живому скані, ми НІКОЛИ не запускаємо повний cache recovery!
+        # Перевіряємо виключно наявність detected_cms у кеші (для SPA типу Glossier), зберігаючи tech_scan_completeness='full'.
+        if has_ga4_live_before_cache and not tech_info.get('detected_cms') and cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
-                        # Якщо GA4 вже знайдено live, але під час partial_timeout втрачено CMS (напр. Shopify на Glossier) — підтягуємо лише CMS
-                        if tech_info['has_ga4'] and not tech_info.get('detected_cms') and c_rec.get('detected_cms'):
-                            c_cms_str = c_rec.get('detected_cms')
-                            c_cms_list = [x.strip() for x in c_cms_str.split(';') if x.strip()]
-                            tech_info['detected_cms'] = c_cms_str
-                            tech_info['detected_cms_list'] = c_cms_list
-                            for cms_item in c_cms_list:
-                                if cms_item not in tech_info['detected_technologies_list']:
-                                    tech_info['detected_technologies_list'].append(cms_item)
-                            break
+                    if isinstance(c_rec, dict) and c_rec.get('detected_cms'):
+                        c_cms_str = c_rec['detected_cms']
+                        c_cms_list = [x.strip() for x in c_cms_str.split(';') if x.strip()]
+                        tech_info['detected_cms'] = c_cms_str
+                        tech_info['detected_cms_list'] = c_cms_list
+                        for cms_item in c_cms_list:
+                            if cms_item not in tech_info['detected_technologies_list']:
+                                tech_info['detected_technologies_list'].append(cms_item)
+                        break
+                except Exception:
+                    pass
 
+        if not has_ga4_live_before_cache and cache_store is not None:
+            for c_key in (evergreen_kv_key, canonical_kv_key):
+                try:
+                    c_rec = await cache_store.get_value(c_key)
+                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies')):
                         raw_t = c_rec.get('detected_technologies') or ''
                         valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
                         cached_techs = [
@@ -753,12 +763,17 @@ async def process_domain(
                         merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
                         has_ga4_merged = bool(c_rec.get('has_ga4') or tech_info['has_ga4'])
                         merged_comp = resolve_cache_merged_completeness(
-                            has_ga4_merged, pw_used_flag, pw_had_timeout_or_block,
-                            live_found_something, tech_info['tech_scan_completeness']
+                            has_ga4_merged,
+                            pw_used_flag,
+                            pw_had_timeout_or_block,
+                            live_found_something,
+                            tech_info['tech_scan_completeness'],
+                            has_ga4_live_before_cache,
                         )
                         for ct in cached_techs:
                             if ct not in live_ev_json:
                                 live_ev_json[ct] = {'source': 'cache'}
+                                cache_sources_count += 1
                         raw_cached_ev = c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache'
                         if not valid_cached_sgtm:
                             _, raw_cached_ev = sanitize_stale_sgtm_strings(None, raw_cached_ev)
@@ -784,13 +799,19 @@ async def process_domain(
                             'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
                             'tech_scan_completeness': merged_comp
                         }
-                        cache_tech_recovered = (merged_comp == 'partial_cached')
+                        cache_tech_recovered = (merged_comp == 'partial_cached' and cache_sources_count > 0)
                         break
                 except Exception:
                     pass
 
         normalize_tech_info_booleans(tech_info)
         detected_tech_list = tech_info['detected_technologies_list']
+
+        Actor.log.info(
+            f"[CACHE DEBUG] {canonical_domain}: has_ga4_live={has_ga4_live_before_cache}, "
+            f"comp={tech_info['tech_scan_completeness']}, cache_sources={cache_sources_count}, "
+            f"pw_used={pw_used_flag}, pw_had_timeout={pw_had_timeout_or_block}"
+        )
 
         google_ads_conf = compute_google_ads_confidence(
             tech_info.get('has_google_ads'), tech_info.get('tech_scan_completeness', 'full'),
@@ -981,8 +1002,11 @@ async def process_domain(
             linkedin_url, had_marketplace_pollution, pw_status_str
         )
 
-        if cache_tech_recovered or tech_info.get('tech_scan_completeness') == 'partial_cached':
-            cache_warn = 'Note: Tech stack recovered from verified cache; live scan blocked — do not cite as current state.'
+        if cache_tech_recovered and cache_sources_count > 0:
+            cache_warn = (
+                f'Note: {cache_sources_count} tech(s) recovered from verified cache; '
+                f'live scan partial — do not cite as current state.'
+            )
             confidence_warning = f'{confidence_warning} | {cache_warn}' if (confidence_warning and confidence_warning != 'None' and 'recovered from verified cache' not in confidence_warning) else cache_warn
         elif tech_info.get('tech_scan_completeness') == 'partial_empty_render':
             empty_warn = 'Note: Zero tracking tags observed in HTML/JS shell (consent-gated or custom loader — tag absence unverified).'
