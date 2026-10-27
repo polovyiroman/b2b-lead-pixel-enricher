@@ -3,19 +3,19 @@ import time
 from typing import Callable
 
 from .contacts import (
+    build_decision_makers_json_from_summary,
     extract_decision_maker_deep,
     is_valid_person_name,
     strip_role_tokens_from_name,
+)
+from .domain_helpers import (
+    normalize_cached_record_booleans,
+    sanitize_cached_dms,
 )
 from .tech_detector import detect_tech_with_evidence
 
 
 def _test_01_corporate_entities() -> str:
-    """
-    Test 1/6: Corporate entity rejection & valid person preservation.
-    Verifies Benjamin Otto, Annette Siragusano, Petra Scharner-Wolff pass,
-    while BPO Capital, GFH Gesellschaft, YOU Verwaltungs, Otto Group are rejected.
-    """
     valid_people = [
         ('Benjamin Otto', 'ottogroup'),
         ('Annette Siragusano', 'ottogroup'),
@@ -27,7 +27,6 @@ def _test_01_corporate_entities() -> str:
         if not is_valid_person_name(cleaned, brand):
             raise AssertionError(f"Valid person '{raw_name}' (cleaned='{cleaned}') was rejected for brand '{brand}'")
 
-    # Verify hyphenated double-surname strips trailing board list token ('Katy') generically
     katy_cleaned = strip_role_tokens_from_name('Petra Scharner-Wolff Katy')
     if katy_cleaned != 'Petra Scharner-Wolff':
         raise AssertionError(f"Expected 'Petra Scharner-Wolff', got '{katy_cleaned}'")
@@ -48,10 +47,6 @@ def _test_01_corporate_entities() -> str:
 
 
 def _test_02_determinism_ottogroup_3x() -> str:
-    """
-    Test 2/6: Deterministic Primary DM selection across 3 permutations of page fetch order.
-    Verifies Benjamin Otto (+ LinkedIn URL) is always selected #1 and JSON output is identical.
-    """
     page_impressum = (
         'https://www.ottogroup.com/de/impressum',
         '<html><body>'
@@ -104,25 +99,18 @@ def _test_03_cache_merge_completeness_and_empty_render(
     normalize_tech_fn: Callable[[dict], None],
     resolve_cache_comp_fn: Callable[[bool, bool, bool, bool, str], str],
 ) -> str:
-    """
-    Test 3/6: Cache merge completeness contract + empty render protection (Unicredit/Bol case).
-    """
-    # Case A: Cache has GA4=True, but live scan failed (pw_used=False) -> MUST be 'partial_cached' (never 'full')
     comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked')
     if comp_comfy != 'partial_cached':
         raise AssertionError(f"Comfy case: expected 'partial_cached', got '{comp_comfy}'")
 
-    # Case B: PW rendered shell (pw_used=True, no timeout), but live_found_something=False -> MUST be 'partial_cached'
     comp_liki = resolve_cache_comp_fn(True, True, False, False, 'full')
     if comp_liki != 'partial_cached':
         raise AssertionError(f"Liki24 cache-only case: expected 'partial_cached', got '{comp_liki}'")
 
-    # Case C: PW rendered clean AND live_found_something=True -> 'full'
     comp_clean = resolve_cache_comp_fn(True, True, False, True, 'full')
     if comp_clean != 'full':
         raise AssertionError(f"Clean live case: expected 'full', got '{comp_clean}'")
 
-    # Case D (Task 5 Unicredit/Bol): 0 techs detected with 'full' -> must downgrade to 'partial_empty_render'
     empty_tech_info = {
         'detected_technologies_list': [],
         'tech_scan_completeness': 'full',
@@ -141,9 +129,6 @@ def _test_03_cache_merge_completeness_and_empty_render(
 
 
 def _test_04_vorstand_role_extraction() -> str:
-    """
-    Test 4/6: German 'Vorstand:' pattern extraction & role normalization (DocMorris case).
-    """
     html = (
         '<html><body>'
         '<p>DocMorris N.V., Vertreten durch den Vorstand: Gundula Koele-Pabst, Heerlen.</p>'
@@ -166,9 +151,6 @@ def _test_04_vorstand_role_extraction() -> str:
 
 
 def _test_05_sgtm_positive_fixture(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 5/6: Positive sGTM custom-domain GTM loader detection.
-    """
     pos_html = (
         '<html><head>'
         '<script src="https://metrics.custom-domain.io/gtm.js?id=GTM-TEST123"></script>'
@@ -186,9 +168,6 @@ def _test_05_sgtm_positive_fixture(normalize_tech_fn: Callable[[dict], None]) ->
 
 
 def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 6/6: Negative sGTM fixtures (stats.g.doubleclick.net/g/collect, google-analytics.com, custom g/collect without gtm.js).
-    """
     neg_fixtures = [
         (
             '<html><head>'
@@ -221,15 +200,62 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
     return "PASS (negative_1=False, negative_2=False, negative_3=False)"
 
 
+def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
+    """
+    Test 7/7 (P2-1 & P2-2):
+    1. Verifies Inweb decision_maker_name == decision_makers_json[0]['name'] == decision_makers_found[0].name
+       even when live dm_name ('Олексій Мамонтов') merges with a 3-person cached list starting with 'Ігор Мутерко'.
+    2. Verifies Liki24 stale sGTM in detected_signals and technology_evidence is sanitized.
+    """
+    raw_inweb_found = (
+        'Ігор Мутерко (Founder) [https://inweb.ua/ua/team/]; '
+        'Олексій Мамонтов (Chief Executive Officer (CEO)) [https://inweb.ua/ua/team/]; '
+        'Олександр Салієнко (Owner) [https://inweb.ua/ua/]'
+    )
+    dm_name, dm_role, dms_found_str = sanitize_cached_dms(
+        'Олексій Мамонтов',
+        'Chief Executive Officer (CEO)',
+        raw_inweb_found,
+        brand_root='inweb',
+    )
+    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, None)
+    dms_json = json.loads(dms_json_str or '[]')
+    first_found_name = (dms_found_str or '').split(';')[0].split('(')[0].strip()
+
+    if not dm_name or dm_name != dms_json[0]['name'] or dm_name != first_found_name:
+        raise AssertionError(
+            f"Inweb DM mismatch: dm_name='{dm_name}', json[0]='{dms_json[0]['name']}', found[0]='{first_found_name}'"
+        )
+    if dm_name != 'Олексій Мамонтов':
+        raise AssertionError(f"Expected CEO 'Олексій Мамонтов' to rank #1 over Founder, got '{dm_name}'")
+
+    # Liki24 stale sGTM hygiene check
+    liki_cached = {
+        'has_sgtm': True,
+        'has_ga4': True,
+        'has_gtm': True,
+        'detected_technologies': 'Google Tag Manager; Server-Side GTM (sGTM); Google Analytics (GA4); Meta Pixel',
+        'detected_signals': 'Meta Pixel, GA4, GTM, sGTM',
+        'technology_evidence': (
+            'Google Tag Manager: id=GTM-LIKI @ https://liki24.com/ | '
+            'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2" @ https://liki24.com/'
+        ),
+        'tech_scan_completeness': 'partial_cached',
+    }
+    normalize_cached_record_booleans(liki_cached)
+    if 'sGTM' in (liki_cached.get('detected_signals') or ''):
+        raise AssertionError(f"Stale sGTM remained in detected_signals: {liki_cached.get('detected_signals')}")
+    if 'Server-Side GTM' in (liki_cached.get('technology_evidence') or ''):
+        raise AssertionError(f"Stale sGTM remained in technology_evidence: {liki_cached.get('technology_evidence')}")
+
+    return "PASS (Inweb dm_name==json[0]==found[0] deterministic; Liki24 stale sGTM purged)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
     resolve_cache_comp_fn: Callable[[bool, bool, bool, bool, str], str],
 ) -> None:
-    """
-    Blocking CI/CD Regression Gate executed inside Apify container before any scraping starts.
-    If any of the 6 core regression tests fail, raises RuntimeError and aborts the run immediately.
-    """
     t0 = time.monotonic()
     suite = [
         ('test_01_corporate_entities', _test_01_corporate_entities),
@@ -241,6 +267,7 @@ def run_startup_regression_gate(
         ('test_04_vorstand_role', _test_04_vorstand_role_extraction),
         ('test_05_sgtm_positive', lambda: _test_05_sgtm_positive_fixture(normalize_tech_fn)),
         ('test_06_sgtm_negative_full', lambda: _test_06_sgtm_negative_fixtures(normalize_tech_fn)),
+        ('test_07_inweb_consistency_and_liki24_hygiene', _test_07_inweb_dm_consistency_and_liki24_hygiene),
     ]
 
     passed_count = 0
@@ -257,5 +284,5 @@ def run_startup_regression_gate(
     log_fn(
         f"[REGRESSION SUITE GATE PASS] {passed_count}/{len(suite)} tests green in {elapsed_ms:.1f}ms "
         f"(corporate_entities=PASS, determinism_3x=PASS, cache_merge=PASS, vorstand=PASS, "
-        f"sgtm_pos=True, sgtm_neg_1_2_3=False)"
+        f"sgtm_pos=True, sgtm_neg_1_2_3=False, inweb_liki24_hygiene=PASS)"
     )
