@@ -55,6 +55,7 @@ from .domain_helpers import (
     resolve_cache_merged_completeness,
     resolve_effective_phone_region,
     sanitize_cached_dms,
+    sanitize_stale_sgtm_strings,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -298,7 +299,8 @@ async def process_domain(
                             cached_copy.get('decision_maker_name'),
                             cached_copy.get('decision_maker_role'),
                             cached_copy.get('decision_makers_found'),
-                            brand_root
+                            brand_root,
+                            cached_copy.get('decision_maker_linkedin_url'),
                         )
                         cached_copy['decision_maker_name'] = c_dm_name
                         cached_copy['decision_maker_role'] = c_dm_role
@@ -737,6 +739,9 @@ async def process_domain(
                         for ct in cached_techs:
                             if ct not in live_ev_json:
                                 live_ev_json[ct] = {'source': 'cache'}
+                        raw_cached_ev = c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache'
+                        if not valid_cached_sgtm:
+                            _, raw_cached_ev = sanitize_stale_sgtm_strings(None, raw_cached_ev)
                         tech_info = {
                             'has_meta_pixel': bool(c_rec.get('has_meta_pixel') or tech_info['has_meta_pixel']),
                             'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel') or tech_info['has_tiktok_pixel']),
@@ -754,8 +759,8 @@ async def process_domain(
                             'detected_cms': c_rec.get('detected_cms') or tech_info['detected_cms'],
                             'has_cookie_banner': bool(c_rec.get('consent_mode_likely') or tech_info['has_cookie_banner']),
                             'detected_technologies_list': merged_techs,
-                            'technology_evidence': c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache',
-                            'technology_evidence_summary': build_summary_from_cached_record({'detected_technologies': '; '.join(merged_techs), 'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'), 'technology_evidence': c_rec.get('technology_evidence')}),
+                            'technology_evidence': raw_cached_ev,
+                            'technology_evidence_summary': build_summary_from_cached_record({'detected_technologies': '; '.join(merged_techs), 'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'), 'technology_evidence': raw_cached_ev}),
                             'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
                             'tech_scan_completeness': merged_comp
                         }
@@ -858,13 +863,13 @@ async def process_domain(
                 try:
                     c_rec = await cache_store.get_value(c_key)
                     if isinstance(c_rec, dict) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
+                        c_dm_li = c_rec.get('decision_maker_linkedin_url') or dm_linkedin_url
                         c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
                             c_rec.get('decision_maker_name'), c_rec.get('decision_maker_role'),
-                            c_rec.get('decision_makers_found'), brand_root
+                            c_rec.get('decision_makers_found'), brand_root, c_dm_li
                         )
                         if not c_dm_name and not c_dms_str:
                             continue
-                        c_dm_li = c_rec.get('decision_maker_linkedin_url')
                         c_dm_src = c_rec.get('decision_maker_source_url')
                         c_dm_src_type = c_rec.get('decision_maker_source_type')
                         curr_dms_count = (decision_makers_found_str or '').count(';') + (1 if decision_makers_found_str else 0)
@@ -878,19 +883,27 @@ async def process_domain(
                             break
                         elif not dm_name or cached_dms_count > curr_dms_count:
                             decision_makers_found_str = c_dms_str or decision_makers_found_str
-                            dm_name = dm_name or c_dm_name
-                            dm_role = dm_role or c_dm_role
+                            dm_name = c_dm_name or dm_name
+                            dm_role = c_dm_role or dm_role
                             dm_linkedin_url = dm_linkedin_url or c_dm_li
-                            dm_source_url = dm_source_url or c_dm_src
-                            dm_source_type = dm_source_type or c_dm_src_type
+                            dm_source_url = c_dm_src or dm_source_url
+                            dm_source_type = c_dm_src_type or dm_source_type
                             break
                 except Exception:
                     pass
 
         dm_name, dm_role, decision_makers_found_str = sanitize_cached_dms(
-            dm_name, dm_role, decision_makers_found_str, brand_root
+            dm_name, dm_role, decision_makers_found_str, brand_root, dm_linkedin_url
         )
         decision_makers_json_str = build_decision_makers_json_from_summary(decision_makers_found_str, dm_linkedin_url)
+        if decision_makers_json_str:
+            try:
+                _parsed_dms = json.loads(decision_makers_json_str)
+                if _parsed_dms and _parsed_dms[0].get('source_url'):
+                    dm_source_url = _parsed_dms[0]['source_url']
+                    dm_source_type = _parsed_dms[0].get('source_type') or classify_dm_source_type(dm_source_url)
+            except Exception:
+                pass
 
         country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
         dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
