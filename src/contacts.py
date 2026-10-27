@@ -173,11 +173,6 @@ def transliterate_ua_to_latin(text: str) -> str:
 
 
 def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
-    """
-    P1 #9: Personal email match v2.
-    Підтримує: first.last, flast, firstlast, last.first, lfirst, а також точний збіг імені (first@domain)
-    або прізвища (last@domain), якщо токен не входить у NON_PERSON_TOKENS.
-    """
     if not full_name or not email or '@' not in email:
         return False
     local = email.split('@', 1)[0].lower().strip()
@@ -199,15 +194,12 @@ def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
     last_init = last_lat[0]
     last_prefix = last_lat[:5] if len(last_lat) >= 5 else last_lat
 
-    # 1. Exact first+last або last+first
     if norm_local in (f'{first_lat}{last_lat}', f'{last_lat}{first_lat}'):
         return True
 
-    # 2. Substring both first & last prefix
     if len(first_lat) >= 3 and first_lat in local and last_prefix in local:
         return True
 
-    # 3. Initial + last_prefix або last_prefix + initial (flast, f.last, last.f)
     pattern = (
         rf'^(?:{re.escape(first_init)}[._-]?{re.escape(last_prefix)}'
         rf'|{re.escape(last_prefix)}[._-]?{re.escape(first_init)}'
@@ -216,7 +208,6 @@ def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
     if re.search(pattern, local):
         return True
 
-    # 4. Exact first_name@domain або last_name@domain (для founder/exec пошт типу benjamin@ або kosovan@)
     if (local == first_lat and len(first_lat) >= 4) or (local == last_lat and len(last_lat) >= 4):
         return True
 
@@ -745,10 +736,15 @@ def classify_dm_source_type(dm_source_url: str | None) -> str | None:
 
 
 def strip_role_tokens_from_name(candidate: str) -> str:
+    """
+    Видаляє з початку та кінця кандидата службові слова, назви відділів,
+    міста, корпоративні маркери, заголовки сторінок (_STOP_NAME_WORDS_LOWER) та капс-абревіатури.
+    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     words = [w.rstrip('-').lstrip('-') for w in words if w.rstrip('-').lstrip('-')]
     while words and (
-        words[0].lower() in ROLE_TOKEN_BLACKLIST
+        words[0].lower() in _STOP_NAME_WORDS_LOWER
+        or words[0].lower() in ROLE_TOKEN_BLACKLIST
         or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or words[0].lower() in CITY_NAMES_BLACKLIST
         or words[0].lower() in CORPORATE_ENTITY_TOKENS
@@ -757,7 +753,8 @@ def strip_role_tokens_from_name(candidate: str) -> str:
     ):
         words.pop(0)
     while words and (
-        words[-1].lower() in ROLE_TOKEN_BLACKLIST
+        words[-1].lower() in _STOP_NAME_WORDS_LOWER
+        or words[-1].lower() in ROLE_TOKEN_BLACKLIST
         or words[-1].lower() in DEPARTMENT_PREFIX_BLACKLIST
         or words[-1].lower() in CITY_NAMES_BLACKLIST
         or words[-1].lower() in CORPORATE_ENTITY_TOKENS
@@ -775,16 +772,11 @@ def strip_role_tokens_from_name(candidate: str) -> str:
 
 
 def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
-    """
-    P0 #2 Fix: Відсікає корпоративні сутності (BPO Capital, GFH Gesellschaft, YOU Verwaltungs)
-    та будь-які токени з капс-абревіатурами або суфіксами юросіб.
-    """
     words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
     if len(words) not in (2, 3):
         return False
     if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
         return False
-    # Якщо будь-яке слово повністю у верхньому регістрі (BPO, GFH, YOU, AG, SE) — це юрособа/абревіатура, не людина
     if any(w.isupper() for w in words):
         return False
     words_low = [w.lower() for w in words]
@@ -797,7 +789,6 @@ def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
         for wl in words_low
     ):
         return False
-    # Перевірка на типові німецькі корпоративні закінчення (-gesellschaft, -verwaltung, -beteiligung, -stiftung)
     if any(wl.endswith(('gesellschaft', 'verwaltung', 'verwaltungs', 'beteiligung', 'stiftung', 'holding', 'konzern')) for wl in words_low):
         return False
     if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
@@ -818,9 +809,13 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
 
 
 def strip_testimonial_elements_and_get_clean_text(soup: BeautifulSoup) -> str:
+    """
+    Видаляє цитати/відгуки і повертає текст із структурним роздільником ' . ' між блочними елементами,
+    щоб заголовок <h2>Management</h2> ніколи не склеювався в одне речення з <p>Benjamin Otto</p>.
+    """
     for tag in soup.find_all(['blockquote', 'cite', 'q']):
         tag.decompose()
-    return soup.get_text(' ', strip=True)
+    return soup.get_text(' . ', strip=True)
 
 
 def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: int, cand_name: str = '') -> bool:
@@ -848,10 +843,6 @@ def build_decision_makers_json_from_summary(
     dms_summary_str: str | None,
     primary_li_url: str | None = None
 ) -> str | None:
-    """
-    Конвертує semicolon-рядок decision_makers_found (або кешований запис) у валідний JSON-масив,
-    відфільтровуючи будь-які застарілі корпоративні сутності (BPO Capital, GFH Gesellschaft, YOU Verwaltungs).
-    """
     if not dms_summary_str:
         return None
     items = []
@@ -889,10 +880,6 @@ def build_decision_makers_json_from_summary(
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None, str | None]:
-    """
-    Повертає 8 значень:
-    (dm_name, dm_role, dm_linkedin_url, dm_source_url, dm_source_is_legal, dm_source_type, dms_summary_str, dms_json_str)
-    """
     candidate_li_urls: list[str] = []
     found_dms_by_name: dict[str, dict] = {}
 
