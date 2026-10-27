@@ -139,10 +139,17 @@ def resolve_cache_merged_completeness(
     pw_had_timeout_or_block: bool,
     live_found_something: bool,
     current_comp: str,
+    has_ga4_live: bool = False,
 ) -> str:
+    """
+    Завдання 1 (v20.11 P0 Fix):
+    1. Якщо живий скан сам знайшов GA4 (has_ga4_live=True) та інші теги без таймаутів/блокувань (навіть через швидкий curl, коли pw_used_flag=False) -> 'full'.
+    2. Якщо ж GA4 був відсутній у живому скані (has_ga4_live=False) і відновлений із кешу (has_ga4_merged=True) -> 'partial_cached'.
+    """
+    if has_ga4_live and live_found_something and not pw_had_timeout_or_block:
+        return 'full'
     if has_ga4_merged:
-        live_was_clean = pw_used_flag and not pw_had_timeout_or_block and live_found_something
-        return 'full' if live_was_clean else 'partial_cached'
+        return 'partial_cached'
     return current_comp if current_comp != 'full' else 'partial_gtm'
 
 
