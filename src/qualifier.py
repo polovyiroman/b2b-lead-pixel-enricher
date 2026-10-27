@@ -16,6 +16,16 @@ from .contacts import (
 )
 from .tech_detector import build_evidence_json_from_cached_record
 
+KNOWN_DTC_ECOM_DOMAINS = {
+    'glossier.com',
+    'chubbiesshorts.com',
+    'cher17.com',
+    'asos.com',
+    'laredoute.fr',
+    'docmorris.de',
+    'coolblue.nl',
+}
+
 
 def is_marketplace_platform(canonical_domain: str, page_title: str, meta_desc: str) -> bool:
     if canonical_domain.lower() in KNOWN_MARKETPLACE_DOMAINS:
@@ -31,8 +41,13 @@ def classify_company_category(
     detected_tech: list[str],
     html_sample: str = ''
 ) -> tuple[str, str]:
-    text = f'{domain} {page_title} {meta_desc}'.lower()
-    html_low = html_sample[:15000].lower()
+    dom_low = (domain or '').lower().replace('www.', '')
+    text = f'{dom_low} {page_title} {meta_desc}'.lower()
+    # Аналізуємо як початок, так і кінець HTML (де лежать <!-- pw_net_req: ... --> коментарі)
+    if len(html_sample) > 60000:
+        html_low = (html_sample[:40000] + '\n' + html_sample[-20000:]).lower()
+    else:
+        html_low = html_sample.lower()
 
     agency_keywords = (
         'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
@@ -65,6 +80,7 @@ def classify_company_category(
         'loja online', 'frete grátis', 'carrinho', 'comprar agora',
         'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv',
         'fashion', 'fashion online', 'accessories', 'footwear', 'sportswear', 'streetwear',
+        'skincare', 'makeup', 'fragrance', 'cosmetics', 'beauty products', 'body care', 'shorts', 'swimwear',
         'mode', 'bekleidung', 'kleidung', 'schuhe', 'taschen', 'accessoires',
         'damenmode', 'herrenmode', 'online-shop für mode', 'top-marken', 'versandapotheke', 'online-apotheke',
         'prêt-à-porter', 'vêtements', 'chaussures', 'sacs', 'mode en ligne',
@@ -79,12 +95,33 @@ def classify_company_category(
         or 'og:type" content="product"' in html_low
     )
     if (
-        domain.lower() in KNOWN_MARKETPLACE_DOMAINS
+        dom_low in KNOWN_MARKETPLACE_DOMAINS
+        or dom_low in KNOWN_DTC_ECOM_DOMAINS
         or any(cms in detected_tech for cms in ('Shopify', 'WooCommerce'))
         or has_product_schema
         or any(k in text for k in ecom_keywords)
     ):
         return 'E-commerce / Retail Brand', 'high'
+
+    # Завдання 1 (v20.10 Glossier SPA Fix): Fallback-сигнали для headless/SPA E-commerce вітрин,
+    # коли основний бандл Shopify не відрендерив класичний cdn.shopify.com у перших 15KB
+    spa_ecom_markers = (
+        'cdn.shopify.com',
+        'myshopify.com',
+        'window.shopify',
+        'shopify.theme',
+        '/cart.js',
+        '/checkout',
+        '"cart"',
+        '"product"',
+        '"variant"',
+        'add to cart',
+        'add-to-cart',
+        'addtocart',
+    )
+    spa_hits = sum(1 for m in spa_ecom_markers if m in html_low or m in text)
+    if spa_hits >= 2:
+        return 'E-commerce / Retail Brand', 'medium'
 
     saas_keywords = (
         'saas', 'cloud platform', 'crm', 'api', 'b2b software', 'automation platform',
@@ -105,7 +142,7 @@ def classify_company_category(
         or any(t in detected_tech for t in ('Google Ads Conversion', 'LinkedIn Insight Tag', 'Meta Pixel', 'TikTok Pixel', 'Intercom'))
     )
     is_explicit_npo = (
-        domain.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua', '.gob.es', '.gouv.fr'))
+        dom_low.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua', '.gob.es', '.gouv.fr'))
         or any(
             phrase in text for phrase in (
                 'благодійний фонд', 'charitable foundation', 'громадська організація',
@@ -357,7 +394,6 @@ def evaluate_qualification_v180(
         analytics_tags.append('GA4')
     if tech_info.get('has_gtm') or 'Google Tag Manager' in detected_list:
         analytics_tags.append('GTM')
-    # Завдання 7 (P3): sGTM гарантовано потрапляє в analytics_tags та detected_signals
     if tech_info.get('has_sgtm') or 'Server-Side GTM (sGTM)' in detected_list:
         analytics_tags.append('sGTM')
 
@@ -370,7 +406,6 @@ def evaluate_qualification_v180(
     has_cookie_banner = tech_info.get('has_cookie_banner', False)
     scan_comp = tech_info.get('tech_scan_completeness', 'full')
 
-    # Завдання 6 (P2): Уніфікована перевірка статусів порожньої оболонки та WAF-блокування
     pw_blocked_by_waf = (
         pw_status_str.startswith('launched_blocked')
         or pw_status_str in ('skipped_hopeless_waf', 'launched_empty_shell', 'launched_empty')
