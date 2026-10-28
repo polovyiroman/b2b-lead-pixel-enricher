@@ -39,6 +39,17 @@ _BROWSER_LOCK = asyncio.Lock()
 _PW_SEMAPHORE = asyncio.Semaphore(3)
 _ESCALATION_PROXY_CFG = None
 
+STRIPPABLE_SUBDOMAIN_PREFIXES = {
+    'www', 'en', 'de', 'uk', 'ua', 'ru', 'fr', 'es', 'it', 'nl',
+    'pl', 'pt', 'se', 'sv', 'no', 'dk', 'da', 'fi', 'cz', 'cs',
+    'ro', 'hu', 'at', 'ch', 'be', 'us', 'gb', 'eu', 'int', 'global', 'm'
+}
+
+MULTI_PART_TLDS = (
+    '.com.ua', '.co.uk', '.org.ua', '.net.ua', '.gov.ua', '.edu.ua',
+    '.in.ua', '.kiev.ua', '.lviv.ua', '.co.de', '.com.pl', '.com.br'
+)
+
 
 def is_playwright_available() -> bool:
     return _PLAYWRIGHT_AVAILABLE
@@ -67,12 +78,22 @@ async def close_shared_playwright_browser() -> None:
             _SHARED_PW = None
 
 
+def strip_language_or_www_subdomains(host: str) -> str:
+    """
+    P1-A Fix (v20.16): Зрізає 'www.' та мовні/регіональні піддомени ('en.zalando.de' -> 'zalando.de',
+    'en.aboutyou.de' -> 'aboutyou.de'), не зачіпаючи двочастинні TLD (.com.ua, .co.uk).
+    """
+    h = (host or '').strip().lower().strip('.')
+    if not h:
+        return h
+    min_parts = 3 if h.endswith(MULTI_PART_TLDS) else 2
+    parts = h.split('.')
+    while len(parts) > min_parts and parts[0] in STRIPPABLE_SUBDOMAIN_PREFIXES:
+        parts.pop(0)
+    return '.'.join(parts)
+
+
 def _is_safe_domain(netloc: str) -> bool:
-    """
-    P1-C Fix (v20.15 SSRF Protection):
-    Відхиляє IP-літерали (127.0.0.1, 10.x.x.x, 192.168.x.x, 169.254.169.254, IPv6),
-    внутрішні TLD (.local, .internal, .lan, .localhost, .arpa) та невалідні символи хоста.
-    """
     if not netloc:
         return False
     host = netloc.split(':')[0].strip().lower().strip('[]')
@@ -113,8 +134,7 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
         host = parsed.netloc or parsed.path.split('/')[0]
         host = host.split('@')[-1]
         host = re.sub(r':\d+$', '', host).strip('.')
-        if host.startswith('www.'):
-            host = host[4:]
+        host = strip_language_or_www_subdomains(host)
 
         if not _is_safe_domain(host):
             continue
@@ -132,16 +152,18 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
 
 
 def get_clean_canonical_domain(final_url: str, fallback_domain: str) -> str:
+    fb_clean = strip_language_or_www_subdomains(fallback_domain)
     try:
         parsed = urlparse(final_url)
-        host = re.sub(r':\d+$', '', parsed.netloc.lower())
-        if host.startswith('www.'):
-            host = host[4:]
+        host = re.sub(r':\d+$', '', parsed.netloc.lower()).strip('.')
         if not host or CHECKOUT_REDIRECT_HOSTS.match(host):
-            return KNOWN_DOMAIN_REDIRECT_ALIASES.get(fallback_domain, fallback_domain)
+            return KNOWN_DOMAIN_REDIRECT_ALIASES.get(fb_clean, fb_clean)
+        host = strip_language_or_www_subdomains(host)
+        if not host:
+            return KNOWN_DOMAIN_REDIRECT_ALIASES.get(fb_clean, fb_clean)
         return KNOWN_DOMAIN_REDIRECT_ALIASES.get(host, host)
     except Exception:
-        return KNOWN_DOMAIN_REDIRECT_ALIASES.get(fallback_domain, fallback_domain)
+        return KNOWN_DOMAIN_REDIRECT_ALIASES.get(fb_clean, fb_clean)
 
 
 def classify_failure_status(status: int, err_msg: str) -> str:
@@ -299,7 +321,7 @@ def extract_semantic_contact_links_from_html(
         parsed = urlparse(full_u)
         if parsed.scheme not in ('http', 'https'):
             continue
-        host = parsed.netloc.lower().replace('www.', '')
+        host = strip_language_or_www_subdomains(parsed.netloc.lower())
         if host != canonical_domain and not host.endswith(f'.{canonical_domain}'):
             continue
         path_low = parsed.path.lower()
@@ -350,7 +372,7 @@ def parse_html_sync(
         raw_tel_candidates.append((sm, 'schema_telephone'))
 
     parsed_base = urlparse(page_url)
-    base_host = re.sub(r':\d+$', '', parsed_base.netloc.lower()).replace('www.', '')
+    base_host = strip_language_or_www_subdomains(re.sub(r':\d+$', '', parsed_base.netloc.lower()))
     brand_root = base_host.split('.')[0] if base_host else ''
 
     social_candidates: dict[str, list[tuple[str, str]]] = {
@@ -398,7 +420,7 @@ def parse_html_sync(
                     social_candidates[plat].append((clean_soc, page_url))
                 break
         else:
-            clean_u_host = re.sub(r':\d+$', '', u_host).replace('www.', '')
+            clean_u_host = strip_language_or_www_subdomains(re.sub(r':\d+$', '', u_host))
             if clean_u_host == base_host or clean_u_host.endswith(f'.{base_host}'):
                 path_low = p_u.path.lower()
                 anchor_txt = a_tag.get_text(' ', strip=True).lower()
