@@ -2,6 +2,7 @@ import json
 import time
 from typing import Callable
 
+from .config import DEFAULT_MANUAL_SEEDS
 from .contacts import (
     build_decision_makers_json_from_summary,
     classify_email_type,
@@ -10,7 +11,11 @@ from .contacts import (
     strip_role_tokens_from_name,
 )
 from .domain_helpers import (
+    KNOWN_POISONED_CACHE_RECOVERY,
+    KNOWN_PW_HOPELESS,
+    SALES_ACTIONABILITY_ENUM_VALUES,
     build_safe_cache_payload,
+    derive_sales_actionability_class,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
@@ -19,6 +24,10 @@ from .domain_helpers import (
 from .qualifier import (
     classify_company_category,
     compute_data_quality_score,
+)
+from .scraper import (
+    _is_safe_domain,
+    prepare_domains,
 )
 from .tech_detector import detect_tech_with_evidence
 
@@ -362,14 +371,6 @@ def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tec
 
 
 def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 11/11 (v20.14 P1 Cache Poisoning Fix):
-    1. Simulates poisoned v20.12 cache for liki24.com ([GA4, Google Ads] only) + empty live render ->
-       verifies heal_poisoned_cache_record restores all 4 techs ([GTM, GA4, Google Ads, Meta Pixel])
-       and data_quality_score >= 20.
-    2. Simulates build_safe_cache_payload: ensures a partial scan with 2 techs NEVER overwrites
-       a prior cached record that had 4 techs, and sets _partial_write=True.
-    """
     poisoned_v2012_cache = {
         'has_ga4': True,
         'has_gtm': False,
@@ -423,7 +424,6 @@ def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Ca
     if liki_score < 20:
         raise AssertionError(f"Expected Liki24 score >= 20 after healing, got {liki_score}")
 
-    # Test non-destructive cache write policy
     prior_clean_cache = {
         'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
         'has_gtm': True,
@@ -449,6 +449,64 @@ def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Ca
     return f"PASS (Poisoned Liki24 healed to 4 techs, score={liki_score}>=20; _partial_write safe union verified)"
 
 
+def _test_12_v2015_security_ssrf_rozetka_and_actionability_enum() -> str:
+    """
+    Test 12/12 (v20.15 Stage 1 & Stage 2 Gate):
+    1. Verifies _is_safe_domain blocks SSRF targets (127.0.0.1, 10.0.0.1, 192.168.1.1, 169.254.169.254, .local, file://).
+    2. Verifies DEFAULT_MANUAL_SEEDS['rozetka.com.ua']['all_ga4_ids'] is None (no fake G-ROZETKA-GA4).
+    3. Verifies grammarly.com, laredoute.fr, zalando.de are in KNOWN_PW_HOPELESS.
+    4. Verifies KNOWN_POISONED_CACHE_RECOVERY['liki24.com'] has recovery_verified_at & max_recovery_age_days.
+    5. Verifies derive_sales_actionability_class maps strictly to SALES_ACTIONABILITY_ENUM_VALUES.
+    """
+    unsafe_targets = [
+        '127.0.0.1',
+        '10.0.0.1',
+        '192.168.1.1',
+        '169.254.169.254',
+        'localhost',
+        'metadata.internal',
+        'printer.local',
+        'router.lan',
+    ]
+    for bad in unsafe_targets:
+        if _is_safe_domain(bad):
+            raise AssertionError(f"SSRF check failed: unsafe target '{bad}' was accepted")
+
+    if not _is_safe_domain('example.com') or not _is_safe_domain('ringostat.com'):
+        raise AssertionError("Valid domain 'example.com' was falsely rejected by _is_safe_domain")
+
+    prep = prepare_domains(['file:///etc/passwd', 'http://127.0.0.1:8080/admin', 'https://macpaw.com'])
+    if len(prep) != 1 or prep[0][0] != 'macpaw.com':
+        raise AssertionError(f"prepare_domains failed SSRF filtering: {prep}")
+
+    rozetka_seed = DEFAULT_MANUAL_SEEDS.get('rozetka.com.ua', {})
+    if rozetka_seed.get('all_ga4_ids') is not None:
+        raise AssertionError(f"Fake Rozetka GA4 ID still present: {rozetka_seed.get('all_ga4_ids')}")
+
+    for hopeless_dom in ('grammarly.com', 'laredoute.fr', 'zalando.de'):
+        if hopeless_dom not in KNOWN_PW_HOPELESS:
+            raise AssertionError(f"Expected '{hopeless_dom}' in KNOWN_PW_HOPELESS")
+
+    liki_rec = KNOWN_POISONED_CACHE_RECOVERY.get('liki24.com', {})
+    if not liki_rec.get('recovery_verified_at') or not liki_rec.get('max_recovery_age_days'):
+        raise AssertionError("KNOWN_POISONED_CACHE_RECOVERY['liki24.com'] missing expiry metadata")
+
+    enum_cases = [
+        ('Sales-Ready Tier 1.5 (Verified DM)', 'E-commerce / Retail Brand', 'sales_ready'),
+        ('Partnership-Ready Only (B2B Inbox)', 'SaaS / Marketplace / Tech Platform', 'partnership'),
+        ('Gatekeeper-Ready Only (Office Inbox)', 'E-commerce / Retail Brand', 'gatekeeper'),
+        ('Tech-Qualified Account Only', 'E-commerce / Retail Brand', 'tech_only'),
+        ('Partner Pipeline Only', 'B2B Agency / Marketing Media', 'partner_agency'),
+        ('Unverified (Scan Blocked by WAF)', 'E-commerce / Retail Brand', 'unqualified'),
+    ]
+    for verd, cat, expected_cls in enum_cases:
+        got = derive_sales_actionability_class(verd, cat)
+        if got != expected_cls or got not in SALES_ACTIONABILITY_ENUM_VALUES:
+            raise AssertionError(f"Actionability enum mismatch for '{verd}': expected '{expected_cls}', got '{got}'")
+
+    return "PASS (SSRF blocked; G-ROZETKA-GA4 removed; PW hopeless updated; 6-enum actionability verified)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -470,6 +528,7 @@ def run_startup_regression_gate(
         ('test_09_curl_clean_live_without_cms_stays_full', lambda: _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn)),
         ('test_10_aboutyou_ga4_cap_and_affiliate_creator', lambda: _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn)),
         ('test_11_poisoned_cache_recovery_and_safe_write', lambda: _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn)),
+        ('test_12_v2015_security_ssrf_rozetka_and_actionability', _test_12_v2015_security_ssrf_rozetka_and_actionability_enum),
     ]
 
     passed_count = 0
