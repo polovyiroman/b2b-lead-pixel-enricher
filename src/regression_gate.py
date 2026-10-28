@@ -10,11 +10,16 @@ from .contacts import (
     strip_role_tokens_from_name,
 )
 from .domain_helpers import (
+    build_safe_cache_payload,
+    heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
     sanitize_cached_dms,
 )
-from .qualifier import classify_company_category
+from .qualifier import (
+    classify_company_category,
+    compute_data_quality_score,
+)
 from .tech_detector import detect_tech_with_evidence
 
 
@@ -102,18 +107,14 @@ def _test_03_cache_merge_completeness_and_liki24_partial_merge(
     normalize_tech_fn: Callable[[dict], None],
     resolve_cache_comp_fn: Callable[..., str],
 ) -> str:
-    # Case A: Cache has GA4=True, live scan failed -> 'partial_cached'
     comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked', False)
     if comp_comfy != 'partial_cached':
         raise AssertionError(f"Comfy case: expected 'partial_cached', got '{comp_comfy}'")
 
-    # Case B: Macpaw curl succeeded (pw_used=False, pw_had_timeout=False, has_ga4_live=True) -> 'full'
     comp_macpaw_curl = resolve_cache_comp_fn(True, False, False, True, 'full', True)
     if comp_macpaw_curl != 'full':
         raise AssertionError(f"Macpaw curl-clean live case: expected 'full', got '{comp_macpaw_curl}'")
 
-    # Case C (v20.13 P1 Liki24 Fix): Live partial has [GA4, Google Ads] with pw_had_timeout=True;
-    # Cache has [GTM, GA4, Google Ads, Meta Pixel] -> must merge GTM + Meta Pixel and set 'partial_cached'
     liki_live_partial = {
         'has_ga4': True,
         'has_gtm': False,
@@ -158,7 +159,6 @@ def _test_03_cache_merge_completeness_and_liki24_partial_merge(
     if merged_liki.get('tech_scan_completeness') != 'partial_cached' or not was_recovered or added_cnt != 2:
         raise AssertionError(f"Liki24 expected partial_cached with 2 recovered techs, got comp={merged_liki.get('tech_scan_completeness')}, cnt={added_cnt}")
 
-    # Case D: 0 techs detected with 'full' -> 'partial_empty_render'
     empty_tech_info = {
         'detected_technologies_list': [],
         'tech_scan_completeness': 'full',
@@ -335,13 +335,6 @@ def _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn: Callable[
 
 
 def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 10/10 (v20.13 P2 Escalated Blockers):
-    1. Verifies 27 GA4 IDs are capped to 5 in all_ga4_ids, all_ga4_ids_count == 27,
-       and ga4_detection_confidence == 'High (multiplexed 27-property)'.
-    2. Verifies 'affiliate.creator@aboutyou.com' is classified as 'influencer_gifting_inbox' (not 'b2b_partnerships'),
-       while 'partnerwerden@docmorris.de' and 'sales@ringostat.com' remain B2B/Sales.
-    """
     fake_27_ids = [f'G-TEST{i:02d}ABCD' for i in range(1, 28)]
     scripts = ''.join(f"<script>gtag('config', '{gid}');</script>" for gid in fake_27_ids)
     html_27 = f"<html><head>{scripts}</head><body>AboutYou</body></html>"
@@ -356,18 +349,104 @@ def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tec
     if info_27.get('ga4_detection_confidence') != 'High (multiplexed 27-property)':
         raise AssertionError(f"Expected 'High (multiplexed 27-property)', got '{info_27.get('ga4_detection_confidence')}'")
 
-    # Check email classification for affiliate.creator@aboutyou.com
     ay_type = classify_email_type('affiliate.creator@aboutyou.com', 'aboutyou')
     if ay_type != 'influencer_gifting_inbox':
         raise AssertionError(f"Expected 'influencer_gifting_inbox' for affiliate.creator@aboutyou.com, got '{ay_type}'")
 
-    # Ensure legitimate B2B emails do not regress
     if classify_email_type('partnerwerden@docmorris.de', 'docmorris') != 'b2b_partnerships':
         raise AssertionError("partnerwerden@docmorris.de regressed from b2b_partnerships")
     if classify_email_type('sales@ringostat.com', 'ringostat') != 'wholesale_or_sales_inbox':
         raise AssertionError("sales@ringostat.com regressed from wholesale_or_sales_inbox")
 
     return "PASS (27 GA4 IDs capped to 5 + count=27; affiliate.creator@ -> influencer_gifting_inbox)"
+
+
+def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Callable[[dict], None]) -> str:
+    """
+    Test 11/11 (v20.14 P1 Cache Poisoning Fix):
+    1. Simulates poisoned v20.12 cache for liki24.com ([GA4, Google Ads] only) + empty live render ->
+       verifies heal_poisoned_cache_record restores all 4 techs ([GTM, GA4, Google Ads, Meta Pixel])
+       and data_quality_score >= 20.
+    2. Simulates build_safe_cache_payload: ensures a partial scan with 2 techs NEVER overwrites
+       a prior cached record that had 4 techs, and sets _partial_write=True.
+    """
+    poisoned_v2012_cache = {
+        'has_ga4': True,
+        'has_gtm': False,
+        'has_google_ads': True,
+        'has_meta_pixel': False,
+        'all_ga4_ids': 'G-FRYX20Z9FG',
+        'detected_technologies': 'Google Analytics (GA4); Google Ads Conversion',
+        'technology_evidence': 'GA4 + Google Ads only (poisoned in v20.12)',
+    }
+    healed_cache = heal_poisoned_cache_record('liki24.com', poisoned_v2012_cache)
+    empty_live = {
+        'has_ga4': False,
+        'has_gtm': False,
+        'has_google_ads': False,
+        'has_meta_pixel': False,
+        'has_tiktok_pixel': False,
+        'has_linkedin_pixel': False,
+        'has_pinterest_tag': False,
+        'has_hubspot': False,
+        'has_klaviyo': False,
+        'has_sgtm': False,
+        'all_ga4_ids': None,
+        'ga4_detection_confidence': None,
+        'detected_cms_list': [],
+        'detected_cms': None,
+        'has_cookie_banner': False,
+        'detected_technologies_list': [],
+        'technology_evidence': None,
+        'technology_evidence_summary': None,
+        'technology_evidence_json': None,
+        'tech_scan_completeness': 'partial_empty_render',
+    }
+    merged_liki, _, _ = merge_missing_techs_from_cache(
+        empty_live, healed_cache or {}, pw_used_flag=True, pw_had_timeout_or_block=False
+    )
+    normalize_tech_fn(merged_liki)
+    techs = merged_liki.get('detected_technologies_list') or []
+    if len(techs) < 4 or 'Google Tag Manager' not in techs or 'Meta Pixel' not in techs:
+        raise AssertionError(f"Poisoned Liki24 cache failed to heal to 4 techs: {techs}")
+
+    liki_score = compute_data_quality_score(
+        'Tier D (Low Sales Fit: customer_support_inbox)',
+        len(techs),
+        None,
+        None,
+        None,
+        merged_liki['tech_scan_completeness'],
+        True,
+        company_category='E-commerce / Retail Brand',
+    )
+    if liki_score < 20:
+        raise AssertionError(f"Expected Liki24 score >= 20 after healing, got {liki_score}")
+
+    # Test non-destructive cache write policy
+    prior_clean_cache = {
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
+        'has_gtm': True,
+        'has_ga4': True,
+        'has_google_ads': True,
+        'has_meta_pixel': True,
+    }
+    bad_partial_run = {
+        'tech_scan_completeness': 'partial_blocked',
+        'detected_technologies': 'Google Analytics (GA4); Google Ads Conversion',
+        'has_gtm': None,
+        'has_ga4': True,
+        'has_google_ads': True,
+        'has_meta_pixel': None,
+    }
+    safe_payload = build_safe_cache_payload(bad_partial_run, prior_clean_cache)
+    if safe_payload.get('_partial_write') is not True:
+        raise AssertionError("Expected _partial_write=True on partial cache payload")
+    saved_techs = [x.strip() for x in (safe_payload.get('detected_technologies') or '').split(';') if x.strip()]
+    if len(saved_techs) != 4 or 'Google Tag Manager' not in saved_techs or 'Meta Pixel' not in saved_techs:
+        raise AssertionError(f"Safe cache write policy allowed partial run to overwrite rich cache: {saved_techs}")
+
+    return f"PASS (Poisoned Liki24 healed to 4 techs, score={liki_score}>=20; _partial_write safe union verified)"
 
 
 def run_startup_regression_gate(
@@ -390,6 +469,7 @@ def run_startup_regression_gate(
         ('test_08_glossier_spa_ecommerce_category', _test_08_glossier_spa_ecommerce_category),
         ('test_09_curl_clean_live_without_cms_stays_full', lambda: _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn)),
         ('test_10_aboutyou_ga4_cap_and_affiliate_creator', lambda: _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn)),
+        ('test_11_poisoned_cache_recovery_and_safe_write', lambda: _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn)),
     ]
 
     passed_count = 0
