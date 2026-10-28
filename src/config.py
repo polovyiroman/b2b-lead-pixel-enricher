@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 23
+CACHE_SCHEMA_VERSION = 24
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -534,8 +534,6 @@ WHOLESALE_MERCH_PREFIXES = (
     'ventas', 'compras', 'mayorista', 'vendite', 'acquisti', 'sprzedaz',
     'hurt', 'hurtownia', 'zamowienia', 'verkoop', 'inkoop', 'salg', 'inkop', 'forsaljning'
 )
-# P2 Fix (AboutYou affiliate.creator@): Додано 'creator', 'collab', 'ugc', 'talent'
-# щоб адреси типу affiliate.creator@aboutyou.com класифікувалися як influencer_gifting_inbox, а не b2b_partnerships
 INFLUENCER_PREFIXES = (
     'gteam', 'creator', 'creators', 'influencer', 'influencers', 'gifting',
     'collab', 'collabs', 'ambassador', 'ambassadors', 'ugc', 'talent', 'talents'
@@ -782,10 +780,10 @@ DEFAULT_MANUAL_SEEDS: dict[str, dict] = {
         'has_pinterest_tag': False,
         'has_hubspot': False,
         'has_klaviyo': False,
-        'all_ga4_ids': 'G-ROZETKA-GA4',
-        'ga4_detection_confidence': 'Verified (Manual Audit Seed)',
+        'all_ga4_ids': None,
+        'ga4_detection_confidence': 'Manual seed (ID not disclosed)',
         'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel; TikTok Pixel',
-        'technology_evidence_summary': 'GTM, GA4, Google Ads, Meta Pixel, TikTok Pixel (Manual Audit Seed)',
+        'technology_evidence_summary': 'GTM, GA4 (dynamic), Google Ads, Meta Pixel, TikTok Pixel (Manual Audit Seed)',
         'technology_evidence': 'Verified Tier-1 Enterprise Stack (GTM + GA4 + Meta Pixel + Google Ads + TikTok Pixel) via manual_audit seed',
         'verified_at': '2026-10-15T12:00:00Z'
     }
