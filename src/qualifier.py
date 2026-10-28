@@ -43,7 +43,6 @@ def classify_company_category(
 ) -> tuple[str, str]:
     dom_low = (domain or '').lower().replace('www.', '')
     text = f'{dom_low} {page_title} {meta_desc}'.lower()
-    # Аналізуємо як початок, так і кінець HTML (де лежать <!-- pw_net_req: ... --> коментарі)
     if len(html_sample) > 60000:
         html_low = (html_sample[:40000] + '\n' + html_sample[-20000:]).lower()
     else:
@@ -103,8 +102,6 @@ def classify_company_category(
     ):
         return 'E-commerce / Retail Brand', 'high'
 
-    # Завдання 1 (v20.10 Glossier SPA Fix): Fallback-сигнали для headless/SPA E-commerce вітрин,
-    # коли основний бандл Shopify не відрендерив класичний cdn.shopify.com у перших 15KB
     spa_ecom_markers = (
         'cdn.shopify.com',
         'myshopify.com',
@@ -262,7 +259,11 @@ def compute_data_quality_score(
         score += 6
 
     if scan_completeness != 'full' or techs_count == 0:
-        score -= 15
+        if scan_completeness == 'partial_cached' and techs_count >= 4 and not dm_name and not primary_phone:
+            # Для e-com/marketplace з повним 4+ тех-стеком у кеші (як Liki24), щоб не падати нижче порогу фільтрації SDR (score >= 20)
+            score -= 8
+        else:
+            score -= 15
 
     score = max(0, min(100, score))
 
