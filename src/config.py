@@ -3,9 +3,10 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 22
+CACHE_SCHEMA_VERSION = 23
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
+MAX_DISPLAY_GA4_IDS = 5
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 HEX_HASH_LOCAL_REGEX = re.compile(r'^[a-f0-9]{20,}$', re.IGNORECASE)
@@ -17,8 +18,6 @@ SCHEMA_PHONE_REGEX = re.compile(
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Завдання 3-close-fix (P0): Детекція Server-Side GTM (sGTM) ТІЛЬКИ за кастомним завантажувачем контейнера /gtm.js?id=GTM-...
-# Без /g/collect?v=2 (який давав false-positive на stats.g.doubleclick.net/g/collect).
 SGTM_CUSTOM_LOADER_REGEX = re.compile(
     r'https?://(?!(?:[a-z0-9-]+\.)?'
     r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
@@ -535,8 +534,11 @@ WHOLESALE_MERCH_PREFIXES = (
     'ventas', 'compras', 'mayorista', 'vendite', 'acquisti', 'sprzedaz',
     'hurt', 'hurtownia', 'zamowienia', 'verkoop', 'inkoop', 'salg', 'inkop', 'forsaljning'
 )
+# P2 Fix (AboutYou affiliate.creator@): Додано 'creator', 'collab', 'ugc', 'talent'
+# щоб адреси типу affiliate.creator@aboutyou.com класифікувалися як influencer_gifting_inbox, а не b2b_partnerships
 INFLUENCER_PREFIXES = (
-    'gteam', 'creators', 'influencers', 'influencer', 'gifting', 'collabs', 'ambassador', 'ambassadors'
+    'gteam', 'creator', 'creators', 'influencer', 'influencers', 'gifting',
+    'collab', 'collabs', 'ambassador', 'ambassadors', 'ugc', 'talent', 'talents'
 )
 GENERAL_OFFICE_PREFIXES = (
     'info', 'contact', 'hello', 'hi', 'office', 'team', 'business',
