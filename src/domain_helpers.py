@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import os
 import re
 import time
@@ -21,6 +22,10 @@ from .qualifier import (
     classify_company_category,
 )
 from .scraper import is_playwright_available
+from .tech_detector import (
+    build_summary_from_cached_record,
+    cap_ga4_ids_and_confidence,
+)
 
 TECH_FLAG_TO_NAME_MAP = (
     ('has_meta_pixel', 'Meta Pixel'),
@@ -141,16 +146,112 @@ def resolve_cache_merged_completeness(
     current_comp: str,
     has_ga4_live: bool = False,
 ) -> str:
-    """
-    Завдання 1 (v20.11 P0 Fix):
-    1. Якщо живий скан сам знайшов GA4 (has_ga4_live=True) та інші теги без таймаутів/блокувань (навіть через швидкий curl, коли pw_used_flag=False) -> 'full'.
-    2. Якщо ж GA4 був відсутній у живому скані (has_ga4_live=False) і відновлений із кешу (has_ga4_merged=True) -> 'partial_cached'.
-    """
     if has_ga4_live and live_found_something and not pw_had_timeout_or_block:
         return 'full'
     if has_ga4_merged:
         return 'partial_cached'
     return current_comp if current_comp != 'full' else 'partial_gtm'
+
+
+def merge_missing_techs_from_cache(
+    tech_info: dict,
+    c_rec: dict,
+    pw_used_flag: bool,
+    pw_had_timeout_or_block: bool,
+) -> tuple[dict, bool, int]:
+    """
+    P1 Fix (Liki24 Cache Merge):
+    Якщо живий скан був неповним (not has_ga4_live АБО pw_had_timeout_or_block АБО comp != 'full'),
+    доповнює tech_info відсутніми технологіями з верифікованого кешу (напр. GTM + Meta Pixel на liki24.com),
+    виставляючи tech_scan_completeness = 'partial_cached'.
+    Якщо ж живий скан був чистим (has_ga4_live=True і not pw_had_timeout_or_block, як на Macpaw/Ringostat),
+    підтягує лише відсутній detected_cms, зберігаючи tech_scan_completeness = 'full'.
+    """
+    has_ga4_live = bool(tech_info.get('has_ga4'))
+    live_comp = tech_info.get('tech_scan_completeness', 'full')
+    live_is_clean_full = has_ga4_live and not pw_had_timeout_or_block and live_comp == 'full'
+
+    if live_is_clean_full:
+        if not tech_info.get('detected_cms') and c_rec.get('detected_cms'):
+            c_cms_str = c_rec['detected_cms']
+            c_cms_list = [x.strip() for x in c_cms_str.split(';') if x.strip()]
+            tech_info['detected_cms'] = c_cms_str
+            tech_info['detected_cms_list'] = c_cms_list
+            for cms_item in c_cms_list:
+                if cms_item not in tech_info['detected_technologies_list']:
+                    tech_info['detected_technologies_list'].append(cms_item)
+        return tech_info, False, 0
+
+    raw_t = c_rec.get('detected_technologies') or ''
+    valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
+    cached_techs = [
+        x.strip() for x in raw_t.split(';')
+        if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
+    ]
+    if not cached_techs:
+        return tech_info, False, 0
+
+    curr_techs = tech_info.get('detected_technologies_list') or []
+    missing_techs = [t for t in cached_techs if t not in curr_techs]
+    if not missing_techs and has_ga4_live:
+        return tech_info, False, 0
+
+    live_ev_json = json.loads(tech_info['technology_evidence_json']) if tech_info.get('technology_evidence_json') else {}
+    live_found_something = bool(live_ev_json) or bool(curr_techs)
+    merged_techs = list(dict.fromkeys(curr_techs + cached_techs))
+    has_ga4_merged = bool(c_rec.get('has_ga4') or has_ga4_live or ('Google Analytics (GA4)' in merged_techs))
+
+    merged_comp = resolve_cache_merged_completeness(
+        has_ga4_merged,
+        pw_used_flag,
+        pw_had_timeout_or_block,
+        live_found_something,
+        live_comp,
+        has_ga4_live and not missing_techs,
+    )
+
+    cache_sources_count = 0
+    for ct in cached_techs:
+        if ct not in live_ev_json:
+            live_ev_json[ct] = {'source': 'cache'}
+            cache_sources_count += 1
+
+    raw_cached_ev = c_rec.get('technology_evidence') or tech_info.get('technology_evidence') or 'Recovered from verified cache'
+    if not valid_cached_sgtm:
+        _, raw_cached_ev = sanitize_stale_sgtm_strings(None, raw_cached_ev)
+
+    raw_ga4_ids = tech_info.get('all_ga4_ids') or c_rec.get('all_ga4_ids')
+    raw_ga4_conf = tech_info.get('ga4_detection_confidence') or c_rec.get('ga4_detection_confidence')
+    capped_ga4_ids, total_ga4_cnt, capped_ga4_conf = cap_ga4_ids_and_confidence(raw_ga4_ids, raw_ga4_conf)
+
+    updated_info = {
+        'has_meta_pixel': bool(c_rec.get('has_meta_pixel') or tech_info.get('has_meta_pixel') or ('Meta Pixel' in merged_techs)),
+        'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel') or tech_info.get('has_tiktok_pixel') or ('TikTok Pixel' in merged_techs)),
+        'has_google_ads': bool(c_rec.get('has_google_ads') or tech_info.get('has_google_ads') or ('Google Ads Conversion' in merged_techs)),
+        'has_linkedin_pixel': bool(c_rec.get('has_linkedin_pixel') or tech_info.get('has_linkedin_pixel') or ('LinkedIn Insight Tag' in merged_techs)),
+        'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag') or tech_info.get('has_pinterest_tag') or ('Pinterest Tag' in merged_techs)),
+        'has_hubspot': bool(c_rec.get('has_hubspot') or tech_info.get('has_hubspot') or ('HubSpot' in merged_techs)),
+        'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info.get('has_klaviyo') or ('Klaviyo' in merged_techs)),
+        'has_ga4': has_ga4_merged,
+        'has_gtm': bool(c_rec.get('has_gtm') or tech_info.get('has_gtm') or ('Google Tag Manager' in merged_techs)),
+        'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
+        'all_ga4_ids': capped_ga4_ids,
+        'all_ga4_ids_count': total_ga4_cnt if total_ga4_cnt > 0 else tech_info.get('all_ga4_ids_count'),
+        'ga4_detection_confidence': capped_ga4_conf,
+        'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()] or tech_info.get('detected_cms_list', []),
+        'detected_cms': c_rec.get('detected_cms') or tech_info.get('detected_cms'),
+        'has_cookie_banner': bool(c_rec.get('consent_mode_likely') or tech_info.get('has_cookie_banner')),
+        'detected_technologies_list': merged_techs,
+        'technology_evidence': raw_cached_ev,
+        'technology_evidence_summary': build_summary_from_cached_record({
+            'detected_technologies': '; '.join(merged_techs),
+            'all_ga4_ids': capped_ga4_ids,
+            'technology_evidence': raw_cached_ev,
+        }),
+        'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
+        'tech_scan_completeness': merged_comp,
+    }
+    return updated_info, (merged_comp == 'partial_cached' and cache_sources_count > 0), cache_sources_count
 
 
 def _dm_deterministic_sort_key(item: tuple[str, str, str], primary_li_url: str | None) -> tuple[int, int, str]:
@@ -435,6 +536,16 @@ def normalize_tech_info_booleans(tech_info: dict) -> None:
     techs_list = tech_info.get('detected_technologies_list') or []
     techs_set = {t.strip() for t in techs_list if t and t.strip()}
 
+    if tech_info.get('all_ga4_ids'):
+        capped_ids, total_cnt, capped_conf = cap_ga4_ids_and_confidence(
+            tech_info.get('all_ga4_ids'),
+            tech_info.get('ga4_detection_confidence'),
+        )
+        tech_info['all_ga4_ids'] = capped_ids
+        if total_cnt > 0:
+            tech_info['all_ga4_ids_count'] = total_cnt
+        tech_info['ga4_detection_confidence'] = capped_conf
+
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(tech_info.get(flag_key))
         if flag_key == 'has_ga4' and tech_info.get('all_ga4_ids'):
@@ -481,6 +592,16 @@ def normalize_cached_record_booleans(cached_copy: dict) -> None:
         )
         cached_copy['detected_signals'] = clean_sig
         cached_copy['technology_evidence'] = clean_ev
+
+    if cached_copy.get('all_ga4_ids'):
+        capped_ids, total_cnt, capped_conf = cap_ga4_ids_and_confidence(
+            cached_copy.get('all_ga4_ids'),
+            cached_copy.get('ga4_detection_confidence'),
+        )
+        cached_copy['all_ga4_ids'] = capped_ids
+        if total_cnt > 0:
+            cached_copy['all_ga4_ids_count'] = total_cnt
+        cached_copy['ga4_detection_confidence'] = capped_conf
 
     for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
         is_found = (tech_label in techs_set) or bool(cached_copy.get(flag_key))
@@ -628,6 +749,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'has_gtm': None,
         'has_sgtm': None,
         'all_ga4_ids': None,
+        'all_ga4_ids_count': None,
         'detected_technologies': None,
         'all_emails': None,
         'all_phones': None,
