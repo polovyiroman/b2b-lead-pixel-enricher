@@ -46,6 +46,7 @@ from .domain_helpers import (
     derive_gdpr_jurisdiction,
     derive_human_contact_tier,
     derive_pii_fields,
+    derive_sales_actionability_class,
     detect_country_hint,
     domain_weight,
     guess_region_from_domain,
@@ -101,7 +102,8 @@ async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None
         return await proxy_config.new_url(
             session_id=f"pw_{abs(hash(domain_key)) % 100000}"
         )
-    except Exception:
+    except Exception as exc:
+        Actor.log.warning(f"[PROXY WARN] Failed to allocate Playwright proxy session for {domain_key}: {exc}")
         return None
 
 
@@ -230,6 +232,9 @@ async def process_domain(
                 )
                 seeded_rec['contact_quality_tier_human'] = derive_human_contact_tier(
                     seeded_rec.get('contact_quality_tier'), seeded_rec.get('company_category', '')
+                )
+                seeded_rec['sales_actionability_class'] = derive_sales_actionability_class(
+                    seeded_rec.get('sales_readiness_verdict'), seeded_rec.get('company_category', '')
                 )
                 seeded_rec['gdpr_jurisdiction'] = _seed_jur
                 seeded_rec['legal_basis_for_processing'] = (
@@ -392,6 +397,9 @@ async def process_domain(
                         cached_copy['contact_quality_tier_human'] = derive_human_contact_tier(
                             cached_copy.get('contact_quality_tier'), _cat
                         )
+                        cached_copy['sales_actionability_class'] = derive_sales_actionability_class(
+                            cached_copy.get('sales_readiness_verdict'), _cat
+                        )
                         cached_copy['data_quality_score'] = compute_data_quality_score(
                             cached_copy.get('contact_quality_tier'), _cached_tech_count,
                             cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_linkedin_url'),
@@ -444,6 +452,7 @@ async def process_domain(
             c_hint = detect_country_hint(canonical_domain, '', '', None, '')
             blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
             blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+            blocked_verdict = 'Unverified (Scan Blocked by WAF)'
             return {
                 'input_domain': domain_key,
                 'canonical_domain': canonical_domain,
@@ -457,7 +466,8 @@ async def process_domain(
                 'cached_snapshot_age_days': None,
                 'error_message': short_err_msg,
                 'data_quality_score': 0,
-                'sales_readiness_verdict': 'Unverified (Scan Blocked by WAF)',
+                'sales_readiness_verdict': blocked_verdict,
+                'sales_actionability_class': derive_sales_actionability_class(blocked_verdict, cat),
                 'company_category': cat,
                 'category_confidence': cat_conf,
                 'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
@@ -647,7 +657,8 @@ async def process_domain(
         ):
             if is_pw_hopeless:
                 pw_status_str = 'skipped_hopeless_waf'
-                pw_had_timeout_or_block = True
+                if not (tech_info['has_ga4'] and tech_info['has_gtm']):
+                    pw_had_timeout_or_block = True
                 Actor.log.info(f'[PW SKIP] {canonical_domain} is in KNOWN_PW_HOPELESS; skipping Playwright fallback')
             else:
                 pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
@@ -928,6 +939,9 @@ async def process_domain(
                 seeded_rec['contact_quality_tier_human'] = derive_human_contact_tier(
                     seeded_rec.get('contact_quality_tier'), seeded_rec.get('company_category', '')
                 )
+                seeded_rec['sales_actionability_class'] = derive_sales_actionability_class(
+                    seeded_rec.get('sales_readiness_verdict'), seeded_rec.get('company_category', '')
+                )
                 seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
                 seeded_rec['legal_basis_for_processing'] = (
                     'legitimate_interest_b2b'
@@ -985,6 +999,7 @@ async def process_domain(
 
         all_phones_list = [p for p, _ in sorted_phones_with_src]
         human_tier = derive_human_contact_tier(contact_quality_tier, company_category)
+        actionability_cls = derive_sales_actionability_class(sales_readiness_verdict, company_category)
         legal_basis = 'legitimate_interest_b2b' if (best_email or dm_name or primary_phone) else None
         pii_fields_str = derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url)
         dq_score = compute_data_quality_score(
@@ -1008,6 +1023,7 @@ async def process_domain(
             'error_message': '',
             'data_quality_score': dq_score,
             'sales_readiness_verdict': sales_readiness_verdict,
+            'sales_actionability_class': actionability_cls,
             'company_category': company_category,
             'category_confidence': category_confidence,
             'marketplace_platform': is_mp_platform,
@@ -1179,7 +1195,7 @@ async def main() -> None:
         metrics_counter = Counter()
 
         try:
-            async with AsyncSession(impersonate='chrome', allow_redirects=True, verify=False, proxy=primary_proxy_url) as client:
+            async with AsyncSession(impersonate='chrome', allow_redirects=True, proxy=primary_proxy_url) as client:
                 tasks = [
                     guarded(
                         process_domain(
@@ -1210,6 +1226,7 @@ async def main() -> None:
 
                     Actor.log.info(
                         f"[{st.upper()}] {result['canonical_domain']} (score={result['data_quality_score']}) | "
+                        f"Class: {result['sales_actionability_class']} | "
                         f"Tier: {result['contact_quality_tier_human']} | "
                         f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
                         f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
