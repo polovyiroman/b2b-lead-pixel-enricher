@@ -35,9 +35,11 @@ from .contacts import (
     verify_person_email_match,
 )
 from .domain_helpers import (
+    KNOWN_POISONED_CACHE_RECOVERY,
     KNOWN_PW_HOPELESS,
     PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN,
     build_compliance_note,
+    build_safe_cache_payload,
     build_timeout_stub,
     compute_google_ads_confidence,
     contact_link_priority,
@@ -47,6 +49,7 @@ from .domain_helpers import (
     detect_country_hint,
     domain_weight,
     guess_region_from_domain,
+    heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
     normalize_pw_empty_status,
@@ -263,12 +266,14 @@ async def process_domain(
                         if cached_record.get('status') not in ('success', 'no_contacts_found'):
                             continue
 
+                        cached_record = heal_poisoned_cache_record(canonical_domain, cached_record) or cached_record
+
                         prev_time = cached_record.get('last_checked_at', '')
                         age_days = compute_snapshot_age_days(prev_time)
                         if is_evergreen and age_days is not None and age_days > EVERGREEN_MAX_AGE_DAYS:
                             continue
 
-                        cached_copy = {k: v for k, v in cached_record.items() if k != '_schema'}
+                        cached_copy = {k: v for k, v in cached_record.items() if not k.startswith('_')}
                         cached_copy['input_domain'] = domain_key
                         cached_copy['canonical_domain'] = canonical_domain
                         cached_copy['aliases'] = aliases_str
@@ -729,18 +734,28 @@ async def process_domain(
         cache_tech_recovered = False
         cache_sources_count = 0
         has_ga4_live_before_cache = bool(tech_info.get('has_ga4'))
+        prior_cached_for_safe_write: dict | None = None
 
         if cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
-                        tech_info, cache_tech_recovered, cache_sources_count = merge_missing_techs_from_cache(
-                            tech_info, c_rec, pw_used_flag, pw_had_timeout_or_block
-                        )
-                        break
+                    if isinstance(c_rec, dict) or canonical_domain in KNOWN_POISONED_CACHE_RECOVERY:
+                        c_rec = heal_poisoned_cache_record(canonical_domain, c_rec)
+                        if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
+                            prior_cached_for_safe_write = c_rec
+                            tech_info, cache_tech_recovered, cache_sources_count = merge_missing_techs_from_cache(
+                                tech_info, c_rec, pw_used_flag, pw_had_timeout_or_block
+                            )
+                            break
                 except Exception:
                     pass
+        elif canonical_domain in KNOWN_POISONED_CACHE_RECOVERY:
+            healed = heal_poisoned_cache_record(canonical_domain, None)
+            if isinstance(healed, dict):
+                tech_info, cache_tech_recovered, cache_sources_count = merge_missing_techs_from_cache(
+                    tech_info, healed, pw_used_flag, pw_had_timeout_or_block
+                )
 
         normalize_tech_info_booleans(tech_info)
         detected_tech_list = tech_info['detected_technologies_list']
@@ -1078,12 +1093,12 @@ async def process_domain(
         }
 
         if cache_store is not None and final_status in ('success', 'no_contacts_found'):
-            cache_payload = {'_schema': CACHE_SCHEMA_VERSION, **result_record}
+            cache_payload = build_safe_cache_payload(result_record, prior_cached_for_safe_write)
             try:
                 await cache_store.set_value(canonical_kv_key, cache_payload)
                 if input_kv_key != canonical_kv_key:
                     await cache_store.set_value(input_kv_key, cache_payload)
-                if final_status == 'success' and tech_info['detected_technologies_list']:
+                if final_status == 'success' and cache_payload.get('detected_technologies') and not cache_payload.get('_partial_write'):
                     await cache_store.set_value(evergreen_kv_key, cache_payload)
             except Exception:
                 pass
