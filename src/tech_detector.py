@@ -10,6 +10,7 @@ from .config import (
     GOOGLE_ADS_REGEX,
     GTAG_CONFIG_GA4_REGEX,
     GTM_JSON_GA4_REGEX,
+    MAX_DISPLAY_GA4_IDS,
     SGTM_CUSTOM_LOADER_REGEX,
 )
 
@@ -49,6 +50,29 @@ def _is_valid_cached_sgtm(rec: dict) -> bool:
     return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
 
 
+def cap_ga4_ids_and_confidence(
+    raw_ga4_ids_str: str | None,
+    raw_confidence: str | None = None
+) -> tuple[str | None, int, str | None]:
+    """
+    P2 Fix (AboutYou 27 IDs / DocMorris 6 IDs):
+    Обмежує список all_ga4_ids максимум 5 ID (MAX_DISPLAY_GA4_IDS = 5),
+    повертає загальну кількість ID та оновлює ga4_detection_confidence на
+    'High (multiplexed N-property)', якщо знайдено більше 5 ID.
+    """
+    if not raw_ga4_ids_str:
+        return None, 0, raw_confidence
+    ids_list = [x.strip() for x in raw_ga4_ids_str.split(';') if x.strip()]
+    total_count = len(ids_list)
+    if total_count == 0:
+        return None, 0, raw_confidence
+    capped_str = '; '.join(ids_list[:MAX_DISPLAY_GA4_IDS])
+    conf = raw_confidence
+    if total_count > MAX_DISPLAY_GA4_IDS:
+        conf = f'High (multiplexed {total_count}-property)'
+    return capped_str, total_count, conf
+
+
 def build_summary_from_cached_record(rec: dict) -> str | None:
     parts = []
     raw_tech = rec.get('detected_technologies') or ''
@@ -82,7 +106,9 @@ def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache
             continue
         entry: dict = {'source': source_label}
         if t == 'Google Analytics (GA4)' and ga4_ids:
-            entry['ids'] = ga4_ids
+            entry['ids'] = ga4_ids[:MAX_DISPLAY_GA4_IDS]
+            if len(ga4_ids) > MAX_DISPLAY_GA4_IDS:
+                entry['total_ids_count'] = len(ga4_ids)
         evidence_map[t] = entry
     return json.dumps(evidence_map, ensure_ascii=False) if evidence_map else None
 
@@ -128,8 +154,6 @@ def detect_tech_with_evidence(
             'ids': [],
         }
 
-    # Завдання 3-close-fix (P0): Server-Side GTM (sGTM) strict detection.
-    # Matches ONLY custom-domain /gtm.js?id=GTM-XXXX loaders (excludes Google/DoubleClick & g/collect).
     sgtm_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
     has_sgtm = bool(sgtm_match)
     if has_sgtm and sgtm_match:
@@ -149,6 +173,8 @@ def detect_tech_with_evidence(
 
     gtm_macro_ga4 = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)} if gtm_js else set()
     all_ga4_set = sorted(high_conf_ga4 | gtm_macro_ga4)
+    total_ga4_count = len(all_ga4_set)
+    capped_ga4_list = all_ga4_set[:MAX_DISPLAY_GA4_IDS]
 
     has_ga4_endpoint_only = (
         not all_ga4_set and (
@@ -166,7 +192,9 @@ def detect_tech_with_evidence(
     ga4_confidence = None
     if all_ga4_set:
         found_tech.append('Google Analytics (GA4)')
-        if high_conf_ga4 or len(all_ga4_set) >= 2:
+        if total_ga4_count > MAX_DISPLAY_GA4_IDS:
+            ga4_confidence = f'High (multiplexed {total_ga4_count}-property)'
+        elif high_conf_ga4 or total_ga4_count >= 2:
             ga4_confidence = 'High'
         else:
             ga4_confidence = 'Medium (GTM Single Macro)'
@@ -176,16 +204,20 @@ def detect_tech_with_evidence(
         src_note = 'page HTML' if ga4_src_label == 'live_html' else (
             'Playwright network' if ga4_src_label == 'pw_network' else 'GTM container'
         )
-        snip = extract_code_snippet(combined_source, all_ga4_set[0])
+        snip = extract_code_snippet(combined_source, capped_ga4_list[0])
+        count_suffix = f' (showing {MAX_DISPLAY_GA4_IDS} of {total_ga4_count})' if total_ga4_count > MAX_DISPLAY_GA4_IDS else ''
         evidence_items.append(
-            f"Google Analytics (GA4) [{ga4_confidence}]: id={';'.join(all_ga4_set)} in {src_note} (\"{snip}\")"
+            f"Google Analytics (GA4) [{ga4_confidence}]: id={';'.join(capped_ga4_list)}{count_suffix} in {src_note} (\"{snip}\")"
         )
-        summary_items.append(f'GA4 ({all_ga4_set[0]})')
-        evidence_json_map['Google Analytics (GA4)'] = {
+        summary_items.append(f'GA4 ({capped_ga4_list[0]})')
+        ga4_ev_entry: dict = {
             'source': ga4_src_label,
             'confidence': ga4_confidence,
-            'ids': all_ga4_set,
+            'ids': capped_ga4_list,
         }
+        if total_ga4_count > MAX_DISPLAY_GA4_IDS:
+            ga4_ev_entry['total_ids_count'] = total_ga4_count
+        evidence_json_map['Google Analytics (GA4)'] = ga4_ev_entry
     elif has_ga4_endpoint_only:
         found_tech.append('Google Analytics (GA4)')
         ga4_confidence = 'Low (Script Endpoint Only — ID Dynamic)'
@@ -290,7 +322,8 @@ def detect_tech_with_evidence(
         'has_ga4': 'Google Analytics (GA4)' in found_tech,
         'has_gtm': 'Google Tag Manager' in found_tech,
         'has_sgtm': has_sgtm,
-        'all_ga4_ids': '; '.join(all_ga4_set) if all_ga4_set else None,
+        'all_ga4_ids': '; '.join(capped_ga4_list) if capped_ga4_list else None,
+        'all_ga4_ids_count': total_ga4_count if total_ga4_count > 0 else None,
         'ga4_detection_confidence': ga4_confidence,
         'detected_cms_list': detected_cms_list,
         'detected_cms': '; '.join(detected_cms_list) if detected_cms_list else None,
