@@ -27,6 +27,7 @@ from .qualifier import (
 )
 from .scraper import (
     _is_safe_domain,
+    get_clean_canonical_domain,
     prepare_domains,
 )
 from .tech_detector import detect_tech_with_evidence
@@ -450,14 +451,6 @@ def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Ca
 
 
 def _test_12_v2015_security_ssrf_rozetka_and_actionability_enum() -> str:
-    """
-    Test 12/12 (v20.15 Stage 1 & Stage 2 Gate):
-    1. Verifies _is_safe_domain blocks SSRF targets (127.0.0.1, 10.0.0.1, 192.168.1.1, 169.254.169.254, .local, file://).
-    2. Verifies DEFAULT_MANUAL_SEEDS['rozetka.com.ua']['all_ga4_ids'] is None (no fake G-ROZETKA-GA4).
-    3. Verifies grammarly.com, laredoute.fr, zalando.de are in KNOWN_PW_HOPELESS.
-    4. Verifies KNOWN_POISONED_CACHE_RECOVERY['liki24.com'] has recovery_verified_at & max_recovery_age_days.
-    5. Verifies derive_sales_actionability_class maps strictly to SALES_ACTIONABILITY_ENUM_VALUES.
-    """
     unsafe_targets = [
         '127.0.0.1',
         '10.0.0.1',
@@ -507,6 +500,27 @@ def _test_12_v2015_security_ssrf_rozetka_and_actionability_enum() -> str:
     return "PASS (SSRF blocked; G-ROZETKA-GA4 removed; PW hopeless updated; 6-enum actionability verified)"
 
 
+def _test_13_subdomain_canonicalization() -> str:
+    """
+    Test 13/13 (v20.16 P1-A Fix):
+    Verifies language/geo subdomains (en.zalando.de, en.aboutyou.de, ua.ringostat.com)
+    canonicalize to root domain without breaking multi-part TLDs (rozetka.com.ua).
+    """
+    cases = [
+        ('https://en.zalando.de/women-home/', 'zalando.de', 'zalando.de'),
+        ('https://en.aboutyou.de/your-shop', 'aboutyou.de', 'aboutyou.de'),
+        ('https://www.en.aboutyou.de/', 'aboutyou.de', 'aboutyou.de'),
+        ('https://ua.ringostat.com/', 'ringostat.com', 'ringostat.com'),
+        ('https://rozetka.com.ua/ua/', 'rozetka.com.ua', 'rozetka.com.ua'),
+    ]
+    for final_u, fb, expected in cases:
+        got = get_clean_canonical_domain(final_u, fb)
+        if got != expected:
+            raise AssertionError(f"Subdomain canonicalization failed for '{final_u}': expected '{expected}', got '{got}'")
+
+    return "PASS (en.zalando.de->zalando.de, en.aboutyou.de->aboutyou.de, rozetka.com.ua intact)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -529,6 +543,7 @@ def run_startup_regression_gate(
         ('test_10_aboutyou_ga4_cap_and_affiliate_creator', lambda: _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn)),
         ('test_11_poisoned_cache_recovery_and_safe_write', lambda: _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn)),
         ('test_12_v2015_security_ssrf_rozetka_and_actionability', _test_12_v2015_security_ssrf_rozetka_and_actionability_enum),
+        ('test_13_subdomain_canonicalization', _test_13_subdomain_canonicalization),
     ]
 
     passed_count = 0
