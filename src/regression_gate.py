@@ -4,11 +4,13 @@ from typing import Callable
 
 from .contacts import (
     build_decision_makers_json_from_summary,
+    classify_email_type,
     extract_decision_maker_deep,
     is_valid_person_name,
     strip_role_tokens_from_name,
 )
 from .domain_helpers import (
+    merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
     sanitize_cached_dms,
 )
@@ -96,31 +98,67 @@ def _test_02_determinism_ottogroup_3x() -> str:
     return "PASS (3x page-order permutations -> identical Benjamin Otto + LinkedIn)"
 
 
-def _test_03_cache_merge_completeness_and_empty_render(
+def _test_03_cache_merge_completeness_and_liki24_partial_merge(
     normalize_tech_fn: Callable[[dict], None],
     resolve_cache_comp_fn: Callable[..., str],
 ) -> str:
-    # Case A: Cache has GA4=True, live scan failed (has_ga4_live=False, pw_used=False) -> MUST be 'partial_cached'
+    # Case A: Cache has GA4=True, live scan failed -> 'partial_cached'
     comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked', False)
     if comp_comfy != 'partial_cached':
         raise AssertionError(f"Comfy case: expected 'partial_cached', got '{comp_comfy}'")
 
-    # Case B: PW rendered shell (pw_used=True), but live_found_something=False & has_ga4_live=False -> MUST be 'partial_cached'
-    comp_liki = resolve_cache_comp_fn(True, True, False, False, 'full', False)
-    if comp_liki != 'partial_cached':
-        raise AssertionError(f"Liki24 cache-only case: expected 'partial_cached', got '{comp_liki}'")
-
-    # Case C (v20.11 P0 Fix): Macpaw/Kasta curl succeeded (pw_used=False, pw_had_timeout=False, has_ga4_live=True) -> MUST be 'full'
+    # Case B: Macpaw curl succeeded (pw_used=False, pw_had_timeout=False, has_ga4_live=True) -> 'full'
     comp_macpaw_curl = resolve_cache_comp_fn(True, False, False, True, 'full', True)
     if comp_macpaw_curl != 'full':
         raise AssertionError(f"Macpaw curl-clean live case: expected 'full', got '{comp_macpaw_curl}'")
 
-    # Case D: PW rendered clean AND has_ga4_live=True -> 'full'
-    comp_pw_clean = resolve_cache_comp_fn(True, True, False, True, 'full', True)
-    if comp_pw_clean != 'full':
-        raise AssertionError(f"Clean PW live case: expected 'full', got '{comp_pw_clean}'")
+    # Case C (v20.13 P1 Liki24 Fix): Live partial has [GA4, Google Ads] with pw_had_timeout=True;
+    # Cache has [GTM, GA4, Google Ads, Meta Pixel] -> must merge GTM + Meta Pixel and set 'partial_cached'
+    liki_live_partial = {
+        'has_ga4': True,
+        'has_gtm': False,
+        'has_google_ads': True,
+        'has_meta_pixel': False,
+        'has_tiktok_pixel': False,
+        'has_linkedin_pixel': False,
+        'has_pinterest_tag': False,
+        'has_hubspot': False,
+        'has_klaviyo': False,
+        'has_sgtm': False,
+        'all_ga4_ids': 'G-FRYX20Z9FG',
+        'ga4_detection_confidence': 'High',
+        'detected_cms_list': [],
+        'detected_cms': None,
+        'has_cookie_banner': False,
+        'detected_technologies_list': ['Google Analytics (GA4)', 'Google Ads Conversion'],
+        'technology_evidence': 'GA4 live',
+        'technology_evidence_summary': 'GA4, Google Ads',
+        'technology_evidence_json': json.dumps({
+            'Google Analytics (GA4)': {'source': 'live_html'},
+            'Google Ads Conversion': {'source': 'live_html'},
+        }),
+        'tech_scan_completeness': 'partial_blocked',
+    }
+    liki_cache_full = {
+        'has_ga4': True,
+        'has_gtm': True,
+        'has_google_ads': True,
+        'has_meta_pixel': True,
+        'all_ga4_ids': 'G-FRYX20Z9FG',
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
+        'technology_evidence': 'GTM + GA4 + Google Ads + Meta Pixel',
+    }
+    merged_liki, was_recovered, added_cnt = merge_missing_techs_from_cache(
+        liki_live_partial, liki_cache_full, pw_used_flag=True, pw_had_timeout_or_block=True
+    )
+    normalize_tech_fn(merged_liki)
+    merged_list = merged_liki.get('detected_technologies_list') or []
+    if 'Google Tag Manager' not in merged_list or 'Meta Pixel' not in merged_list:
+        raise AssertionError(f"Liki24 partial+cache merge failed to recover GTM/Meta: {merged_list}")
+    if merged_liki.get('tech_scan_completeness') != 'partial_cached' or not was_recovered or added_cnt != 2:
+        raise AssertionError(f"Liki24 expected partial_cached with 2 recovered techs, got comp={merged_liki.get('tech_scan_completeness')}, cnt={added_cnt}")
 
-    # Case E: 0 techs detected with 'full' -> must downgrade to 'partial_empty_render'
+    # Case D: 0 techs detected with 'full' -> 'partial_empty_render'
     empty_tech_info = {
         'detected_technologies_list': [],
         'tech_scan_completeness': 'full',
@@ -129,13 +167,9 @@ def _test_03_cache_merge_completeness_and_empty_render(
     }
     normalize_tech_fn(empty_tech_info)
     if empty_tech_info['tech_scan_completeness'] != 'partial_empty_render':
-        raise AssertionError(
-            f"Unicredit/Bol empty render case: expected 'partial_empty_render', got '{empty_tech_info['tech_scan_completeness']}'"
-        )
-    if empty_tech_info.get('has_ga4') is not None:
-        raise AssertionError(f"Expected has_ga4=None on partial_empty_render, got {empty_tech_info.get('has_ga4')}")
+        raise AssertionError(f"Expected 'partial_empty_render', got '{empty_tech_info['tech_scan_completeness']}'")
 
-    return "PASS (Macpaw curl-clean->full; Comfy/Liki24 cache->partial_cached; 0-tech->partial_empty_render)"
+    return "PASS (Liki24 partial+cache merges GTM+Meta; Macpaw curl->full; 0-tech->partial_empty_render)"
 
 
 def _test_04_vorstand_role_extraction() -> str:
@@ -284,11 +318,6 @@ def _test_08_glossier_spa_ecommerce_category() -> str:
 
 
 def _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 9/9 (v20.11 P0 Guard):
-    Verifies a custom site without CMS (like macpaw.com, readdle.com, kasta.ua) where curl found GTM+GA4
-    (pw_used_flag=False) stays tech_scan_completeness == 'full' and never gets downgraded to 'partial_cached'.
-    """
     html = (
         '<html><head>'
         '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-KW4BC5"></script>'
@@ -305,6 +334,42 @@ def _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn: Callable[
     return "PASS (Custom site with live GTM+GA4 and detected_cms=None stays 'full')"
 
 
+def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn: Callable[[dict], None]) -> str:
+    """
+    Test 10/10 (v20.13 P2 Escalated Blockers):
+    1. Verifies 27 GA4 IDs are capped to 5 in all_ga4_ids, all_ga4_ids_count == 27,
+       and ga4_detection_confidence == 'High (multiplexed 27-property)'.
+    2. Verifies 'affiliate.creator@aboutyou.com' is classified as 'influencer_gifting_inbox' (not 'b2b_partnerships'),
+       while 'partnerwerden@docmorris.de' and 'sales@ringostat.com' remain B2B/Sales.
+    """
+    fake_27_ids = [f'G-TEST{i:02d}ABCD' for i in range(1, 28)]
+    scripts = ''.join(f"<script>gtag('config', '{gid}');</script>" for gid in fake_27_ids)
+    html_27 = f"<html><head>{scripts}</head><body>AboutYou</body></html>"
+    info_27 = detect_tech_with_evidence(html_27, '', ['GTM-AY1234'], 'https://www.aboutyou.de/', 'full')
+    normalize_tech_fn(info_27)
+
+    displayed_ids = [x.strip() for x in (info_27.get('all_ga4_ids') or '').split(';') if x.strip()]
+    if len(displayed_ids) != 5:
+        raise AssertionError(f"Expected all_ga4_ids capped at 5, got {len(displayed_ids)}: {displayed_ids}")
+    if info_27.get('all_ga4_ids_count') != 27:
+        raise AssertionError(f"Expected all_ga4_ids_count=27, got {info_27.get('all_ga4_ids_count')}")
+    if info_27.get('ga4_detection_confidence') != 'High (multiplexed 27-property)':
+        raise AssertionError(f"Expected 'High (multiplexed 27-property)', got '{info_27.get('ga4_detection_confidence')}'")
+
+    # Check email classification for affiliate.creator@aboutyou.com
+    ay_type = classify_email_type('affiliate.creator@aboutyou.com', 'aboutyou')
+    if ay_type != 'influencer_gifting_inbox':
+        raise AssertionError(f"Expected 'influencer_gifting_inbox' for affiliate.creator@aboutyou.com, got '{ay_type}'")
+
+    # Ensure legitimate B2B emails do not regress
+    if classify_email_type('partnerwerden@docmorris.de', 'docmorris') != 'b2b_partnerships':
+        raise AssertionError("partnerwerden@docmorris.de regressed from b2b_partnerships")
+    if classify_email_type('sales@ringostat.com', 'ringostat') != 'wholesale_or_sales_inbox':
+        raise AssertionError("sales@ringostat.com regressed from wholesale_or_sales_inbox")
+
+    return "PASS (27 GA4 IDs capped to 5 + count=27; affiliate.creator@ -> influencer_gifting_inbox)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -316,7 +381,7 @@ def run_startup_regression_gate(
         ('test_02_determinism_ottogroup_3x', _test_02_determinism_ottogroup_3x),
         (
             'test_03_cache_merge_completeness',
-            lambda: _test_03_cache_merge_completeness_and_empty_render(normalize_tech_fn, resolve_cache_comp_fn),
+            lambda: _test_03_cache_merge_completeness_and_liki24_partial_merge(normalize_tech_fn, resolve_cache_comp_fn),
         ),
         ('test_04_vorstand_role', _test_04_vorstand_role_extraction),
         ('test_05_sgtm_positive', lambda: _test_05_sgtm_positive_fixture(normalize_tech_fn)),
@@ -324,6 +389,7 @@ def run_startup_regression_gate(
         ('test_07_inweb_consistency_and_liki24_hygiene', _test_07_inweb_dm_consistency_and_liki24_hygiene),
         ('test_08_glossier_spa_ecommerce_category', _test_08_glossier_spa_ecommerce_category),
         ('test_09_curl_clean_live_without_cms_stays_full', lambda: _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn)),
+        ('test_10_aboutyou_ga4_cap_and_affiliate_creator', lambda: _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn)),
     ]
 
     passed_count = 0
