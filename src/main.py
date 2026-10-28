@@ -47,7 +47,7 @@ from .domain_helpers import (
     detect_country_hint,
     domain_weight,
     guess_region_from_domain,
-    has_verified_sgtm_in_cache,
+    merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
     normalize_pw_empty_status,
     normalize_tech_info_booleans,
@@ -55,7 +55,6 @@ from .domain_helpers import (
     resolve_cache_merged_completeness,
     resolve_effective_phone_region,
     sanitize_cached_dms,
-    sanitize_stale_sgtm_strings,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -243,6 +242,7 @@ async def process_domain(
                     seeded_rec.get('decision_maker_linkedin_url')
                 )
                 seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, _seed_hint)
+                seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
                 return seeded_rec
 
             is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
@@ -312,6 +312,7 @@ async def process_domain(
                         cached_copy.setdefault('detected_cms', None)
                         cached_copy.setdefault('consent_mode_likely', None)
                         cached_copy.setdefault('ga4_detection_confidence', None)
+                        cached_copy.setdefault('all_ga4_ids_count', None)
                         cached_copy.setdefault('tech_scan_completeness', 'partial_cached')
                         cached_copy.setdefault('category_confidence', 'high')
                         cached_copy.setdefault(
@@ -335,6 +336,7 @@ async def process_domain(
                         _cached_all_emails = (cached_copy.get('all_emails') or cached_copy.get('best_email') or '').split(';')
                         _cached_emails_list = [e.strip() for e in _cached_all_emails if e.strip()]
                         if _cached_emails_list:
+                            cached_copy['best_email_type'] = classify_email_type(cached_copy.get('best_email'), brand_root)
                             cached_copy['all_emails_classification'] = '; '.join(
                                 f'{em} ({classify_email_type(em, brand_root)})' for em in _cached_emails_list
                             )
@@ -528,6 +530,7 @@ async def process_domain(
                 'has_gtm': None,
                 'has_sgtm': None,
                 'all_ga4_ids': None,
+                'all_ga4_ids_count': None,
                 'detected_technologies': None,
                 'all_emails': None,
                 'all_phones': None,
@@ -727,79 +730,14 @@ async def process_domain(
         cache_sources_count = 0
         has_ga4_live_before_cache = bool(tech_info.get('has_ga4'))
 
-        # Завдання 1 (v20.11 P0 Fix): Якщо GA4 вже знайдено в живому скані, ми НІКОЛИ не запускаємо повний cache recovery!
-        # Перевіряємо виключно наявність detected_cms у кеші (для SPA типу Glossier), зберігаючи tech_scan_completeness='full'.
-        if has_ga4_live_before_cache and not tech_info.get('detected_cms') and cache_store is not None:
+        if cache_store is not None:
             for c_key in (evergreen_kv_key, canonical_kv_key):
                 try:
                     c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and c_rec.get('detected_cms'):
-                        c_cms_str = c_rec['detected_cms']
-                        c_cms_list = [x.strip() for x in c_cms_str.split(';') if x.strip()]
-                        tech_info['detected_cms'] = c_cms_str
-                        tech_info['detected_cms_list'] = c_cms_list
-                        for cms_item in c_cms_list:
-                            if cms_item not in tech_info['detected_technologies_list']:
-                                tech_info['detected_technologies_list'].append(cms_item)
-                        break
-                except Exception:
-                    pass
-
-        if not has_ga4_live_before_cache and cache_store is not None:
-            for c_key in (evergreen_kv_key, canonical_kv_key):
-                try:
-                    c_rec = await cache_store.get_value(c_key)
-                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies')):
-                        raw_t = c_rec.get('detected_technologies') or ''
-                        valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
-                        cached_techs = [
-                            x.strip() for x in raw_t.split(';')
-                            if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
-                        ]
-                        if not cached_techs:
-                            continue
-                        live_ev_json = json.loads(tech_info['technology_evidence_json']) if tech_info.get('technology_evidence_json') else {}
-                        live_found_something = bool(live_ev_json) or bool(tech_info.get('detected_technologies_list'))
-                        merged_techs = list(dict.fromkeys(tech_info['detected_technologies_list'] + cached_techs))
-                        has_ga4_merged = bool(c_rec.get('has_ga4') or tech_info['has_ga4'])
-                        merged_comp = resolve_cache_merged_completeness(
-                            has_ga4_merged,
-                            pw_used_flag,
-                            pw_had_timeout_or_block,
-                            live_found_something,
-                            tech_info['tech_scan_completeness'],
-                            has_ga4_live_before_cache,
+                    if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
+                        tech_info, cache_tech_recovered, cache_sources_count = merge_missing_techs_from_cache(
+                            tech_info, c_rec, pw_used_flag, pw_had_timeout_or_block
                         )
-                        for ct in cached_techs:
-                            if ct not in live_ev_json:
-                                live_ev_json[ct] = {'source': 'cache'}
-                                cache_sources_count += 1
-                        raw_cached_ev = c_rec.get('technology_evidence') or tech_info['technology_evidence'] or 'Recovered from verified cache'
-                        if not valid_cached_sgtm:
-                            _, raw_cached_ev = sanitize_stale_sgtm_strings(None, raw_cached_ev)
-                        tech_info = {
-                            'has_meta_pixel': bool(c_rec.get('has_meta_pixel') or tech_info['has_meta_pixel']),
-                            'has_tiktok_pixel': bool(c_rec.get('has_tiktok_pixel') or tech_info['has_tiktok_pixel']),
-                            'has_google_ads': bool(c_rec.get('has_google_ads') or tech_info['has_google_ads']),
-                            'has_linkedin_pixel': bool(c_rec.get('has_linkedin_pixel') or tech_info['has_linkedin_pixel']),
-                            'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag') or tech_info['has_pinterest_tag']),
-                            'has_hubspot': bool(c_rec.get('has_hubspot') or tech_info['has_hubspot']),
-                            'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info['has_klaviyo']),
-                            'has_ga4': has_ga4_merged,
-                            'has_gtm': bool(c_rec.get('has_gtm') or tech_info['has_gtm']),
-                            'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
-                            'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'),
-                            'ga4_detection_confidence': c_rec.get('ga4_detection_confidence') or tech_info.get('ga4_detection_confidence'),
-                            'detected_cms_list': [x.strip() for x in (c_rec.get('detected_cms') or '').split(';') if x.strip()] or tech_info['detected_cms_list'],
-                            'detected_cms': c_rec.get('detected_cms') or tech_info['detected_cms'],
-                            'has_cookie_banner': bool(c_rec.get('consent_mode_likely') or tech_info['has_cookie_banner']),
-                            'detected_technologies_list': merged_techs,
-                            'technology_evidence': raw_cached_ev,
-                            'technology_evidence_summary': build_summary_from_cached_record({'detected_technologies': '; '.join(merged_techs), 'all_ga4_ids': c_rec.get('all_ga4_ids') or tech_info.get('all_ga4_ids'), 'technology_evidence': raw_cached_ev}),
-                            'technology_evidence_json': json.dumps(live_ev_json, ensure_ascii=False) if live_ev_json else None,
-                            'tech_scan_completeness': merged_comp
-                        }
-                        cache_tech_recovered = (merged_comp == 'partial_cached' and cache_sources_count > 0)
                         break
                 except Exception:
                     pass
@@ -989,6 +927,7 @@ async def process_domain(
                     seeded_rec.get('decision_maker_linkedin_url')
                 )
                 seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, country_hint)
+                seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
                 return seeded_rec
 
         linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
@@ -1131,6 +1070,7 @@ async def process_domain(
             'has_gtm': tech_info['has_gtm'],
             'has_sgtm': tech_info.get('has_sgtm'),
             'all_ga4_ids': tech_info['all_ga4_ids'],
+            'all_ga4_ids_count': tech_info.get('all_ga4_ids_count'),
             'detected_technologies': '; '.join(detected_tech_list) if detected_tech_list else None,
             'all_emails': '; '.join(all_emails_list) if all_emails_list else None,
             'all_phones': '; '.join(all_phones_list) if all_phones_list else None,
@@ -1280,5 +1220,6 @@ async def main() -> None:
                 except Exception:
                     pass
         finally:
+            await asyncio.sleep(0.05)
             await close_shared_playwright_browser()
             thread_pool.shutdown(wait=False)
