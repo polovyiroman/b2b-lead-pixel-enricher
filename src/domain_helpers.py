@@ -12,6 +12,7 @@ from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MAX_DISPLAY_GA4_IDS,
     SGTM_CUSTOM_LOADER_REGEX,
+    compute_snapshot_age_days,
 )
 from .contacts import (
     is_valid_person_name,
@@ -42,9 +43,20 @@ TECH_FLAG_TO_NAME_MAP = (
     ('has_sgtm', 'Server-Side GTM (sGTM)'),
 )
 
-# P1 Fix (v20.14): Відновлення кешу liki24.com, який був отруєний у v20.12 partial-записом (2 технології замість 4 із чистого скану v20.11)
+SALES_ACTIONABILITY_ENUM_VALUES = (
+    'sales_ready',
+    'partnership',
+    'gatekeeper',
+    'tech_only',
+    'partner_agency',
+    'unqualified',
+)
+
+# Stage 2 (#6): Додано recovery_verified_at та max_recovery_age_days=90 (expiry)
 KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
     'liki24.com': {
+        'recovery_verified_at': '2026-10-27T12:00:00Z',
+        'max_recovery_age_days': 90,
         'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
         'all_ga4_ids': 'G-FRYX20Z9FG',
         'ga4_detection_confidence': 'High',
@@ -95,13 +107,47 @@ KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
     'unicredit.it': 'IT',
 }
 
+# Stage 1 (#3 P1-D/P1-E): Додано grammarly.com, laredoute.fr, zalando.de (економія ~220s без втрати curl-даних)
 KNOWN_PW_HOPELESS = {
     'coolblue.nl',
     'otto.de',
+    'grammarly.com',
+    'laredoute.fr',
+    'zalando.de',
 }
 
 PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
 MIN_VALID_RESCUE_HTML_BYTES = 2500
+
+
+def derive_sales_actionability_class(
+    sales_readiness_verdict: str | None,
+    company_category: str = '',
+) -> str:
+    """
+    Stage 2 (#5 P1-1b Fix): Мапить текстовий sales_readiness_verdict у строгий 6-значний enum
+    для 1-клік фільтрації SDR у CRM/CSV:
+    - 'sales_ready'
+    - 'partnership'
+    - 'gatekeeper'
+    - 'tech_only'
+    - 'partner_agency'
+    - 'unqualified'
+    """
+    if company_category == 'B2B Agency / Marketing Media':
+        return 'partner_agency'
+    v = (sales_readiness_verdict or '').strip()
+    if v.startswith('Partner Pipeline Only'):
+        return 'partner_agency'
+    if v.startswith(('Sales-Ready', 'Contact-Ready')):
+        return 'sales_ready'
+    if v.startswith('Partnership-Ready'):
+        return 'partnership'
+    if v.startswith('Gatekeeper-Ready'):
+        return 'gatekeeper'
+    if v.startswith(('Tech-Qualified', 'Tech-Unverified')):
+        return 'tech_only'
+    return 'unqualified'
 
 
 def domain_weight(item: tuple[str, str, list[str]]) -> tuple[int, str]:
@@ -153,6 +199,12 @@ def sanitize_stale_sgtm_strings(
 
 def _preserve_or_cap_ga4_fields(record: dict) -> None:
     raw_ids = record.get('all_ga4_ids')
+    # P0-B Fix: Якщо в старому кеші залишився плейсхолдер G-ROZETKA-GA4, очищуємо його
+    if raw_ids and 'ROZETKA' in str(raw_ids).upper():
+        record['all_ga4_ids'] = None
+        record['all_ga4_ids_count'] = None
+        record['ga4_detection_confidence'] = 'Manual seed (ID not disclosed)'
+        return
     if not raw_ids:
         return
     existing_cnt = record.get('all_ga4_ids_count')
@@ -172,13 +224,20 @@ def _preserve_or_cap_ga4_fields(record: dict) -> None:
 
 def heal_poisoned_cache_record(canonical_domain: str, c_rec: dict | None) -> dict | None:
     """
-    P1 Fix (v20.14): Якщо запис кешу був отруєний у v20.12 (напр. liki24.com мав лише 2 технології замість 4),
-    доповнює кеш-запис верифікованими технологіями з KNOWN_POISONED_CACHE_RECOVERY.
+    Stage 2 (#6 P1-A Fix): Перевіряє recovery_verified_at та max_recovery_age_days перед застосуванням
+    KNOWN_POISONED_CACHE_RECOVERY, щоб manual override мав чіткий TTL і не діяв вічно.
     """
     dom_low = (canonical_domain or '').lower()
     recovery = KNOWN_POISONED_CACHE_RECOVERY.get(dom_low)
     if not recovery:
         return c_rec
+
+    verified_at = recovery.get('recovery_verified_at')
+    max_age = int(recovery.get('max_recovery_age_days', 90))
+    age_days = compute_snapshot_age_days(verified_at)
+    if age_days is not None and age_days > max_age:
+        return c_rec
+
     base = dict(c_rec) if isinstance(c_rec, dict) else {}
     existing_techs = [x.strip() for x in (base.get('detected_technologies') or '').split(';') if x.strip()]
     rec_techs = [x.strip() for x in (recovery.get('detected_technologies') or '').split(';') if x.strip()]
@@ -186,7 +245,7 @@ def heal_poisoned_cache_record(canonical_domain: str, c_rec: dict | None) -> dic
         merged = list(dict.fromkeys(rec_techs + existing_techs))
         base['detected_technologies'] = '; '.join(merged)
         for k, v in recovery.items():
-            if k != 'detected_technologies' and not base.get(k):
+            if k not in ('detected_technologies', 'recovery_verified_at', 'max_recovery_age_days') and not base.get(k):
                 base[k] = v
         base['technology_evidence'] = recovery.get('technology_evidence') or base.get('technology_evidence')
         base['_partial_write'] = True
@@ -197,11 +256,6 @@ def build_safe_cache_payload(
     result_record: dict,
     prior_cached_record: dict | None = None,
 ) -> dict:
-    """
-    Етап 2 (P1 Clean Cache Write Policy):
-    1. Позначає _partial_write = True, якщо tech_scan_completeness != 'full'.
-    2. Ніколи не дозволяє частковому запису затерти багатший технологічний стек, який уже був у prior_cached_record!
-    """
     payload = {'_schema': CACHE_SCHEMA_VERSION, **result_record}
     is_partial = result_record.get('tech_scan_completeness') != 'full'
     payload['_partial_write'] = is_partial
@@ -262,7 +316,6 @@ def merge_missing_techs_from_cache(
         if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
     ]
 
-    # Якщо кеш був позначений як _partial_write, а живий скан знайшов більше технологій і має GA4 — довіряємо живому скану
     if c_rec.get('_partial_write') and has_ga4_live and len(curr_techs) >= len(cached_techs):
         return tech_info, False, 0
 
@@ -316,10 +369,12 @@ def merge_missing_techs_from_cache(
         _, raw_cached_ev = sanitize_stale_sgtm_strings(None, raw_cached_ev)
 
     raw_ga4_ids = tech_info.get('all_ga4_ids') or c_rec.get('all_ga4_ids')
+    if raw_ga4_ids and 'ROZETKA' in str(raw_ga4_ids).upper():
+        raw_ga4_ids = None
     raw_ga4_conf = tech_info.get('ga4_detection_confidence') or c_rec.get('ga4_detection_confidence')
     existing_ga4_cnt = tech_info.get('all_ga4_ids_count') or c_rec.get('all_ga4_ids_count')
     capped_ga4_ids, parsed_ga4_cnt, capped_ga4_conf = cap_ga4_ids_and_confidence(raw_ga4_ids, raw_ga4_conf)
-    true_ga4_cnt = max(int(existing_ga4_cnt or 0), parsed_ga4_cnt)
+    true_ga4_cnt = max(int(existing_ga4_cnt or 0), parsed_ga4_cnt) if capped_ga4_ids else 0
     if true_ga4_cnt > MAX_DISPLAY_GA4_IDS:
         capped_ga4_conf = f'High (multiplexed {true_ga4_cnt}-property)'
 
@@ -741,6 +796,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     c_hint = detect_country_hint(canonical_domain, '', '', None, '')
     jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
     is_eu = jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+    verdict = 'Unverified (Run Timeout Reached — Retry Domain)'
     return {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -754,7 +810,8 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'cached_snapshot_age_days': None,
         'error_message': 'Actor run approached global timeout before domain finished; retry in smaller batch',
         'data_quality_score': 0,
-        'sales_readiness_verdict': 'Unverified (Run Timeout Reached — Retry Domain)',
+        'sales_readiness_verdict': verdict,
+        'sales_actionability_class': derive_sales_actionability_class(verdict, cat),
         'company_category': cat,
         'category_confidence': cat_conf,
         'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
