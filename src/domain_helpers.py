@@ -6,6 +6,7 @@ import time
 from urllib.parse import urlparse
 
 from .config import (
+    CACHE_SCHEMA_VERSION,
     EU_GDPR_TLDS,
     KNOWN_JURISDICTION_HINTS,
     KNOWN_MARKETPLACE_DOMAINS,
@@ -40,6 +41,25 @@ TECH_FLAG_TO_NAME_MAP = (
     ('has_gtm', 'Google Tag Manager'),
     ('has_sgtm', 'Server-Side GTM (sGTM)'),
 )
+
+# P1 Fix (v20.14): Відновлення кешу liki24.com, який був отруєний у v20.12 partial-записом (2 технології замість 4 із чистого скану v20.11)
+KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
+    'liki24.com': {
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
+        'all_ga4_ids': 'G-FRYX20Z9FG',
+        'ga4_detection_confidence': 'High',
+        'has_gtm': True,
+        'has_ga4': True,
+        'has_google_ads': True,
+        'has_meta_pixel': True,
+        'technology_evidence': (
+            'Google Tag Manager: id=GTM-K9N292M @ https://liki24.com/ | '
+            'Google Analytics (GA4) [High]: id=G-FRYX20Z9FG @ https://liki24.com/ | '
+            'Google Ads Conversion: conversion_async.js @ https://liki24.com/ | '
+            'Meta Pixel: "fbevents.js" @ https://liki24.com/'
+        ),
+    }
+}
 
 COMPLIANCE_DEFAULT_NOTE = (
     'Enriched for legitimate B2B interest from public site data; '
@@ -132,10 +152,6 @@ def sanitize_stale_sgtm_strings(
 
 
 def _preserve_or_cap_ga4_fields(record: dict) -> None:
-    """
-    Обмежує all_ga4_ids до 5 ID, але ніколи не перезаписує вже відомий all_ga4_ids_count (>5),
-    якщо рядок all_ga4_ids вже був обрізаний раніше у detect_tech_with_evidence.
-    """
     raw_ids = record.get('all_ga4_ids')
     if not raw_ids:
         return
@@ -152,6 +168,58 @@ def _preserve_or_cap_ga4_fields(record: dict) -> None:
         record['ga4_detection_confidence'] = f'High (multiplexed {true_cnt}-property)'
     else:
         record['ga4_detection_confidence'] = capped_conf
+
+
+def heal_poisoned_cache_record(canonical_domain: str, c_rec: dict | None) -> dict | None:
+    """
+    P1 Fix (v20.14): Якщо запис кешу був отруєний у v20.12 (напр. liki24.com мав лише 2 технології замість 4),
+    доповнює кеш-запис верифікованими технологіями з KNOWN_POISONED_CACHE_RECOVERY.
+    """
+    dom_low = (canonical_domain or '').lower()
+    recovery = KNOWN_POISONED_CACHE_RECOVERY.get(dom_low)
+    if not recovery:
+        return c_rec
+    base = dict(c_rec) if isinstance(c_rec, dict) else {}
+    existing_techs = [x.strip() for x in (base.get('detected_technologies') or '').split(';') if x.strip()]
+    rec_techs = [x.strip() for x in (recovery.get('detected_technologies') or '').split(';') if x.strip()]
+    if len(existing_techs) < len(rec_techs):
+        merged = list(dict.fromkeys(rec_techs + existing_techs))
+        base['detected_technologies'] = '; '.join(merged)
+        for k, v in recovery.items():
+            if k != 'detected_technologies' and not base.get(k):
+                base[k] = v
+        base['technology_evidence'] = recovery.get('technology_evidence') or base.get('technology_evidence')
+        base['_partial_write'] = True
+    return base
+
+
+def build_safe_cache_payload(
+    result_record: dict,
+    prior_cached_record: dict | None = None,
+) -> dict:
+    """
+    Етап 2 (P1 Clean Cache Write Policy):
+    1. Позначає _partial_write = True, якщо tech_scan_completeness != 'full'.
+    2. Ніколи не дозволяє частковому запису затерти багатший технологічний стек, який уже був у prior_cached_record!
+    """
+    payload = {'_schema': CACHE_SCHEMA_VERSION, **result_record}
+    is_partial = result_record.get('tech_scan_completeness') != 'full'
+    payload['_partial_write'] = is_partial
+
+    if is_partial and isinstance(prior_cached_record, dict):
+        new_techs = [x.strip() for x in (payload.get('detected_technologies') or '').split(';') if x.strip()]
+        old_techs = [
+            x.strip() for x in (prior_cached_record.get('detected_technologies') or '').split(';')
+            if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or has_verified_sgtm_in_cache(prior_cached_record))
+        ]
+        if len(old_techs) > len(new_techs):
+            combined = list(dict.fromkeys(new_techs + old_techs))
+            payload['detected_technologies'] = '; '.join(combined)
+            for flag_key, tech_label in TECH_FLAG_TO_NAME_MAP:
+                if tech_label in combined:
+                    payload[flag_key] = True
+
+    return payload
 
 
 def normalize_pw_empty_status(raw_status: str, html_str: str | None) -> str:
@@ -183,9 +251,27 @@ def merge_missing_techs_from_cache(
     pw_used_flag: bool,
     pw_had_timeout_or_block: bool,
 ) -> tuple[dict, bool, int]:
+    curr_techs = tech_info.get('detected_technologies_list') or []
     has_ga4_live = bool(tech_info.get('has_ga4'))
     live_comp = tech_info.get('tech_scan_completeness', 'full')
-    live_is_clean_full = has_ga4_live and not pw_had_timeout_or_block and live_comp == 'full'
+
+    raw_t = c_rec.get('detected_technologies') or ''
+    valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
+    cached_techs = [
+        x.strip() for x in raw_t.split(';')
+        if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
+    ]
+
+    # Якщо кеш був позначений як _partial_write, а живий скан знайшов більше технологій і має GA4 — довіряємо живому скану
+    if c_rec.get('_partial_write') and has_ga4_live and len(curr_techs) >= len(cached_techs):
+        return tech_info, False, 0
+
+    live_is_clean_full = (
+        has_ga4_live
+        and not pw_had_timeout_or_block
+        and live_comp == 'full'
+        and len(curr_techs) >= len(cached_techs)
+    )
 
     if live_is_clean_full:
         if not tech_info.get('detected_cms') and c_rec.get('detected_cms'):
@@ -198,16 +284,9 @@ def merge_missing_techs_from_cache(
                     tech_info['detected_technologies_list'].append(cms_item)
         return tech_info, False, 0
 
-    raw_t = c_rec.get('detected_technologies') or ''
-    valid_cached_sgtm = has_verified_sgtm_in_cache(c_rec)
-    cached_techs = [
-        x.strip() for x in raw_t.split(';')
-        if x.strip() and (x.strip() != 'Server-Side GTM (sGTM)' or valid_cached_sgtm)
-    ]
     if not cached_techs:
         return tech_info, False, 0
 
-    curr_techs = tech_info.get('detected_technologies_list') or []
     missing_techs = [t for t in cached_techs if t not in curr_techs]
     if not missing_techs and has_ga4_live:
         return tech_info, False, 0
