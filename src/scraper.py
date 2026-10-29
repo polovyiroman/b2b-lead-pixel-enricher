@@ -185,11 +185,6 @@ def classify_failure_status(status: int, err_msg: str) -> str:
 
 
 def is_dynamic_hopeless_waf(err_msg: str) -> bool:
-    """
-    Проблема №4 Fix (Dynamic WAF Fingerprint Detector):
-    Якщо curl_cffi отримав жорсткий блок від AkamaiGHost, DataDome або PerimeterX,
-    і резидентський проксі не підключений — не спалюємо бюджет браузера впусту.
-    """
     err_low = (err_msg or '').lower()
     hard_waf_markers = ('waf:akamai', 'waf:datadome', 'waf:perimeterx', 'waf:imperva')
     if any(m in err_low for m in hard_waf_markers) and _ESCALATION_PROXY_CFG is None:
@@ -509,11 +504,6 @@ def pw_locale_for_region(region: str | None) -> str:
 
 
 async def _get_or_launch_browser():
-    """
-    Крок 3 Fix (Dynamic Native User-Agent):
-    Зчитує нативний User-Agent встановленого Chromium і замінює 'HeadlessChrome/' на 'Chrome/',
-    щоб OS у заголовку User-Agent (Linux x86_64) на 100% збігалася з navigator.platform у JS-оточенні.
-    """
     global _SHARED_PW, _SHARED_BROWSER, _NATIVE_CLEAN_UA
     async with _BROWSER_LOCK:
         if _SHARED_BROWSER is not None and _SHARED_BROWSER.is_connected():
@@ -540,10 +530,6 @@ async def _get_or_launch_browser():
 
 
 async def _try_accept_cookie_banner(page) -> bool:
-    """
-    Проблема №1 Fix: Реальний клік по селекторах OneTrust, Cookiebot, Usercentrics, Didomi, Complianz,
-    щоб розблокувати відстріл GTM/GA4/Meta Pixel на сайтах із режимом Strict GDPR Opt-In.
-    """
     for sel in CMP_ACCEPT_SELECTORS:
         try:
             loc = page.locator(sel).first
@@ -611,8 +597,6 @@ async def fetch_html_playwright_fallback(
                     try:
                         r_url = req.url
                         r_low = r_url.lower()
-                        # Проблема №2 Fix: Ловимо /g/collect та /gtm.js?id=gtm- на БУДЬ-ЯКОМУ домені
-                        # (включно з first-party sGTM типу sgtm.brand.com/g/collect?v=2&tid=G-XXXX&gcs=G111)
                         is_first_party_sgtm_or_ga4 = (
                             '/g/collect' in r_low
                             or '/gtm.js?id=gtm-' in r_low
@@ -677,7 +661,7 @@ async def fetch_html_playwright_fallback(
 
                 last_status = 'launched_empty_shell'
             except Exception as e:
-                last_status = 'launched_timeout' if 'timeout' in str(e).lower(): else 'launched_error'
+                last_status = 'launched_timeout' if 'timeout' in str(e).lower() else 'launched_error'
             finally:
                 if context is not None:
                     try:
