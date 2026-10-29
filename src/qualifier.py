@@ -230,7 +230,7 @@ def compute_data_quality_score(
     score = 0
     t_str = contact_quality_tier or ''
     if is_same_person_email:
-        score += 45 + 20
+        score += 65
     elif 'Tier A-' in t_str or 'Agency Tier A' in t_str:
         score += 40
     elif 'Tier A' in t_str:
@@ -260,7 +260,6 @@ def compute_data_quality_score(
 
     if scan_completeness != 'full' or techs_count == 0:
         if scan_completeness == 'partial_cached' and techs_count >= 4 and not dm_name and not primary_phone:
-            # Для e-com/marketplace з повним 4+ тех-стеком у кеші (як Liki24), щоб не падати нижче порогу фільтрації SDR (score >= 20)
             score -= 8
         else:
             score -= 15
@@ -283,6 +282,7 @@ def build_sales_hook(
     dm_role: str | None,
     dm_linkedin_url: str | None,
     best_email: str | None,
+    is_eu_gdpr: bool = False,
 ) -> str:
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
@@ -304,11 +304,17 @@ def build_sales_hook(
     has_tiktok = bool(tech_info.get('has_tiktok_pixel'))
     has_li = bool(tech_info.get('has_linkedin_pixel'))
     has_consent = bool(tech_info.get('has_cookie_banner'))
+    has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
 
     dm_intro = f'{dm_name} ({dm_role})' if dm_name else 'Marketing Lead'
     li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
+
+    # Крок 2 Fix: Якщо домен у юрисдикції ЄС, крутить Google Ads, але не передає сигнали Google Consent Mode v2 (gcs/gcd)
+    cm_v2_gap_note = ''
+    if is_eu_gdpr and has_gads and not has_cm_v2 and tech_info.get('tech_scan_completeness') == 'full':
+        cm_v2_gap_note = ' [EU Consent Mode v2 gap: Google Ads active without gcs/gcd parameters observed]'
 
     paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
 
@@ -316,7 +322,7 @@ def build_sales_hook(
         paid_str = ' + '.join(paid_channels)
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str} (Server-Side GTM verified). "
+            f"Stack: {stack_str} (Server-Side GTM verified){cm_v2_gap_note}. "
             f"Opening Hook: \"Saw {brand} running {paid_str} with Server-Side GTM already in place — "
             f"how are you currently benchmarking CAPI event match quality and incremental ROAS across channels?\""
         )
@@ -332,6 +338,13 @@ def build_sales_hook(
 
     if paid_channels:
         paid_str = ' + '.join(paid_channels)
+        if cm_v2_gap_note:
+            return (
+                f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+                f"Stack: {stack_str}{cm_v2_gap_note}. "
+                f"Opening Hook: \"Noticed {brand} is running active {paid_str} tags in the EU market without "
+                f"Google Consent Mode v2 (gcs/gcd) signals firing — have you audited EEA conversion modeling loss yet?\""
+            )
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
             f"Stack: {stack_str}. Active multi-channel paid acquisition ({paid_str}) detected. "
@@ -816,7 +829,8 @@ def build_manual_seed_record(
         dm_name,
         dm_role,
         seed.get('decision_maker_linkedin_url'),
-        best_email
+        best_email,
+        is_eu_gdpr=is_eu_gdpr,
     )
 
     deliv_str = seed.get(
