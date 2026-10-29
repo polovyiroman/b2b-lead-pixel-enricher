@@ -8,6 +8,7 @@ from curl_cffi.requests import AsyncSession
 
 from .config import (
     CHECKOUT_REDIRECT_HOSTS,
+    CMP_ACCEPT_SELECTORS,
     CONTACT_ANCHOR_TEXT_KEYWORDS,
     EMAIL_REGEX,
     GTM_ID_REGEX,
@@ -35,6 +36,7 @@ except ImportError:
 
 _SHARED_PW = None
 _SHARED_BROWSER = None
+_NATIVE_CLEAN_UA: str | None = None
 _BROWSER_LOCK = asyncio.Lock()
 _PW_SEMAPHORE = asyncio.Semaphore(3)
 _ESCALATION_PROXY_CFG = None
@@ -55,6 +57,10 @@ def is_playwright_available() -> bool:
     return _PLAYWRIGHT_AVAILABLE
 
 
+def has_residential_escalation_proxy() -> bool:
+    return _ESCALATION_PROXY_CFG is not None
+
+
 def configure_pw(escalation_proxy=None, max_concurrent: int = 3) -> None:
     global _ESCALATION_PROXY_CFG, _PW_SEMAPHORE
     _ESCALATION_PROXY_CFG = escalation_proxy
@@ -62,7 +68,7 @@ def configure_pw(escalation_proxy=None, max_concurrent: int = 3) -> None:
 
 
 async def close_shared_playwright_browser() -> None:
-    global _SHARED_PW, _SHARED_BROWSER
+    global _SHARED_PW, _SHARED_BROWSER, _NATIVE_CLEAN_UA
     async with _BROWSER_LOCK:
         if _SHARED_BROWSER is not None:
             try:
@@ -76,13 +82,10 @@ async def close_shared_playwright_browser() -> None:
             except Exception:
                 pass
             _SHARED_PW = None
+        _NATIVE_CLEAN_UA = None
 
 
 def strip_language_or_www_subdomains(host: str) -> str:
-    """
-    P1-A Fix (v20.16): Зрізає 'www.' та мовні/регіональні піддомени ('en.zalando.de' -> 'zalando.de',
-    'en.aboutyou.de' -> 'aboutyou.de'), не зачіпаючи двочастинні TLD (.com.ua, .co.uk).
-    """
     h = (host or '').strip().lower().strip('.')
     if not h:
         return h
@@ -168,7 +171,7 @@ def get_clean_canonical_domain(final_url: str, fallback_domain: str) -> str:
 
 def classify_failure_status(status: int, err_msg: str) -> str:
     err_low = (err_msg or '').lower()
-    if status in (401, 403, 429, 503) or 'cloudflare' in err_low or 'captcha' in err_low:
+    if status in (401, 403, 429, 503) or 'cloudflare' in err_low or 'captcha' in err_low or 'waf:' in err_low:
         return 'blocked'
     if 'timeout' in err_low or 'timed out' in err_low:
         return 'timeout'
@@ -181,6 +184,21 @@ def classify_failure_status(status: int, err_msg: str) -> str:
     return 'unreachable'
 
 
+def is_dynamic_hopeless_waf(err_msg: str) -> bool:
+    """
+    Проблема №4 Fix (Dynamic WAF Fingerprint Detector):
+    Якщо curl_cffi отримав жорсткий блок від AkamaiGHost, DataDome або PerimeterX,
+    і резидентський проксі не підключений — не спалюємо бюджет браузера впусту.
+    """
+    err_low = (err_msg or '').lower()
+    hard_waf_markers = ('waf:akamai', 'waf:datadome', 'waf:perimeterx', 'waf:imperva')
+    if any(m in err_low for m in hard_waf_markers) and _ESCALATION_PROXY_CFG is None:
+        return True
+    if ('waf:cf_challenge' in err_low) and _ESCALATION_PROXY_CFG is None:
+        return True
+    return False
+
+
 def is_soft_404_page(html: str, page_title: str) -> bool:
     if not html:
         return True
@@ -189,6 +207,23 @@ def is_soft_404_page(html: str, page_title: str) -> bool:
     if len(html) < 1800 and ('404' in html[:800] or 'not found' in html[:800].lower()):
         return True
     return False
+
+
+def _detect_waf_vendor_from_response(resp) -> str:
+    try:
+        headers = {str(k).lower(): str(v).lower() for k, v in (resp.headers or {}).items()}
+        server = headers.get('server', '')
+        if 'akamaighost' in server or 'akamai' in server or 'x-akamai-transformed' in headers:
+            return 'waf:akamai'
+        if 'datadome' in server or 'x-datadome' in headers or 'x-dd-b' in headers:
+            return 'waf:datadome'
+        if 'cf-mitigated' in headers or ('cloudflare' in server and resp.status_code in (403, 503)):
+            return 'waf:cf_challenge'
+        if 'x-iinfo' in headers or 'incapsula' in server:
+            return 'waf:imperva'
+    except Exception:
+        pass
+    return ''
 
 
 async def fetch_html_safely(
@@ -219,7 +254,8 @@ async def fetch_html_safely(
             if 200 <= last_status < 400:
                 text = resp.text[:MAX_HTML_BYTES] if resp.text else ''
                 return last_status, text, final_url, ''
-            last_err = f'HTTP {last_status}'
+            waf_tag = _detect_waf_vendor_from_response(resp)
+            last_err = f'HTTP {last_status} ({waf_tag})' if waf_tag else f'HTTP {last_status}'
         except Exception as e:
             last_err = str(e)
         if attempt < retries:
@@ -434,7 +470,7 @@ def parse_html_sync(
     for script_or_style in soup(['script', 'style', 'noscript', 'svg', 'path']):
         script_or_style.decompose()
 
-    main_text = ' '.join(soup.get_text(' ', strip=True).split())
+    main_text = ' '.join(soup.get_text(' . ', strip=True).split())
     valid_phones = extract_valid_phones(main_text, raw_tel_candidates, default_region)
     phones_with_source = [(p, sc, page_url) for p, sc in valid_phones]
 
@@ -473,7 +509,12 @@ def pw_locale_for_region(region: str | None) -> str:
 
 
 async def _get_or_launch_browser():
-    global _SHARED_PW, _SHARED_BROWSER
+    """
+    Крок 3 Fix (Dynamic Native User-Agent):
+    Зчитує нативний User-Agent встановленого Chromium і замінює 'HeadlessChrome/' на 'Chrome/',
+    щоб OS у заголовку User-Agent (Linux x86_64) на 100% збігалася з navigator.platform у JS-оточенні.
+    """
+    global _SHARED_PW, _SHARED_BROWSER, _NATIVE_CLEAN_UA
     async with _BROWSER_LOCK:
         if _SHARED_BROWSER is not None and _SHARED_BROWSER.is_connected():
             return _SHARED_BROWSER
@@ -487,7 +528,36 @@ async def _get_or_launch_browser():
                 '--no-sandbox',
             ]
         )
+        try:
+            tmp_page = await _SHARED_BROWSER.new_page()
+            raw_ua = await tmp_page.evaluate('() => navigator.userAgent')
+            await tmp_page.close()
+            if raw_ua and isinstance(raw_ua, str):
+                _NATIVE_CLEAN_UA = raw_ua.replace('HeadlessChrome/', 'Chrome/')
+        except Exception:
+            _NATIVE_CLEAN_UA = None
         return _SHARED_BROWSER
+
+
+async def _try_accept_cookie_banner(page) -> bool:
+    """
+    Проблема №1 Fix: Реальний клік по селекторах OneTrust, Cookiebot, Usercentrics, Didomi, Complianz,
+    щоб розблокувати відстріл GTM/GA4/Meta Pixel на сайтах із режимом Strict GDPR Opt-In.
+    """
+    for sel in CMP_ACCEPT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=150):
+                await loc.click(timeout=500)
+                await page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            continue
+    try:
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+    return False
 
 
 async def fetch_html_playwright_fallback(
@@ -520,13 +590,10 @@ async def fetch_html_playwright_fallback(
                 browser = await _get_or_launch_browser()
                 ctx_kwargs: dict = {
                     'locale': locale,
-                    'user_agent': (
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/131.0.0.0 Safari/537.36'
-                    ),
                     'viewport': {'width': 1366, 'height': 768},
                 }
+                if _NATIVE_CLEAN_UA:
+                    ctx_kwargs['user_agent'] = _NATIVE_CLEAN_UA
                 if active_proxy:
                     parsed_p = urlparse(active_proxy)
                     ctx_kwargs['proxy'] = {
@@ -543,16 +610,24 @@ async def fetch_html_playwright_fallback(
                 def _on_request(req):
                     try:
                         r_url = req.url
-                        if any(
-                            tk in r_url.lower() for tk in (
+                        r_low = r_url.lower()
+                        # Проблема №2 Fix: Ловимо /g/collect та /gtm.js?id=gtm- на БУДЬ-ЯКОМУ домені
+                        # (включно з first-party sGTM типу sgtm.brand.com/g/collect?v=2&tid=G-XXXX&gcs=G111)
+                        is_first_party_sgtm_or_ga4 = (
+                            '/g/collect' in r_low
+                            or '/gtm.js?id=gtm-' in r_low
+                        )
+                        is_known_vendor_tracker = any(
+                            tk in r_low for tk in (
                                 'googletagmanager.com', 'google-analytics.com', 'analytics.google.com',
                                 'doubleclick.net', 'googleadservices.com', 'connect.facebook.net',
                                 'facebook.com/tr', 'analytics.tiktok.com', 'snap.licdn.com',
                                 'clarity.ms', 'hotjar.com', 'hs-scripts.com', 'klaviyo.com', 'cdn.shopify.com'
                             )
-                        ):
-                            if len(captured_tracker_urls) < 40:
-                                captured_tracker_urls.append(r_url[:240])
+                        )
+                        if is_first_party_sgtm_or_ga4 or is_known_vendor_tracker:
+                            if len(captured_tracker_urls) < 60:
+                                captured_tracker_urls.append(r_url[:360])
                     except Exception:
                         pass
 
@@ -578,10 +653,7 @@ async def fetch_html_playwright_fallback(
                         last_status = 'launched_error'
 
                 if accept_consent:
-                    try:
-                        await page.wait_for_timeout(1200)
-                    except Exception:
-                        pass
+                    await _try_accept_cookie_banner(page)
                 else:
                     try:
                         await page.wait_for_timeout(600)
@@ -605,7 +677,7 @@ async def fetch_html_playwright_fallback(
 
                 last_status = 'launched_empty_shell'
             except Exception as e:
-                last_status = 'launched_timeout' if 'timeout' in str(e).lower() else 'launched_error'
+                last_status = 'launched_timeout' if 'timeout' in str(e).lower(): else 'launched_error'
             finally:
                 if context is not None:
                     try:
