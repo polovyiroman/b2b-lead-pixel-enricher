@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 24
+CACHE_SCHEMA_VERSION = 25
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -25,6 +25,35 @@ SGTM_CUSTOM_LOADER_REGEX = re.compile(
     r'google\.com|googleapis\.com|gstatic\.com)\b)'
     r'[a-zA-Z0-9.-]+/gtm\.js\?id=GTM-[A-Z0-9]+',
     re.IGNORECASE
+)
+
+# Проблема №2 Fix: Ловить first-party sGTM collector URL (напр. https://sgtm.brand.com/g/collect?v=2&tid=G-XXXX),
+# коли gtm.js завантажено зі стандартного googletagmanager.com, але суворо виключає домени Google/DoubleClick
+# і вимагає обов'язкової наявності параметра tid=G- у query string (щоб test_06 negative_3 залишався False).
+SGTM_FIRST_PARTY_COLLECT_REGEX = re.compile(
+    r'https?://(?!(?:[a-z0-9-]+\.)?'
+    r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
+    r'doubleclick\.net|googleadservices\.com|googlesyndication\.com|'
+    r'google\.com|googleapis\.com|gstatic\.com)\b)'
+    r'([a-zA-Z0-9.-]+)/g/collect\?[^"\'\s<>]*?(?:^|[?&])tid=G-[A-Z0-9]{6,12}\b',
+    re.IGNORECASE
+)
+
+CONSENT_MODE_V2_GCS_REGEX = re.compile(r'(?:[?&])gcs=(G1[01][01])\b')
+CONSENT_MODE_V2_GCD_REGEX = re.compile(r'(?:[?&])gcd=([0-9a-zA-Z_-]{8,40})\b')
+
+CMP_ACCEPT_SELECTORS = (
+    '#onetrust-accept-btn-handler',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonAccept',
+    '[data-testid="uc-accept-all-button"]',
+    '#didomi-notice-agree-button',
+    '.cmplz-accept',
+    '[data-cookiefirst-action="accept"]',
+    'button#cookie-accept',
+    'button[id*="accept-all" i]',
+    'button[id*="accept" i]',
+    'button[class*="accept-all" i]',
 )
 
 GA4_STRICT_10CHAR_REGEX = re.compile(r'\bG-(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,10}\b')
@@ -566,10 +595,13 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
+# P2-D Fix: Додано productsafety / produktsicherheit / recall до LOW_PRIORITY_PREFIXES,
+# щоб на aboutyou.de не вигравав внутрішній комплаєнс-інбокс productsafety@aboutyou.com
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
-    'productcompliance', 'impressum',
+    'productcompliance', 'productsafety', 'product-safety', 'produktsicherheit', 'recall',
+    'impressum',
     'gdpr', 'billing', 'invoice', 'invoices', 'accounting', 'finance',
     'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira',
     'bewerbung', 'karriere', 'personal', 'buchhaltung', 'rechnung', 'rechnungen',
@@ -603,7 +635,7 @@ NON_PERSON_TOKENS = (
     | {
         'corp', 'department', 'dept', 'official', 'press', 'dsa', 'concerns',
         'regulatory', 'ops', 'whsl', 'laadpalen', 'zonnepanelen', 'energie',
-        'installatie', 'impressum', 'productcompliance', 'institutionen', 'new'
+        'installatie', 'impressum', 'productcompliance', 'productsafety', 'institutionen', 'new'
     }
 )
 
