@@ -501,11 +501,6 @@ def _test_12_v2015_security_ssrf_rozetka_and_actionability_enum() -> str:
 
 
 def _test_13_subdomain_canonicalization() -> str:
-    """
-    Test 13/13 (v20.16 P1-A Fix):
-    Verifies language/geo subdomains (en.zalando.de, en.aboutyou.de, ua.ringostat.com)
-    canonicalize to root domain without breaking multi-part TLDs (rozetka.com.ua).
-    """
     cases = [
         ('https://en.zalando.de/women-home/', 'zalando.de', 'zalando.de'),
         ('https://en.aboutyou.de/your-shop', 'aboutyou.de', 'aboutyou.de'),
@@ -519,6 +514,34 @@ def _test_13_subdomain_canonicalization() -> str:
             raise AssertionError(f"Subdomain canonicalization failed for '{final_u}': expected '{expected}', got '{got}'")
 
     return "PASS (en.zalando.de->zalando.de, en.aboutyou.de->aboutyou.de, rozetka.com.ua intact)"
+
+
+def _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn: Callable[[dict], None]) -> str:
+    """
+    Test 14/14 (v20.17 Deep Architecture Audit):
+    1. Verifies first-party sGTM collector (https://sgtm.brand.com/g/collect?v=2&tid=G-12345678AB&gcs=G111&gcd=13r3r3r3r5)
+       is detected as Server-Side GTM (has_sgtm=True) + Consent Mode v2 (has_consent_mode_v2_signals=True).
+    2. Verifies productsafety@aboutyou.com is classified as 'legal_or_hr_inbox' so customer-facing inboxes win.
+    """
+    html_sgtm_collect = (
+        '<html><head>'
+        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-STD1234"></script>'
+        '</head><body>'
+        '<!-- pw_net_req: https://sgtm.brand.com/g/collect?v=2&tid=G-12345678AB&gcs=G111&gcd=13r3r3r3r5 -->'
+        '</body></html>'
+    )
+    info = detect_tech_with_evidence(html_sgtm_collect, '', ['GTM-STD1234'], 'https://brand.com/', 'full')
+    normalize_tech_fn(info)
+    if info.get('has_sgtm') is not True:
+        raise AssertionError(f"Expected has_sgtm=True on first-party /g/collect with tid=G-, got {info.get('has_sgtm')}")
+    if info.get('has_consent_mode_v2_signals') is not True:
+        raise AssertionError("Expected has_consent_mode_v2_signals=True when gcs=G111 & gcd= present")
+
+    ps_type = classify_email_type('productsafety@aboutyou.com', 'aboutyou')
+    if ps_type != 'legal_or_hr_inbox':
+        raise AssertionError(f"Expected 'legal_or_hr_inbox' for productsafety@aboutyou.com, got '{ps_type}'")
+
+    return "PASS (first-party sGTM /g/collect+tid=G- -> has_sgtm=True; gcs/gcd -> Consent Mode v2; productsafety@ -> legal)"
 
 
 def run_startup_regression_gate(
@@ -544,6 +567,7 @@ def run_startup_regression_gate(
         ('test_11_poisoned_cache_recovery_and_safe_write', lambda: _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn)),
         ('test_12_v2015_security_ssrf_rozetka_and_actionability', _test_12_v2015_security_ssrf_rozetka_and_actionability_enum),
         ('test_13_subdomain_canonicalization', _test_13_subdomain_canonicalization),
+        ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
     ]
 
     passed_count = 0
