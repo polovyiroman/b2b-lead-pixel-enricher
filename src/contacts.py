@@ -1,11 +1,10 @@
 import asyncio
 import json
+import os
 import re
-import textwrap
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-import phonenumbers
 
 from .config import (
     B2B_PARTNERSHIP_PREFIXES,
@@ -45,395 +44,260 @@ from .config import (
     TELEGRAM_PLACEHOLDER_SLUGS,
     TESTIMONIAL_TEXT_MARKERS,
     UA_TO_LATIN,
+    UI_ACTION_WORDS_BLACKLIST,
     VERTRETEN_DURCH_PATTERN,
     WHOLESALE_MERCH_PREFIXES,
     clean_url_port,
 )
 
-DNS_MEMORY_CACHE: dict[str, tuple[str | None, bool, str]] = {}
+_DNS_MX_CACHE: dict[str, str] = {}
 _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
 
-IMPRESSUM_CANONICAL_PATH_REGEX = re.compile(
-    r'/(?:impressum|mentions-legales|aviso-legal)\b',
-    re.IGNORECASE
-)
 
-_STOP_NAME_WORDS_LOWER = {w.lower() for w in STOP_NAME_WORDS}
-
-SENDER_SUBDOMAIN_PREFIXES = (
-    'mail.', 'e.', 'email.', 'news.', 'newsletter.', 'newsletters.',
-    'bounce.', 'bounces.', 'crm.', 'mktg.', 'em.', 'mailing.'
-)
-
-EU_DIACRITIC_MAP = {
-    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss',
-    'á': 'a', 'à': 'a', 'â': 'a', 'ã': 'a', 'å': 'a', 'ą': 'a',
-    'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e', 'ę': 'e',
-    'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
-    'ó': 'o', 'ò': 'o', 'ô': 'o', 'õ': 'o', 'ø': 'o', 'ł': 'l',
-    'ú': 'u', 'ù': 'u', 'û': 'u', 'ń': 'n', 'ñ': 'n',
-    'ć': 'c', 'č': 'c', 'ç': 'c', 'ś': 's', 'š': 's', 'ź': 'z', 'ż': 'z', 'ž': 'z',
-}
-
-
-def decode_cf_email(encoded_str: str) -> str:
+def decode_cf_email(cf_hex: str) -> str | None:
     try:
-        r = int(encoded_str[:2], 16)
+        r = int(cf_hex[:2], 16)
         return ''.join(
-            chr(int(encoded_str[i:i + 2], 16) ^ r)
-            for i in range(2, len(encoded_str), 2)
+            chr(int(cf_hex[i:i + 2], 16) ^ r)
+            for i in range(2, len(cf_hex), 2)
         )
     except Exception:
+        return None
+
+
+def transliterate_ua_to_latin(text: str) -> str:
+    return ''.join(UA_TO_LATIN.get(ch, ch) for ch in text.lower())
+
+
+def normalize_executive_role(raw_role: str | None) -> str | None:
+    if not raw_role:
+        return None
+    clean = ' '.join(str(raw_role).split()).strip(' ,—–-:|()•')
+    low = clean.lower()
+    if low in ROLE_NORMALIZATION_MAP:
+        return ROLE_NORMALIZATION_MAP[low]
+    for k, v in ROLE_NORMALIZATION_MAP.items():
+        if re.search(rf'\b{re.escape(k)}\b', low):
+            return v
+    return clean
+
+
+def strip_role_tokens_from_name(raw_name: str) -> str:
+    if not raw_name:
         return ''
+    cleaned = re.sub(r'^(?:Dr\.|Prof\.|Mag\.|Dipl\.-Ing\.|Ing\.|Mr\.|Mrs\.|Ms\.)\s+', '', raw_name.strip(), flags=re.I)
+    tokens = [t.strip(' ,—–-:|()•.') for t in cleaned.split() if t.strip(' ,—–-:|()•.')]
+    kept: list[str] = []
+    for tok in tokens:
+        t_low = tok.lower()
+        if t_low in ROLE_TOKEN_BLACKLIST or t_low in STOP_NAME_WORDS or tok in STOP_NAME_WORDS:
+            continue
+        if t_low in CITY_NAMES_BLACKLIST or t_low in CORPORATE_ENTITY_TOKENS:
+            continue
+        kept.append(tok)
+    return ' '.join(kept[:3])
 
 
-def _matches_prefix_safely(
-    local: str,
-    normalized_local: str,
-    tokens: list[str],
-    prefixes: tuple[str, ...]
-) -> bool:
-    prefix_set = set(prefixes)
-    if local in prefix_set or normalized_local in prefix_set:
-        return True
-    if any(t in prefix_set for t in tokens):
-        return True
-    long_prefixes = tuple(p for p in prefixes if len(p) >= 4)
-    if long_prefixes and (local.startswith(long_prefixes) or normalized_local.startswith(long_prefixes)):
-        return True
+def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
+    if not candidate:
+        return False
+    clean = ' '.join(candidate.split()).strip()
+    if len(clean) < 5 or len(clean) > 48:
+        return False
+    low = clean.lower()
+    if low in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
+        return False
+    if any(ch.isdigit() for ch in clean):
+        return False
+    parts = clean.split()
+    if len(parts) < 2 or len(parts) > 3:
+        return False
+    b_low = (brand_root or '').lower().strip()
+    for p in parts:
+        p_clean = p.strip('.,-’\'')
+        p_low = p_clean.lower()
+        if len(p_clean) < 2:
+            return False
+        if not p_clean[0].isupper():
+            return False
+        if p_clean in STOP_NAME_WORDS or p_low in ROLE_TOKEN_BLACKLIST:
+            return False
+        if p_low in CITY_NAMES_BLACKLIST or p_low in CORPORATE_ENTITY_TOKENS:
+            return False
+        if p_low in DEPARTMENT_PREFIX_BLACKLIST or p_low in UI_ACTION_WORDS_BLACKLIST:
+            return False
+        if b_low and len(b_low) >= 4 and p_low == b_low and p_low not in ('otto',):
+            return False
+        for sub_part in p_clean.split('-'):
+            if not sub_part or len(sub_part) < 2:
+                return False
+            if sub_part.lower() in CORPORATE_ENTITY_TOKENS or sub_part.lower() in CITY_NAMES_BLACKLIST:
+                return False
+    return True
+
+
+def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
+    if not dm_name or not email or '@' not in email:
+        return False
+    local = email.split('@', 1)[0].lower()
+    if local in NON_PERSON_TOKENS:
+        return False
+    parts = [transliterate_ua_to_latin(p) for p in dm_name.split() if len(p) >= 2]
+    if len(parts) < 2:
+        return False
+    first_n, last_n = re.sub(r'[^a-z]', '', parts[0]), re.sub(r'[^a-z]', '', parts[-1])
+    norm_local = re.sub(r'[^a-z]', '', local)
+    if len(first_n) >= 3 and len(last_n) >= 3:
+        if first_n in norm_local and last_n in norm_local:
+            return True
+        if norm_local == f'{first_n[0]}{last_n}' or norm_local == f'{last_n}{first_n[0]}':
+            return True
     return False
 
 
-def classify_email_type(email: str | None, brand_token: str = '') -> str | None:
+def verify_person_linkedin_match(dm_name: str | None, linkedin_url: str | None) -> bool:
+    if not dm_name or not linkedin_url or 'linkedin.com/in/' not in linkedin_url.lower():
+        return False
+    slug = linkedin_url.lower().split('linkedin.com/in/', 1)[1].split('/')[0].split('?')[0]
+    slug_clean = re.sub(r'[^a-z]', '', slug)
+    parts = [ re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2 ]
+    parts = [p for p in parts if len(p) >= 3]
+    if len(parts) < 2:
+        return False
+    return parts[0] in slug_clean and parts[-1] in slug_clean
+
+
+def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tuple[str, ...]) -> bool:
+    if local_part in prefix_tuple:
+        return True
+    for t in tokens:
+        if t in prefix_tuple:
+            return True
+    for pref in prefix_tuple:
+        if len(pref) >= 4 and (local_part.startswith(pref) or local_part.endswith(pref)):
+            return True
+    return False
+
+
+def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if not email or '@' not in email:
         return None
-    local, domain = email.split('@', 1)
-    local = local.lower()
-    domain = domain.lower()
-    domain_root = domain.split('.')[0]
-    normalized_local = re.sub(r'[._+-]', '', local)
-    tokens = [t for t in re.split(r'[._+-]', local) if t]
-    first_token = tokens[0] if tokens else local
+    local, dom = email.lower().strip().split('@', 1)
+    tokens = [t for t in re.split(r'[._+\-]+', local) if t]
+    norm_local = re.sub(r'[._+\-]', '', local)
+    b_low = (brand_root or '').lower().strip()
 
-    if domain in PUBLIC_WEBMAIL_DOMAINS and brand_token and brand_token in normalized_local:
-        if _matches_prefix_safely(local, normalized_local, tokens, SUPPORT_PREFIXES):
+    if dom in PUBLIC_WEBMAIL_DOMAINS:
+        if any(s in tokens or s in norm_local for s in ('support', 'help', 'service', 'order', 'orders', 'shop')):
             return 'brand_webmail_support_inbox'
-        if _matches_prefix_safely(local, normalized_local, tokens, PR_MEDIA_PREFIXES):
-            return 'pr_and_media_inbox'
+        if b_low and len(b_low) >= 3 and b_low in norm_local:
+            return 'brand_webmail_general_inbox'
         return 'brand_webmail_general_inbox'
 
-    if _matches_prefix_safely(local, normalized_local, tokens, LOW_PRIORITY_PREFIXES):
+    if _matches_prefix_safely(local, tokens, LOW_PRIORITY_PREFIXES):
         return 'legal_or_hr_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, INFLUENCER_PREFIXES):
+    if _matches_prefix_safely(local, tokens, INFLUENCER_PREFIXES):
         return 'influencer_gifting_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, B2B_PARTNERSHIP_PREFIXES):
-        return 'b2b_partnerships'
-
-    if local in REGIONAL_BRANCH_LOCALS or first_token in REGIONAL_BRANCH_LOCALS:
-        return 'regional_branch_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, DEPARTMENT_OR_ADMISSIONS_PREFIXES):
-        return 'admissions_or_department_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, MARKETING_EXEC_PREFIXES):
+    if _matches_prefix_safely(local, tokens, MARKETING_EXEC_PREFIXES):
         return 'marketing_or_exec_role'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, WHOLESALE_MERCH_PREFIXES):
+    if _matches_prefix_safely(local, tokens, B2B_PARTNERSHIP_PREFIXES):
+        return 'b2b_partnerships'
+    if _matches_prefix_safely(local, tokens, WHOLESALE_MERCH_PREFIXES):
         return 'wholesale_or_sales_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, GENERAL_OFFICE_PREFIXES):
+    if _matches_prefix_safely(local, tokens, PR_MEDIA_PREFIXES):
+        return 'pr_and_media_inbox'
+    if _matches_prefix_safely(local, tokens, SUPPORT_PREFIXES):
+        return 'customer_support_inbox'
+    if _matches_prefix_safely(local, tokens, DEPARTMENT_OR_ADMISSIONS_PREFIXES):
+        return 'admissions_or_department_inbox'
+    if local in REGIONAL_BRANCH_LOCALS or any(t in REGIONAL_BRANCH_LOCALS for t in tokens):
+        return 'regional_branch_inbox'
+    if _matches_prefix_safely(local, tokens, GENERAL_OFFICE_PREFIXES):
         return 'general_office_inbox'
 
-    if _matches_prefix_safely(local, normalized_local, tokens, SUPPORT_PREFIXES):
-        return 'customer_support_inbox'
-
-    if _matches_prefix_safely(local, normalized_local, tokens, PR_MEDIA_PREFIXES):
-        return 'pr_and_media_inbox'
-
-    if domain not in PUBLIC_WEBMAIL_DOMAINS and len(tokens) == 2 and all(t.isalpha() for t in tokens):
-        if tokens[0] not in NON_PERSON_TOKENS and tokens[1] not in NON_PERSON_TOKENS and tokens[1] != domain_root:
-            if (len(tokens[0]) == 1 and len(tokens[1]) >= 3) or (len(tokens[0]) >= 3 and len(tokens[1]) >= 3):
-                return 'personal_or_named_inbox'
+    if len(tokens) == 2 and all(len(t) >= 2 and t.isalpha() and t not in NON_PERSON_TOKENS for t in tokens):
+        return 'personal_or_named_inbox'
+    if len(tokens) == 1 and local.isalpha() and 3 <= len(local) <= 12 and local not in NON_PERSON_TOKENS:
+        if b_low and local == b_low:
+            return 'general_office_inbox'
+        return 'personal_or_named_inbox'
 
     return 'department_or_general_inbox'
 
 
-def transliterate_ua_to_latin(text: str) -> str:
-    out = []
-    for ch in text.lower():
-        if ch in UA_TO_LATIN:
-            out.append(UA_TO_LATIN[ch])
-        elif ch in EU_DIACRITIC_MAP:
-            out.append(EU_DIACRITIC_MAP[ch])
-        else:
-            out.append(ch)
-    return ''.join(out)
+def is_valid_Scraped_email(email: str, canonical_domain: str) -> tuple[bool, bool]:
+    if not email or '@' not in email or len(email) > 90:
+        return False, False
+    em_low = email.lower().strip().strip('.,;:/|()[]<>\"\'')
+    if any(em_low.endswith(ext) for ext in JUNK_EXTENSIONS):
+        return False, False
+    local, dom = em_low.split('@', 1)
+    if not local or not dom or '.' not in dom:
+        return False, False
+    tld = dom.rsplit('.', 1)[-1]
+    if tld in INVALID_EMAIL_TLDS or not tld.isalpha() or len(tld) < 2:
+        return False, False
+    if local in JUNK_EMAIL_LOCALS or HEX_HASH_LOCAL_REGEX.match(local):
+        return False, False
+    if any(j in dom for j in JUNK_EMAIL_DOMAINS):
+        return False, False
 
+    c_low = (canonical_domain or '').lower().replace('www.', '')
+    brand_root = c_low.split('.')[0] if c_low else ''
+    if dom == c_low or dom.endswith(f'.{c_low}'):
+        return True, False
+    if dom in PUBLIC_WEBMAIL_DOMAINS:
+        norm_l = re.sub(r'[._+\-]', '', local)
+        if brand_root and len(brand_root) >= 3 and brand_root in norm_l:
+            return True, False
+        return False, False
 
-def verify_person_email_match(full_name: str | None, email: str | None) -> bool:
-    if not full_name or not email or '@' not in email:
-        return False
-    local = email.split('@', 1)[0].lower().strip()
-    if local in NON_PERSON_TOKENS:
-        return False
+    dom_root = dom.split('.')[0]
+    if brand_root and len(brand_root) >= 4 and (dom_root == brand_root or brand_root in dom_root):
+        return True, False
 
-    name_parts = [p.strip() for p in full_name.split() if len(p.strip()) >= 2]
-    if len(name_parts) < 2:
-        return False
-
-    first_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[0]))
-    last_raw = name_parts[-1].split('-')[0]
-    last_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(last_raw))
-    if len(last_lat) < 3 or len(first_lat) < 2:
-        return False
-
-    norm_local = re.sub(r'[^a-z]', '', local)
-    first_init = first_lat[0]
-    last_init = last_lat[0]
-    last_prefix = last_lat[:5] if len(last_lat) >= 5 else last_lat
-
-    if norm_local in (f'{first_lat}{last_lat}', f'{last_lat}{first_lat}'):
-        return True
-
-    if len(first_lat) >= 3 and first_lat in local and last_prefix in local:
-        return True
-
-    pattern = (
-        rf'^(?:{re.escape(first_init)}[._-]?{re.escape(last_prefix)}'
-        rf'|{re.escape(last_prefix)}[._-]?{re.escape(first_init)}'
-        rf'|{re.escape(first_lat)}[._-]?{re.escape(last_init)})$'
-    )
-    if re.search(pattern, local):
-        return True
-
-    if (local == first_lat and len(first_lat) >= 4) or (local == last_lat and len(last_lat) >= 4):
-        return True
-
-    return False
-
-
-def verify_person_linkedin_match(full_name: str | None, linkedin_url: str | None) -> bool:
-    if not full_name or not linkedin_url or '/in/' not in linkedin_url.lower():
-        return False
-    slug = linkedin_url.lower().split('/in/', 1)[1].split('/')[0].split('?')[0]
-    slug_clean = re.sub(r'[^a-z]', '', slug)
-    name_parts = [p.strip() for p in full_name.split() if len(p.strip()) >= 2]
-    if len(name_parts) < 2:
-        return False
-
-    first_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[0]))
-    last_lat = re.sub(r'[^a-z]', '', transliterate_ua_to_latin(name_parts[-1].split('-')[0]))
-
-    has_last = len(last_lat) >= 4 and last_lat[:4] in slug_clean
-    has_first = len(first_lat) >= 3 and first_lat[:3] in slug_clean
-    return has_last and has_first
-
-
-async def query_doh_json(client: AsyncSession, domain: str, record_type: str) -> tuple[dict | None, str]:
-    endpoints = [
-        f'https://dns.google/resolve?name={domain}&type={record_type}',
-        f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
-        f'https://dns.quad9.net:5053/dns-query?name={domain}&type={record_type}',
-    ]
-    last_status = 'dns_error'
-    for ep in endpoints:
-        for use_direct in (False, True):
-            try:
-                kwargs = {
-                    'headers': {'accept': 'application/dns-json'},
-                    'timeout': 4.5,
-                }
-                if use_direct:
-                    kwargs['proxy'] = None
-                resp = await client.get(ep, **kwargs)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict):
-                        return data, 'ok'
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    last_status = 'dns_timeout'
-                continue
-    return None, last_status
-
-
-async def verify_email_deliverability_deep(
-    client: AsyncSession,
-    email: str | None,
-    source_url: str | None
-) -> str | None:
-    if not email or '@' not in email:
-        return None
-    domain = email.split('@', 1)[1].strip().lower()
-    is_public_webmail = domain in PUBLIC_WEBMAIL_DOMAINS
-
-    dom_lock = _DNS_DOMAIN_LOCKS.setdefault(domain, asyncio.Lock())
-    async with dom_lock:
-        if domain in DNS_MEMORY_CACHE:
-            provider, has_spf, err_code = DNS_MEMORY_CACHE[domain]
-        else:
-            provider = None
-            has_spf = False
-            mx_data, err_code = await query_doh_json(client, domain, 'MX')
-            if mx_data is not None:
-                answers = mx_data.get('Answer', [])
-                mx_hosts = [str(ans.get('data', '')).lower() for ans in answers if ans.get('type') == 15]
-                if mx_hosts:
-                    joined_mx = ' '.join(mx_hosts)
-                    if 'google.com' in joined_mx or 'googlemail.com' in joined_mx:
-                        provider = 'Google' if is_public_webmail else 'Google Workspace'
-                    elif 'outlook.com' in joined_mx or 'protection.outlook.com' in joined_mx:
-                        provider = 'Microsoft' if is_public_webmail else 'Microsoft 365'
-                    elif 'pphosted.com' in joined_mx or 'proofpoint' in joined_mx:
-                        provider = 'Proofpoint Enterprise'
-                    elif 'mimecast.com' in joined_mx:
-                        provider = 'Mimecast Enterprise'
-                    elif 'barracudanetworks.com' in joined_mx:
-                        provider = 'Barracuda Gateway'
-                    elif 'route.mx.cloudflare.net' in joined_mx:
-                        provider = 'Cloudflare Email'
-                    elif 'zoho.' in joined_mx:
-                        provider = 'Zoho Mail'
-                    elif 'protonmail.' in joined_mx:
-                        provider = 'ProtonMail'
-                    elif 'ukr.net' in joined_mx:
-                        provider = 'Ukr.net'
-                    else:
-                        provider = mx_hosts[0].split()[-1].rstrip('.')
-                else:
-                    err_code = 'dns_no_mx_records'
-
-                txt_data, _ = await query_doh_json(client, domain, 'TXT')
-                if txt_data is not None:
-                    txt_ans = [str(a.get('data', '')).lower() for a in txt_data.get('Answer', [])]
-                    has_spf = any('v=spf1' in t for t in txt_ans)
-
-            if provider or err_code == 'dns_no_mx_records':
-                DNS_MEMORY_CACHE[domain] = (provider, has_spf, err_code)
-
-    if provider:
-        spf_tag = 'SPF_present' if has_spf else 'SPF_missing'
-        src_tag = 'published_in_site_html' if source_url else 'extracted'
-        if is_public_webmail:
-            return f'public_webmail_domain ({domain}; MX_found={provider}; {spf_tag}; {src_tag}; mailbox_unverified_by_smtp)'
-        return f'domain_accepts_email ({provider}; MX_found; {spf_tag}; {src_tag})'
-
-    if err_code == 'dns_no_mx_records':
-        return 'invalid_no_mx_records (domain_cannot_receive_email)'
-    return f'{err_code} (lookup_failed)'
-
-
-def reject_external_domain_pollution(
-    valid: dict[str, str],
-    base_domain: str
-) -> tuple[dict[str, str], bool]:
-    if not valid:
-        return valid, False
-    base_brand = base_domain.split('.')[0].lower() if base_domain else ''
-
-    def is_native_or_brand_alias(addr: str) -> bool:
-        local, dom = addr.split('@', 1)
-        dom_root = dom.split('.')[0]
-        norm_local = re.sub(r'[._+-]', '', local.lower())
-        if dom == base_domain or dom.endswith(f'.{base_domain}'):
-            return True
-        if base_brand and len(base_brand) >= 3 and (dom_root == base_brand or base_brand in dom_root or dom_root in base_brand):
-            return True
-        if dom in PUBLIC_WEBMAIL_DOMAINS and base_brand and base_brand in norm_local:
-            return True
-        return False
-
-    native_subset = {addr: src for addr, src in valid.items() if is_native_or_brand_alias(addr)}
-    if native_subset:
-        return native_subset, False
-
-    return {}, True
+    return False, True
 
 
 def rank_and_clean_emails(
     email_sources: dict[str, str],
-    base_domain: str
+    canonical_domain: str
 ) -> tuple[list[tuple[str, str]], bool]:
-    valid: dict[str, str] = {}
-    base_brand = base_domain.split('.')[0].lower() if base_domain else ''
-
-    for raw_email, source_url in email_sources.items():
-        email = raw_email.lower().strip('.,;:()[]"\'<> \t\r\n')
-        email = re.sub(r'^(?:%20|u002[0-9a-f]|u003[0-9a-f]|3a|2f)+', '', email)
-
-        if any(email.endswith(ext) for ext in JUNK_EXTENSIONS):
-            continue
-        if '@' not in email:
-            continue
-
-        local_part, domain_part = email.split('@', 1)
-        if not local_part or not domain_part or '.' not in domain_part:
-            continue
-
-        if 'sentry.' in domain_part or HEX_HASH_LOCAL_REGEX.match(local_part):
-            continue
-
-        if base_domain and domain_part != base_domain and domain_part.endswith(f'.{base_domain}'):
-            sub_prefix = domain_part[:-len(base_domain)]
-            if sub_prefix in SENDER_SUBDOMAIN_PREFIXES:
-                continue
-
-        tld = domain_part.rsplit('.', 1)[-1].lower()
-        if tld in INVALID_EMAIL_TLDS or len(tld) < 2 or not tld.isalpha():
-            continue
-
-        domain_root = domain_part.split('.')[0]
-        clean_local = re.sub(r'[0-9._+-]+$', '', local_part)
-
-        if domain_part in JUNK_EMAIL_DOMAINS and base_domain not in domain_part:
-            continue
-        if local_part in JUNK_EMAIL_LOCALS or clean_local in JUNK_EMAIL_LOCALS:
-            continue
-        if local_part == domain_root and domain_part != base_domain:
-            continue
-
-        if 6 <= len(email) <= 60 and email not in valid:
-            valid[email] = clean_url_port(source_url) or source_url
-
-    valid, had_external_pollution = reject_external_domain_pollution(valid, base_domain)
-
+    brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
     type_weights = {
-        'marketing_or_exec_role': 35,
-        'personal_or_named_inbox': 32,
-        'b2b_partnerships': 28,
-        'wholesale_or_sales_inbox': 25,
-        'general_office_inbox': 24,
-        'brand_webmail_general_inbox': 20,
+        'marketing_or_exec_role': 100,
+        'personal_or_named_inbox': 92,
+        'b2b_partnerships': 85,
+        'wholesale_or_sales_inbox': 75,
+        'general_office_inbox': 60,
+        'brand_webmail_general_inbox': 50,
+        'brand_webmail_support_inbox': 42,
+        'regional_branch_inbox': 35,
+        'admissions_or_department_inbox': 28,
         'department_or_general_inbox': 15,
-        'regional_branch_inbox': 14,
-        'brand_webmail_support_inbox': 12,
-        'influencer_gifting_inbox': 11,
-        'admissions_or_department_inbox': 10,
+        'pr_and_media_inbox': 12,
+        'influencer_gifting_inbox': 10,
         'customer_support_inbox': 8,
-        'pr_and_media_inbox': 5,
-        'legal_or_hr_inbox': -40
+        'legal_or_hr_inbox': 2,
     }
 
-    def email_score(addr: str) -> tuple[int, str]:
-        _, domain = addr.split('@', 1)
-        dom_root = domain.split('.')[0]
-        score = 0
-        if base_domain and domain == base_domain:
-            score += 25
-        elif base_domain and domain.endswith(f'.{base_domain}'):
-            score += 18
-        elif base_brand and dom_root == base_brand:
-            score += 20
-        elif base_brand and base_brand in dom_root:
-            score += 8
-        email_type = classify_email_type(addr, base_brand)
-        score += type_weights.get(email_type or '', 0)
-        return (-score, addr)
+    cleaned: dict[str, tuple[int, str]] = {}
+    had_external_pollution = False
 
-    sorted_addrs = sorted(valid.keys(), key=email_score)
-    return [(addr, valid[addr]) for addr in sorted_addrs], had_external_pollution
+    for raw_em, src_url in email_sources.items():
+        em = raw_em.strip().strip('.,;:/|()[]<>\"\'').lower()
+        is_val, is_ext = is_valid_Scraped_email(em, canonical_domain)
+        if not is_val:
+            if is_ext:
+                had_external_pollution = True
+            continue
+        em_type = classify_email_type(em, brand_root) or 'department_or_general_inbox'
+        score = type_weights.get(em_type, 10)
+        if em not in cleaned or score > cleaned[em][0]:
+            cleaned[em] = (score, src_url)
+
+    ranked = sorted(cleaned.items(), key=lambda x: (-x[1][0], x[0]))
+    return [(em, info[1]) for em, info in ranked], had_external_pollution
 
 
 def classify_email_source_type_and_note(
@@ -442,71 +306,20 @@ def classify_email_source_type_and_note(
     email_source_url: str | None,
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None]:
-    if not best_email or not email_source_url:
+    if not best_email:
         return None, None
-    em_low = best_email.lower()
-    em_dom = em_low.split('@', 1)[1] if '@' in em_low else ''
-    parsed_src = urlparse(email_source_url)
-    src_host = re.sub(r':\d+$', '', parsed_src.netloc.lower().replace('www.', ''))
-    path_low = parsed_src.path.lower()
+    path = urlparse(email_source_url or '').path.lower()
+    if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
+        src_type = 'impressum_or_legal_page'
+    elif any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto')):
+        src_type = 'contact_page'
+    elif any(k in path for k in ('about', 'team', 'komanda', 'ueber-uns', 'uber-uns', 'pro-nas')):
+        src_type = 'about_or_team_page'
+    else:
+        src_type = 'homepage_or_footer'
 
-    alias_suffix = ''
-    if em_dom and src_host and em_dom != src_host and not em_dom.endswith(f'.{src_host}'):
-        if em_dom in PUBLIC_WEBMAIL_DOMAINS:
-            alias_suffix = f', mailbox hosted on public webmail ({em_dom})'
-        else:
-            alias_suffix = f', mailbox on brand alias {em_dom}'
-
-    in_footer = False
-    for p_url, html, _ in pages_with_urls:
-        if (clean_url_port(p_url) or p_url) == (clean_url_port(email_source_url) or email_source_url):
-            soup = BeautifulSoup(html, 'lxml')
-            for f_tag in soup.find_all(['footer', 'nav']):
-                if em_low in f_tag.get_text(' ', strip=True).lower() or em_low in str(f_tag).lower():
-                    in_footer = True
-                    break
-            if not in_footer:
-                for el in soup.find_all(attrs={'class': re.compile(r'footer|bottom-bar|copyright', re.I)}):
-                    if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
-                        in_footer = True
-                        break
-            if not in_footer:
-                for el in soup.find_all(attrs={'id': re.compile(r'footer', re.I)}):
-                    if em_low in el.get_text(' ', strip=True).lower() or em_low in str(el).lower():
-                        in_footer = True
-                        break
-
-    if in_footer:
-        return (
-            'site_footer',
-            f'Found in site footer/navigation on {email_source_url} ({best_email_type}){alias_suffix}'
-        )
-
-    if any(k in path_low for k in ('contact', 'kontakt', 'kontakty', 'impressum', 'get-in-touch')):
-        return 'contact_page', f'Published on dedicated contact page ({email_source_url}){alias_suffix}'
-
-    if DM_LEGAL_SOURCE_FLAG.search(path_low) or 'privacy' in path_low or 'terms' in path_low:
-        if best_email_type in ('general_office_inbox', 'b2b_partnerships', 'wholesale_or_sales_inbox', 'customer_support_inbox'):
-            return (
-                'site_footer',
-                f'General/B2B inbox ({best_email}) listed on {path_low} (safe for gatekeeper/routing){alias_suffix}'
-            )
-        return 'legal_or_terms_page', f'Listed on legal/terms page ({path_low}){alias_suffix}'
-
-    if any(k in path_low for k in ('support', 'help', 'care', 'faq')):
-        if best_email_type == 'b2b_partnerships':
-            return (
-                'support_or_footer',
-                f'B2B/Corporate partnership email ({best_email}) listed in contact directory on {path_low}{alias_suffix}'
-            )
-        return 'support_or_footer', f'Listed on support/help directory page ({path_low}){alias_suffix}'
-
-    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/'):
-        if alias_suffix:
-            return 'homepage', f'Published on {src_host} homepage{alias_suffix}'
-        return 'homepage', 'Published directly on homepage'
-
-    return 'page_body', f'Extracted from page body ({path_low}){alias_suffix}'
+    note = f'Extracted {best_email_type} from {src_type}'
+    return src_type, note
 
 
 def extract_named_email_owner_hint(
@@ -516,363 +329,275 @@ def extract_named_email_owner_hint(
 ) -> str | None:
     if not best_email or best_email_type != 'personal_or_named_inbox':
         return None
-    em_low = best_email.lower()
-    local_part = best_email.split('@', 1)[0]
-
-    for _, html, text in pages_with_urls:
-        soup = BeautifulSoup(html, 'lxml')
-        for a_tag in soup.find_all('a', href=True):
-            if em_low in a_tag['href'].lower() or em_low in a_tag.get_text().lower():
-                curr = a_tag
-                for _ in range(4):
-                    curr = curr.find_parent(['li', 'tr', 'td', 'p', 'div', 'article', 'section'])
-                    if not curr:
-                        break
-                    c_txt = ' '.join(curr.get_text(' ', strip=True).split())
-                    cleaned_ctx = re.sub(re.escape(best_email), '', c_txt, flags=re.IGNORECASE).strip(' —–-:|,;')
-                    has_role = any(rw in cleaned_ctx.lower() for rw in ROLE_WORDS_IN_CONTEXT)
-                    if has_role and 8 <= len(cleaned_ctx) <= 220:
-                        return textwrap.shorten(f'{local_part}: {cleaned_ctx}', width=140, placeholder='…')
-
-        idx = text.lower().find(em_low)
+    for _, _, text in pages_with_urls:
+        idx = text.lower().find(best_email.lower())
         if idx != -1:
-            start = max(0, idx - 110)
-            end = min(len(text), idx + len(best_email) + 90)
-            snippet = ' '.join(text[start:end].split())
-            cleaned_snip = re.sub(re.escape(best_email), '', snippet, flags=re.IGNORECASE).strip(' —–-:|,;')
-            if any(rw in cleaned_snip.lower() for rw in ROLE_WORDS_IN_CONTEXT) and len(cleaned_snip) >= 8:
-                return textwrap.shorten(f'{local_part}: {cleaned_snip}', width=140, placeholder='…')
-
-    return f'Named staff inbox ({local_part}) — role not found on site, verify on LinkedIn'
-
-
-def clean_and_validate_social_url(platform: str, href: str) -> str | None:
-    try:
-        parsed = urlparse(href.strip())
-    except Exception:
-        return None
-
-    if parsed.scheme not in ('http', 'https'):
-        return None
-
-    host = parsed.netloc.lower()
-    if host.startswith('www.'):
-        host = host[4:]
-    if host.startswith('m.'):
-        host = host[2:]
-
-    segments = [s for s in parsed.path.split('/') if s]
-    if not segments:
-        return None
-
-    segments_lower = [s.lower() for s in segments]
-    if any(seg in SOCIAL_BAD_SEGMENTS for seg in segments_lower):
-        return None
-
-    if platform == 'facebook':
-        if host not in ('facebook.com', 'fb.com') or segments_lower[0] == 'profile.php':
-            return None
-        return f'https://www.facebook.com/{segments[0]}'
-
-    if platform == 'instagram':
-        if host != 'instagram.com':
-            return None
-        return f'https://www.instagram.com/{segments[0]}'
-
-    if platform == 'linkedin':
-        if not host.endswith('linkedin.com') or len(segments) < 2:
-            return None
-        if segments_lower[0] not in ('company', 'school'):
-            return None
-        return f'https://www.linkedin.com/{segments_lower[0]}/{segments[1]}'
-
-    if platform == 'tiktok':
-        if host != 'tiktok.com' or not segments[0].startswith('@'):
-            return None
-        return f'https://www.tiktok.com/{segments[0]}'
-
-    if platform == 'telegram':
-        if host not in ('t.me', 'telegram.me') or segments_lower[0] in ('share', 'joinchat', 'addstickers'):
-            return None
-        tg_slug = segments_lower[0]
-        if tg_slug.startswith('+') or len(tg_slug) < 4:
-            return None
-        if tg_slug in TELEGRAM_PLACEHOLDER_SLUGS:
-            return None
-        tg_parts = [p for p in re.split(r'[._-]', tg_slug) if p]
-        if any(p in TELEGRAM_PLACEHOLDER_SLUGS for p in tg_parts):
-            return None
-        return f'https://t.me/{segments[0]}'
-
-    if platform == 'youtube':
-        if host != 'youtube.com':
-            return None
-        if segments[0].startswith('@'):
-            return f'https://www.youtube.com/{segments[0]}'
-        if segments_lower[0] in ('c', 'channel', 'user') and len(segments) >= 2:
-            return f'https://www.youtube.com/{segments_lower[0]}/{segments[1]}'
-        return None
-
-    if platform == 'twitter':
-        if host not in ('twitter.com', 'x.com'):
-            return None
-        return f'https://x.com/{segments[0]}'
-
+            window = text[max(0, idx - 90):min(len(text), idx + 90)]
+            for rw in ROLE_WORDS_IN_CONTEXT:
+                if rw in window.lower():
+                    return f'Context near {best_email}: "{window.strip()[:100]}"'
     return None
 
 
-def pick_best_social_candidate(
-    candidates: list[tuple[str, str]],
-    brand_root: str
-) -> tuple[str | None, str | None]:
-    if not candidates:
-        return None, None
-    brand_low = brand_root.lower()
-    for url, src in candidates:
-        if brand_low and brand_low in url.lower():
-            return url, clean_url_port(src) or src
-    return candidates[0][0], clean_url_port(candidates[0][1]) or candidates[0][1]
+async def verify_email_deliverability_deep(
+    client: AsyncSession,
+    email: str | None,
+    source_url: str | None = None
+) -> str | None:
+    if not email or '@' not in email:
+        return None
+    dom = email.split('@', 1)[1].lower().strip()
+    if dom in PUBLIC_WEBMAIL_DOMAINS:
+        return f'public_webmail_provider ({dom}; MX_assumed_valid)'
 
+    if dom in _DNS_MX_CACHE:
+        return _DNS_MX_CACHE[dom]
 
-def score_phone_context(context_text: str) -> int:
-    ctx = context_text.lower()
-    score = 0
-    if any(k in ctx for k in B2B_PHONE_KEYWORDS):
-        score += 25
-    if any(k in ctx for k in RETAIL_PHONE_KEYWORDS):
-        score -= 10
-    return score
+    lock = _DNS_DOMAIN_LOCKS.setdefault(dom, asyncio.Lock())
+    async with lock:
+        if dom in _DNS_MX_CACHE:
+            return _DNS_MX_CACHE[dom]
 
+        doh_endpoints = (
+            f'https://dns.google/resolve?name={dom}&type=MX',
+            f'https://cloudflare-dns.com/dns-query?name={dom}&type=MX',
+        )
+        mx_answers = []
+        dns_ok = False
+        for ep in doh_endpoints:
+            try:
+                resp = await client.get(ep, headers={'Accept': 'application/dns-json'}, timeout=4.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    dns_ok = True
+                    mx_answers = data.get('Answer') or []
+                    if mx_answers:
+                        break
+            except Exception:
+                continue
 
-def is_junk_phone(e164: str) -> bool:
-    digits = re.sub(r'\D', '', e164)
-    if not digits:
-        return True
-    if re.search(r'(?:1234567|123456|1111111|0000000|9999999|123456789)$', digits):
-        return True
-    if len(set(digits[-7:])) <= 2 and len(digits) >= 9:
-        return True
-    return False
+        if not dns_ok:
+            res = 'dns_lookup_timeout_or_error (verify_manually)'
+            _DNS_MX_CACHE[dom] = res
+            return res
+
+        if not mx_answers:
+            res = 'invalid_no_mx_records_found'
+            _DNS_MX_CACHE[dom] = res
+            return res
+
+        mx_hosts = ' '.join(str(a.get('data', '')).lower() for a in mx_answers)
+        if 'google.com' in mx_hosts or 'googlemail.com' in mx_hosts:
+            provider = 'Google Workspace'
+        elif 'outlook.com' in mx_hosts or 'protection.outlook.com' in mx_hosts:
+            provider = 'Microsoft 365'
+        elif 'pphosted.com' in mx_hosts or 'mimecast.com' in mx_hosts:
+            provider = 'Enterprise Gateway (Proofpoint/Mimecast)'
+        elif 'zoho.' in mx_hosts:
+            provider = 'Zoho Mail'
+        else:
+            provider = 'Custom MX'
+
+        spf_present = False
+        try:
+            txt_resp = await client.get(
+                f'https://dns.google/resolve?name={dom}&type=TXT',
+                headers={'Accept': 'application/dns-json'},
+                timeout=3.5
+            )
+            if txt_resp.status_code == 200:
+                txt_ans = txt_resp.json().get('Answer') or []
+                spf_present = any('v=spf1' in str(a.get('data', '')).lower() for a in txt_ans)
+        except Exception:
+            pass
+
+        spf_tag = 'SPF_present' if spf_present else 'SPF_unverified'
+        res = f'domain_accepts_email ({provider}; MX_found; {spf_tag})'
+        _DNS_MX_CACHE[dom] = res
+        return res
 
 
 def extract_valid_phones(
     text: str,
-    raw_tel_candidates: list[tuple[str, str]],
-    default_region: str
+    raw_tel_links: list[tuple[str, str]],
+    default_region: str = 'US'
 ) -> list[tuple[str, int]]:
-    phone_scores: dict[str, int] = {}
-    phone_order: dict[str, int] = {}
-    order_counter = 0
-    preferred_prefix = REGION_DIALING_PREFIX_MAP.get(default_region.upper(), '')
+    dial_pref = REGION_DIALING_PREFIX_MAP.get(default_region.upper(), '+1')
+    candidates: dict[str, int] = {}
 
-    for raw_tel, context in raw_tel_candidates:
-        try:
-            parsed = phonenumbers.parse(raw_tel, default_region)
-            if phonenumbers.is_valid_number(parsed):
-                e164_chk = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
-                if is_junk_phone(e164_chk):
-                    continue
-                formatted = phonenumbers.format_number(
-                    parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL
-                )
-                region_bonus = 35 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
-                ctx_score = 15 + region_bonus + score_phone_context(context)
-                if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
-                    phone_scores[formatted] = ctx_score
-                if formatted not in phone_order:
-                    phone_order[formatted] = order_counter
-                    order_counter += 1
-        except phonenumbers.NumberParseException:
-            continue
+    def _score_phone(raw_p: str, ctx: str, is_href: bool) -> None:
+        cleaned = re.sub(r'[^\d+]', '', raw_p)
+        if cleaned.startswith('00'):
+            cleaned = '+' + cleaned[2:]
+        digits_only = re.sub(r'\D', '', cleaned)
+        if len(digits_only) < 9 or len(digits_only) > 15:
+            return
+        if re.search(r'(\d)\1{6,}', digits_only):
+            return
+        if digits_only.startswith(('199', '200', '201', '202')) and len(digits_only) == 8:
+            return
 
-    for match in phonenumbers.PhoneNumberMatcher(text, default_region):
-        if phonenumbers.is_valid_number(match.number):
-            e164_chk = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
-            if is_junk_phone(e164_chk):
-                continue
-            formatted = phonenumbers.format_number(
-                match.number, phonenumbers.PhoneNumberFormat.INTERNATIONAL
-            )
-            start_idx = max(0, match.start - 90)
-            end_idx = min(len(text), match.end + 90)
-            context = text[start_idx:end_idx]
-            region_bonus = 35 if (preferred_prefix and e164_chk.startswith(preferred_prefix)) else 0
-            ctx_score = region_bonus + score_phone_context(context)
+        if not cleaned.startswith('+'):
+            if default_region == 'UA' and digits_only.startswith('0') and len(digits_only) == 10:
+                cleaned = '+38' + digits_only
+            elif default_region == 'DE' and digits_only.startswith('0') and 10 <= len(digits_only) <= 12:
+                cleaned = '+49' + digits_only[1:]
+            elif len(digits_only) >= 10:
+                cleaned = f'{dial_pref}{digits_only[-10:]}' if dial_pref == '+1' else f'+{digits_only}'
+            else:
+                return
 
-            if formatted not in phone_scores or ctx_score > phone_scores[formatted]:
-                phone_scores[formatted] = ctx_score
-            if formatted not in phone_order:
-                phone_order[formatted] = order_counter
-                order_counter += 1
+        score = 50 if is_href else 25
+        ctx_low = (ctx or '').lower()
+        if any(k in ctx_low for k in B2B_PHONE_KEYWORDS):
+            score += 30
+        elif any(k in ctx_low for k in RETAIL_PHONE_KEYWORDS):
+            score -= 10
+        if cleaned not in candidates or score > candidates[cleaned]:
+            candidates[cleaned] = score
 
-    sorted_phones = sorted(
-        phone_scores.keys(),
-        key=lambda p: (-phone_scores[p], phone_order[p])
-    )
-    return [(p, phone_scores[p]) for p in sorted_phones[:10]]
+    for tel_str, ctx in raw_tel_links:
+        _score_phone(tel_str, ctx, True)
+
+    for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', text):
+        val = m.group(0)
+        start = max(0, m.start() - 50)
+        end = min(len(text), m.end() + 50)
+        _score_phone(val, text[start:end], False)
+
+    ranked = sorted(candidates.items(), key=lambda x: (-x[1], x[0]))
+    return ranked[:3]
 
 
-def classify_dm_source_type(dm_source_url: str | None) -> str | None:
-    if not dm_source_url:
+def clean_and_validate_social_url(platform: str, url: str) -> str | None:
+    if not url:
         return None
-    path_low = urlparse(dm_source_url).path.lower()
-    if IMPRESSUM_CANONICAL_PATH_REGEX.search(path_low):
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ('http', 'https'):
+            return None
+        path_segments = [s for s in parsed.path.split('/') if s]
+        if not path_segments:
+            return None
+        first_seg = path_segments[0].lower()
+        if first_seg in SOCIAL_BAD_SEGMENTS:
+            return None
+
+        if platform == 'linkedin':
+            if first_seg not in ('company', 'in', 'school', 'showcase'):
+                return None
+            if len(path_segments) < 2:
+                return None
+            slug = path_segments[1]
+            return f'https://www.linkedin.com/{first_seg}/{slug}'
+
+        if platform == 'telegram':
+            if first_seg in TELEGRAM_PLACEHOLDER_SLUGS or first_seg == 'share':
+                return None
+            return f'https://t.me/{path_segments[0]}'
+
+        if platform == 'tiktok':
+            if not first_seg.startswith('@'):
+                return None
+            return f'https://www.tiktok.com/{path_segments[0]}'
+
+        clean_path = '/'.join(path_segments[:2])
+        host = parsed.netloc.lower()
+        if not host.startswith('www.') and platform in ('instagram', 'facebook', 'youtube'):
+            host = 'www.' + host
+        return f'https://{host}/{clean_path}'
+    except Exception:
+        return None
+
+
+def pick_best_social_candidate(
+    candidates: list[tuple[str, str]],
+    brand_root: str = ''
+) -> tuple[str | None, str | None]:
+    if not candidates:
+        return None, None
+    b_low = (brand_root or '').lower()
+    best_url, best_src, best_score = None, None, -100
+    for u, src in candidates:
+        sc = 10
+        u_low = u.lower()
+        if '/company/' in u_low:
+            sc += 30
+        elif '/in/' in u_low:
+            sc -= 5
+        if b_low and len(b_low) >= 3 and b_low in u_low:
+            sc += 25
+        if sc > best_score:
+            best_score = sc
+            best_url, best_src = u, src
+    return best_url, best_src
+
+
+def classify_dm_source_type(source_url: str | None) -> str | None:
+    if not source_url:
+        return None
+    u_low = source_url.lower()
+    if 'linkedin.com/in/' in u_low:
+        return 'serp_linkedin_xray'
+    path = urlparse(source_url).path.lower()
+    if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return 'impressum_page'
-    if DM_LEGAL_SOURCE_FLAG.search(path_low):
-        return 'legal_or_offer_page'
-    if any(k in path_low for k in ('/team', '/komanda', '/leadership', '/management', '/founders', '/zespol', '/equipe')):
-        return 'team_page'
-    if any(k in path_low for k in (
-        '/about', '/pro-nas', '/o-nas', '/company', '/our-story',
-        '/uber-uns', '/ueber-uns', '/qui-sommes-nous', '/a-propos',
-        '/quienes-somos', '/chi-siamo', '/over-ons', '/o-firmie', '/om-oss'
-    )):
+    if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'board', 'vorstand')):
+        return 'team_or_leadership_page'
+    if any(k in path for k in ('about', 'ueber-uns', 'uber-uns', 'pro-nas', 'o-nas', 'company', 'qui-sommes-nous')):
         return 'about_page'
-    if any(k in path_low for k in ('/blog', '/news', '/article', '/post', '/media', '/press')):
+    if any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto')):
+        return 'contact_page'
+    if DM_LEGAL_SOURCE_FLAG.search(path):
+        return 'legal_or_terms_page'
+    if any(k in path for k in ('blog', 'news', 'press', 'media', 'article', 'post', 'newsroom')):
         return 'blog_or_press_page'
-    if path_low in ('', '/', '/ua/', '/uk/', '/en/', '/uk-ua/', '/de/', '/fr/', '/pl/', '/es/', '/it/', '/nl/'):
+    if not path or path == '/':
         return 'homepage'
     return 'product_or_service_page'
 
 
-def strip_role_tokens_from_name(candidate: str) -> str:
-    """
-    Видаляє з початку та кінця кандидата службові слова, назви відділів,
-    міста, корпоративні маркери, заголовки сторінок (_STOP_NAME_WORDS_LOWER) та капс-абревіатури.
-    """
-    words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
-    words = [w.rstrip('-').lstrip('-') for w in words if w.rstrip('-').lstrip('-')]
-    while words and (
-        words[0].lower() in _STOP_NAME_WORDS_LOWER
-        or words[0].lower() in ROLE_TOKEN_BLACKLIST
-        or words[0].lower() in DEPARTMENT_PREFIX_BLACKLIST
-        or words[0].lower() in CITY_NAMES_BLACKLIST
-        or words[0].lower() in CORPORATE_ENTITY_TOKENS
-        or words[0].isupper()
-        or re.fullmatch(ROLES_REGEX_PART, words[0], re.IGNORECASE)
-    ):
-        words.pop(0)
-    while words and (
-        words[-1].lower() in _STOP_NAME_WORDS_LOWER
-        or words[-1].lower() in ROLE_TOKEN_BLACKLIST
-        or words[-1].lower() in DEPARTMENT_PREFIX_BLACKLIST
-        or words[-1].lower() in CITY_NAMES_BLACKLIST
-        or words[-1].lower() in CORPORATE_ENTITY_TOKENS
-        or words[-1].isupper()
-        or re.fullmatch(ROLES_REGEX_PART, words[-1], re.IGNORECASE)
-    ):
-        words.pop(-1)
-    has_cyrillic = any(re.search(r'[а-яіїєґА-ЯІЇЄҐ]', w) for w in words)
-    if has_cyrillic:
-        while words and re.fullmatch(r'[A-Za-z\'-]+', words[0]):
-            words.pop(0)
-    if len(words) == 3 and ('-' in words[1] or '-' in words[0]):
-        words = words[:2]
-    return ' '.join(words)
-
-
-def is_valid_person_name(candidate: str, brand_root: str = '') -> bool:
-    words = [w.strip('.,;:()[]"\'') for w in candidate.strip().split() if w.strip('.,;:()[]"\'')]
-    if len(words) not in (2, 3):
-        return False
-    if not all(w and w[0].isupper() and len(w) >= 2 for w in words):
-        return False
-    if any(w.isupper() for w in words):
-        return False
-    words_low = [w.lower() for w in words]
-    if any(
-        wl in _STOP_NAME_WORDS_LOWER
-        or wl in ROLE_TOKEN_BLACKLIST
-        or wl in DEPARTMENT_PREFIX_BLACKLIST
-        or wl in CITY_NAMES_BLACKLIST
-        or wl in CORPORATE_ENTITY_TOKENS
-        for wl in words_low
-    ):
-        return False
-    if any(wl.endswith(('gesellschaft', 'verwaltung', 'verwaltungs', 'beteiligung', 'stiftung', 'holding', 'konzern')) for wl in words_low):
-        return False
-    if any(re.fullmatch(ROLES_REGEX_PART, w, re.IGNORECASE) for w in words):
-        return False
-    if brand_root:
-        b_low = brand_root.lower()
-        joined_low = ''.join(words_low)
-        if joined_low == b_low or b_low in words_low:
-            return False
-    return True
-
-
-def normalize_executive_role(raw_role: str | None) -> str | None:
-    if not raw_role:
-        return None
-    clean = raw_role.strip(' .,;:|-–—')
-    return ROLE_NORMALIZATION_MAP.get(clean.lower(), clean)
-
-
-def strip_testimonial_elements_and_get_clean_text(soup: BeautifulSoup) -> str:
-    """
-    Видаляє цитати/відгуки і повертає текст із структурним роздільником ' . ' між блочними елементами,
-    щоб заголовок <h2>Management</h2> ніколи не склеювався в одне речення з <p>Benjamin Otto</p>.
-    """
-    for tag in soup.find_all(['blockquote', 'cite', 'q']):
-        tag.decompose()
-    return soup.get_text(' . ', strip=True)
-
-
-def is_text_match_in_testimonial_window(text: str, match_start: int, match_end: int, cand_name: str = '') -> bool:
-    if cand_name.strip().lower() in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
-        return True
-    win_start = max(0, match_start - 200)
-    win_end = min(len(text), match_end + 140)
-    window = text[win_start:win_end]
-    win_low = window.lower()
-    if any(m in win_low for m in TESTIMONIAL_TEXT_MARKERS):
-        return True
-    before_slice = text[max(0, match_start - 80):match_start]
-    if any(q in before_slice for q in ('«', '»', '“', '”', '„')):
-        return True
-    return False
-
-
-def is_low_trust_legal_offer_page(path: str) -> bool:
-    if IMPRESSUM_CANONICAL_PATH_REGEX.search(path):
-        return False
-    return bool(DM_LEGAL_SOURCE_FLAG.search(path))
+def _dm_role_priority_weight(role_str: str | None) -> int:
+    r_low = (role_str or '').lower()
+    if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
+        return -30
+    if any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'growth', 'digital')):
+        return 24
+    if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
+        return 20
+    if any(k in r_low for k in ('founder', 'co-founder')):
+        return 18
+    if 'owner' in r_low:
+        return 16
+    return 10
 
 
 def build_decision_makers_json_from_summary(
-    dms_summary_str: str | None,
-    primary_li_url: str | None = None
+    dms_found_str: str | None,
+    primary_linkedin_url: str | None = None
 ) -> str | None:
-    if not dms_summary_str:
+    if not dms_found_str:
         return None
     items = []
-    seen = set()
-    for part in dms_summary_str.split(';'):
-        part = part.strip()
-        if not part:
+    for idx, chunk in enumerate(dms_found_str.split(';')):
+        chunk = chunk.strip()
+        if not chunk:
             continue
-        m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', part)
+        m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', chunk)
         if not m:
             continue
-        raw_name, raw_role, src_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-        clean_name = strip_role_tokens_from_name(raw_name)
-        if not is_valid_person_name(clean_name):
-            continue
-        if clean_name.lower() in seen:
-            continue
-        seen.add(clean_name.lower())
-        norm_role = normalize_executive_role(raw_role) or raw_role
-        src_type = classify_dm_source_type(src_url)
-        matched_li = primary_li_url if (primary_li_url and verify_person_linkedin_match(clean_name, primary_li_url)) else None
-        conf = 'high' if (matched_li or src_type in ('impressum_page', 'team_page', 'about_page')) else 'medium'
+        name, role, src_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        li_match = None
+        if primary_linkedin_url and (idx == 0 or verify_person_linkedin_match(name, primary_linkedin_url)):
+            li_match = primary_linkedin_url
+        elif 'linkedin.com/in/' in src_url.lower():
+            li_match = src_url
         items.append({
-            'name': clean_name,
-            'role': norm_role,
-            'linkedin_url': matched_li,
+            'name': name,
+            'role': role,
             'source_url': src_url,
-            'source_type': src_type,
-            'confidence': conf,
-            'is_verified_person': True
+            'source_type': classify_dm_source_type(src_url),
+            'linkedin_url': li_match,
         })
     return json.dumps(items, ensure_ascii=False) if items else None
 
@@ -880,195 +605,236 @@ def build_decision_makers_json_from_summary(
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None, str | None]:
-    candidate_li_urls: list[str] = []
-    found_dms_by_name: dict[str, dict] = {}
+    if not pages_with_urls:
+        return None, None, None, None, False, None, None, None
 
-    brand_root = ''
-    if pages_with_urls:
-        first_host = urlparse(pages_with_urls[0][0]).netloc.lower().replace('www.', '')
-        brand_root = first_host.split('.')[0] if first_host else ''
+    first_url = pages_with_urls[0][0]
+    parsed_host = urlparse(first_url).netloc.lower().replace('www.', '')
+    brand_root = parsed_host.split('.')[0] if parsed_host else ''
 
-    for page_url, html, _ in pages_with_urls:
-        url_path = urlparse(page_url).path
-        if DM_SOURCE_BLACKLIST.search(url_path):
-            continue
-        soup = BeautifulSoup(html, 'lxml')
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href'].strip()
-            if 'linkedin.com/in/' in href.lower():
-                parsed = urlparse(href)
-                if parsed.scheme in ('http', 'https'):
-                    clean_li = f"https://www.linkedin.com{parsed.path.rstrip('/')}"
-                    if clean_li not in candidate_li_urls:
-                        candidate_li_urls.append(clean_li)
+    candidates: dict[str, dict] = {}
+    personal_linkedin_urls: list[str] = []
 
-    def add_dm_candidate(name: str, role: str | None, page_url: str, is_leg: bool, base_priority: int):
-        norm_name = strip_role_tokens_from_name(name)
-        if not is_valid_person_name(norm_name, brand_root):
-            return
-        name_key = norm_name.lower()
-        if name_key in FOREIGN_TESTIMONIAL_NAMES_BLACKLIST:
-            return
-        clean_src = clean_url_port(page_url) or page_url
-        src_type = classify_dm_source_type(clean_src)
-        matched_li = next((u for u in candidate_li_urls if verify_person_linkedin_match(norm_name, u)), None)
-        norm_role = normalize_executive_role(role) or 'Executive'
-
-        type_bonus = {
-            'impressum_page': 32,
-            'team_page': 30,
-            'about_page': 25,
-            'homepage': 15,
-            'product_or_service_page': 10,
-            'blog_or_press_page': 5,
-            'legal_or_offer_page': 8
-        }.get(src_type or '', 5)
-
-        role_low = norm_role.lower()
-        if 'supervisory' in role_low or 'aufsichtsrat' in role_low:
-            role_bonus = -30
-        elif src_type == 'product_or_service_page' and 'ceo' in role_low and 'founder' not in role_low:
-            role_bonus = -10
-        elif any(k in role_low for k in ('marketing', 'cmo', 'e-commerce', 'growth', 'digital')):
-            role_bonus = 22
-        elif any(k in role_low for k in ('ceo', 'founder', 'co-founder', 'owner', 'managing director')):
-            role_bonus = 18
-        else:
-            role_bonus = 5
-
-        li_bonus = 60 if matched_li else 0
-        total_score = base_priority + type_bonus + role_bonus + li_bonus
-        conf = 'high' if (matched_li or src_type in ('impressum_page', 'team_page', 'about_page')) else 'medium'
-
-        existing = found_dms_by_name.get(name_key)
-        if existing is None or total_score > existing['score']:
-            found_dms_by_name[name_key] = {
-                'name': norm_name,
-                'role': norm_role,
-                'li_url': matched_li or (existing['li_url'] if existing else None),
-                'source_url': clean_src,
-                'source_type': src_type,
-                'confidence': conf,
-                'is_legal': is_leg,
-                'score': total_score
-            }
-        elif matched_li and not existing.get('li_url'):
-            existing['li_url'] = matched_li
-            existing['score'] += 60
-            existing['confidence'] = 'high'
-
-    for page_url, html, _ in pages_with_urls:
-        url_path = urlparse(page_url).path
-        if DM_SOURCE_BLACKLIST.search(url_path):
+    for page_url, raw_html, page_text in pages_with_urls:
+        u_path = urlparse(page_url).path.lower()
+        if DM_SOURCE_BLACKLIST.search(u_path):
             continue
 
-        soup = BeautifulSoup(html, 'lxml')
-        for script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
-            raw_json = script.string
-            if not raw_json:
-                continue
-            try:
-                data = json.loads(raw_json)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get('@type', '')).lower() in ('review', 'claimreview', 'quotation'):
-                        continue
-                    for key, default_role in (('founder', 'Founder'), ('founders', 'Founder'), ('employee', 'Executive')):
-                        val = item.get(key)
-                        if isinstance(val, dict) and val.get('name'):
-                            cand = strip_role_tokens_from_name(str(val['name']))
-                            role = normalize_executive_role(str(val.get('jobTitle') or default_role))
-                            if is_valid_person_name(cand, brand_root):
-                                is_leg = is_low_trust_legal_offer_page(url_path)
-                                add_dm_candidate(cand, role, page_url, is_leg, 40)
-                        elif isinstance(val, list):
-                            for sub in val:
-                                if isinstance(sub, dict) and sub.get('name'):
-                                    cand = strip_role_tokens_from_name(str(sub['name']))
-                                    role = normalize_executive_role(str(sub.get('jobTitle') or default_role))
-                                    if is_valid_person_name(cand, brand_root):
-                                        is_leg = is_low_trust_legal_offer_page(url_path)
-                                        add_dm_candidate(cand, role, page_url, is_leg, 40)
-            except Exception:
-                continue
+        is_legal_doc = bool(DM_LEGAL_SOURCE_FLAG.search(u_path)) and not any(
+            imp in u_path for imp in ('impressum', 'mentions-legales', 'aviso-legal')
+        )
+        src_type = classify_dm_source_type(page_url)
+        page_bonus = 15 if src_type in ('impressum_page', 'team_or_leadership_page', 'about_page') else 0
 
-    for page_url, html, _ in pages_with_urls:
-        url_path = urlparse(page_url).path
-        if DM_SOURCE_BLACKLIST.search(url_path):
-            continue
-        is_leg = is_low_trust_legal_offer_page(url_path)
+        if raw_html:
+            soup = BeautifulSoup(raw_html, 'lxml')
+            for a_el in soup.find_all('a', href=True):
+                href = a_el['href'].strip()
+                if 'linkedin.com/in/' in href.lower():
+                    clean_li = clean_and_validate_social_url('linkedin', href)
+                    if clean_li and clean_li not in personal_linkedin_urls:
+                        personal_linkedin_urls.append(clean_li)
 
-        clean_soup = BeautifulSoup(html, 'lxml')
-        dm_clean_text = strip_testimonial_elements_and_get_clean_text(clean_soup)
+            for ld_script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
+                try:
+                    data = json.loads(ld_script.string or '')
+                    objs = data if isinstance(data, list) else [data]
+                    for obj in objs:
+                        if not isinstance(obj, dict):
+                            continue
+                        graph = obj.get('@graph', [obj])
+                        for node in (graph if isinstance(graph, list) else [obj]):
+                            if not isinstance(node, dict):
+                                continue
+                            for key_role in ('founder', 'founders', 'employee', 'employees', 'member', 'members', 'author'):
+                                val = node.get(key_role)
+                                p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
+                                for person in p_list:
+                                    if not isinstance(person, dict):
+                                        continue
+                                    p_name = strip_role_tokens_from_name(str(person.get('name', '')))
+                                    p_job = str(person.get('jobTitle') or key_role)
+                                    if is_valid_person_name(p_name, brand_root):
+                                        norm_r = normalize_executive_role(p_job) or 'Founder'
+                                        sc = _dm_role_priority_weight(norm_r) + page_bonus + 10
+                                        k_low = p_name.lower()
+                                        if k_low not in candidates or sc > candidates[k_low]['score']:
+                                            candidates[k_low] = {
+                                                'name': p_name,
+                                                'role': norm_r,
+                                                'url': page_url,
+                                                'is_legal': is_legal_doc,
+                                                'src_type': src_type,
+                                                'score': sc,
+                                            }
+                except Exception:
+                    pass
 
-        for vm in VERTRETEN_DURCH_PATTERN.finditer(dm_clean_text):
-            cand_name = strip_role_tokens_from_name(vm.group(1))
-            if is_valid_person_name(cand_name, brand_root):
-                add_dm_candidate(cand_name, 'Chief Executive Officer (CEO)', page_url, is_leg, 45)
-
-        for m in NAME_BEFORE_ROLE_PATTERN.finditer(dm_clean_text):
-            cand_name = strip_role_tokens_from_name(m.group(1))
-            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
+        for m in VERTRETEN_DURCH_PATTERN.finditer(page_text):
+            raw_n = m.group(1)
+            full_match_low = m.group(0).lower()
+            cand_name = strip_role_tokens_from_name(raw_n)
+            if not is_valid_person_name(cand_name, brand_root):
                 continue
-            cand_role = normalize_executive_role(m.group(2))
-            ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
-            if 'aufsichtsrat' in ctx_slice:
-                continue
-            if is_valid_person_name(cand_name, brand_root):
-                add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
+            if 'aufsichtsrat' in full_match_low:
+                role_label = 'Chairman of the Supervisory Board'
+            elif 'vorstand' in full_match_low:
+                role_label = 'Executive Board / CEO (Vorstand)'
+            else:
+                role_label = 'Managing Director / CEO (Geschäftsführer)'
+            sc = _dm_role_priority_weight(role_label) + page_bonus + 12
+            k_low = cand_name.lower()
+            if k_low not in candidates or sc > candidates[k_low]['score']:
+                candidates[k_low] = {
+                    'name': cand_name,
+                    'role': role_label,
+                    'url': page_url,
+                    'is_legal': is_legal_doc,
+                    'src_type': src_type,
+                    'score': sc,
+                }
 
-        for m in ROLE_BEFORE_NAME_PATTERN.finditer(dm_clean_text):
-            cand_name = strip_role_tokens_from_name(m.group(2))
-            if is_text_match_in_testimonial_window(dm_clean_text, m.start(), m.end(), cand_name):
-                continue
-            cand_role = normalize_executive_role(m.group(1))
-            ctx_slice = dm_clean_text[max(0, m.start() - 55):min(len(dm_clean_text), m.end() + 55)].lower()
-            if 'aufsichtsrat' in ctx_slice:
-                continue
-            if is_valid_person_name(cand_name, brand_root):
-                add_dm_candidate(cand_name, cand_role, page_url, is_leg, 25)
+        for pattern, name_grp, role_grp in (
+            (NAME_BEFORE_ROLE_PATTERN, 1, 2),
+            (ROLE_BEFORE_NAME_PATTERN, 2, 1),
+        ):
+            for m in pattern.finditer(page_text):
+                start_w = max(0, m.start() - 120)
+                end_w = min(len(page_text), m.end() + 120)
+                ctx_window = page_text[start_w:end_w].lower()
+                if any(tm in ctx_window for tm in TESTIMONIAL_TEXT_MARKERS):
+                    continue
+                raw_n = m.group(name_grp)
+                raw_r = m.group(role_grp)
+                cand_name = strip_role_tokens_from_name(raw_n)
+                if not is_valid_person_name(cand_name, brand_root):
+                    continue
+                norm_r = normalize_executive_role(raw_r) or raw_r
+                sc = _dm_role_priority_weight(norm_r) + page_bonus
+                k_low = cand_name.lower()
+                if k_low not in candidates or sc > candidates[k_low]['score']:
+                    candidates[k_low] = {
+                        'name': cand_name,
+                        'role': norm_r,
+                        'url': page_url,
+                        'is_legal': is_legal_doc,
+                        'src_type': src_type,
+                        'score': sc,
+                    }
 
-    for page_url, _, page_text in pages_with_urls:
-        url_path = urlparse(page_url).path
-        if DM_SOURCE_BLACKLIST.search(url_path):
-            continue
-        is_leg = is_low_trust_legal_offer_page(url_path)
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             if is_valid_person_name(cand_name, brand_root):
-                add_dm_candidate(cand_name, 'Registered Business Owner / ФОП', page_url, is_leg, 10)
+                norm_r = 'Owner'
+                sc = _dm_role_priority_weight(norm_r) + page_bonus
+                k_low = cand_name.lower()
+                if k_low not in candidates or sc > candidates[k_low]['score']:
+                    candidates[k_low] = {
+                        'name': cand_name,
+                        'role': norm_r,
+                        'url': page_url,
+                        'is_legal': is_legal_doc,
+                        'src_type': src_type,
+                        'score': sc,
+                    }
 
-    if not found_dms_by_name:
+    if not candidates:
         return None, None, None, None, False, None, None, None
 
-    found_dms = sorted(found_dms_by_name.values(), key=lambda d: (-d['score'], d['name']))
-    primary = found_dms[0]
-    top_dms = found_dms[:5]
-    dms_summary_str = '; '.join(
-        f"{d['name']} ({d['role']}) [{d['source_url']}]" for d in top_dms
+    for c_info in candidates.values():
+        c_info['li_url'] = None
+        for li_u in personal_linkedin_urls:
+            if verify_person_linkedin_match(c_info['name'], li_u):
+                c_info['li_url'] = li_u
+                c_info['score'] += 35
+                break
+
+    sorted_cands = sorted(
+        candidates.values(),
+        key=lambda item: (-1 if item['li_url'] else 0, -item['score'], item['name'])
     )
-    dms_json_list = [
-        {
-            'name': d['name'],
-            'role': d['role'],
-            'linkedin_url': d['li_url'],
-            'source_url': d['source_url'],
-            'source_type': d['source_type'],
-            'confidence': d['confidence'],
-            'is_verified_person': True
-        }
-        for d in top_dms
-    ]
-    dms_json_str = json.dumps(dms_json_list, ensure_ascii=False)
+
+    best = sorted_cands[0]
+    dms_found_str = '; '.join(
+        f"{c['name']} ({c['role']}) [{c['url']}]" for c in sorted_cands[:5]
+    )
+    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, best['li_url'])
+
     return (
-        primary['name'],
-        primary['role'],
-        primary['li_url'],
-        primary['source_url'],
-        primary['is_legal'],
-        primary['source_type'],
-        dms_summary_str,
-        dms_json_str
+        best['name'],
+        best['role'],
+        best['li_url'],
+        best['url'],
+        best['is_legal'],
+        best['src_type'],
+        dms_found_str,
+        dms_json_str,
     )
+
+
+async def fetch_dm_via_serp_fallback(
+    client: AsyncSession,
+    search_query: str | None,
+    brand_root: str = '',
+    serper_api_key: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    Крок 1 (Автоматичний пошук ЛПР через Google SERP / Serper.dev):
+    Коли сайт не публікує імена CMO/CEO (як більшість великих інтернет-магазинів),
+    робить 1 легкий запит до Serper.dev із нашим decision_maker_search_query
+    і розбирає заголовки LinkedIn ('Ім'я Прізвище - Посада - Компанія | LinkedIn')
+    за допомогою наших детермінованих функцій strip_role_tokens_from_name та verify_person_linkedin_match.
+    """
+    api_key = (serper_api_key or os.environ.get('SERPER_API_KEY') or '').strip()
+    if not api_key or not search_query:
+        return None, None, None, None
+
+    try:
+        resp = await client.post(
+            'https://google.serper.dev/search',
+            headers={
+                'X-API-KEY': api_key,
+                'Content-Type': 'application/json',
+            },
+            json={'q': search_query, 'num': 5},
+            timeout=6.0,
+        )
+        if resp.status_code != 200:
+            return None, None, None, None
+        data = resp.json()
+        organic = data.get('organic') or []
+        role_re = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.I | re.U)
+
+        for item in organic:
+            link = str(item.get('link') or '').strip()
+            title = str(item.get('title') or '').strip()
+            snippet = str(item.get('snippet') or '').strip()
+            if 'linkedin.com/in/' not in link.lower() or not title:
+                continue
+
+            clean_li = clean_and_validate_social_url('linkedin', link)
+            if not clean_li:
+                continue
+
+            # Типовий заголовок LinkedIn: "Іван Петренко - Chief Marketing Officer - Comfy | LinkedIn"
+            title_no_suffix = re.sub(r'\s*[\|\-–—]\s*LinkedIn.*$', '', title, flags=re.I)
+            segments = [s.strip() for s in re.split(r'\s+[\-–—|•]\s+', title_no_suffix) if s.strip()]
+            if not segments:
+                continue
+
+            cand_name = strip_role_tokens_from_name(segments[0])
+            if not is_valid_person_name(cand_name, brand_root):
+                continue
+            if not verify_person_linkedin_match(cand_name, clean_li):
+                continue
+
+            combined_role_ctx = ' '.join(segments[1:]) + ' ' + snippet
+            r_match = role_re.search(combined_role_ctx)
+            raw_role = r_match.group(1) if r_match else (segments[1] if len(segments) > 1 else 'Marketing / Executive Lead')
+            norm_role = normalize_executive_role(raw_role) or 'Marketing / Executive Lead'
+            dms_str = f'{cand_name} ({norm_role}) [{clean_li}]'
+            return cand_name, norm_role, clean_li, dms_str
+    except Exception:
+        pass
+
+    return None, None, None, None
