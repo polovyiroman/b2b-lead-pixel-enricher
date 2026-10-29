@@ -3,6 +3,8 @@ import re
 from .config import (
     AD_AND_ANALYTICS_SIGNATURES,
     CMS_HTML_ONLY_SIGNATURES,
+    CONSENT_MODE_V2_GCD_REGEX,
+    CONSENT_MODE_V2_GCS_REGEX,
     COOKIE_CONSENT_MARKERS,
     GA4_SCRIPT_SRC_REGEX,
     GA4_STRICT_10CHAR_REGEX,
@@ -12,6 +14,7 @@ from .config import (
     GTM_JSON_GA4_REGEX,
     MAX_DISPLAY_GA4_IDS,
     SGTM_CUSTOM_LOADER_REGEX,
+    SGTM_FIRST_PARTY_COLLECT_REGEX,
 )
 
 SHORT_SUMMARY_LABELS = {
@@ -47,19 +50,16 @@ def extract_code_snippet(source_text: str, match_str: str, max_len: int = 80) ->
 
 def _is_valid_cached_sgtm(rec: dict) -> bool:
     ev_str = str(rec.get('technology_evidence') or '')
-    return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
+    return bool(
+        SGTM_CUSTOM_LOADER_REGEX.search(ev_str)
+        or SGTM_FIRST_PARTY_COLLECT_REGEX.search(ev_str)
+    )
 
 
 def cap_ga4_ids_and_confidence(
     raw_ga4_ids_str: str | None,
     raw_confidence: str | None = None
 ) -> tuple[str | None, int, str | None]:
-    """
-    P2 Fix (AboutYou 27 IDs / DocMorris 6 IDs):
-    Обмежує список all_ga4_ids максимум 5 ID (MAX_DISPLAY_GA4_IDS = 5),
-    повертає загальну кількість ID та оновлює ga4_detection_confidence на
-    'High (multiplexed N-property)', якщо знайдено більше 5 ID.
-    """
     if not raw_ga4_ids_str:
         return None, 0, raw_confidence
     ids_list = [x.strip() for x in raw_ga4_ids_str.split(';') if x.strip()]
@@ -145,7 +145,7 @@ def detect_tech_with_evidence(
             'source': 'live_html',
             'ids': gtm_ids,
         }
-    elif 'googletagmanager.com/gtm.js' in pw_net_lower:
+    elif 'googletagmanager.com/gtm.js' in pw_net_lower or '/gtm.js?id=gtm-' in pw_net_lower:
         found_tech.append('Google Tag Manager')
         evidence_items.append(f'Google Tag Manager: network request gtm.js @ {page_url}')
         summary_items.append('GTM (net)')
@@ -154,17 +154,40 @@ def detect_tech_with_evidence(
             'ids': [],
         }
 
-    sgtm_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
+    # Проблема №2 Fix: Перевіряємо як кастомний завантажувач gtm.js, так і first-party /g/collect?...&tid=G-XXXX
+    sgtm_loader_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
+    sgtm_collect_match = SGTM_FIRST_PARTY_COLLECT_REGEX.search(combined_source)
+    sgtm_match = sgtm_loader_match or sgtm_collect_match
     has_sgtm = bool(sgtm_match)
     if has_sgtm and sgtm_match:
         found_tech.append('Server-Side GTM (sGTM)')
-        sgtm_snip = sgtm_match.group(0)[:70]
+        sgtm_snip = sgtm_match.group(0)[:85]
+        sgtm_src = 'pw_network' if (sgtm_collect_match and sgtm_snip.lower() in pw_net_lower) else 'live_html'
         evidence_items.append(f'Server-Side GTM (sGTM): custom endpoint "{sgtm_snip}" @ {page_url}')
         summary_items.append('sGTM')
         evidence_json_map['Server-Side GTM (sGTM)'] = {
-            'source': 'live_html',
+            'source': sgtm_src,
             'endpoint': sgtm_snip,
         }
+
+    # Крок 2 Fix: Детекція сигналів Google Consent Mode v2 (gcs=G1.. / gcd=...) у мережевих запитах або коді
+    gcs_match = CONSENT_MODE_V2_GCS_REGEX.search(combined_source)
+    gcd_match = CONSENT_MODE_V2_GCD_REGEX.search(combined_source)
+    has_consent_mode_v2_signals = bool(
+        gcs_match
+        or gcd_match
+        or "gtag('consent'" in html_lower
+        or 'gtag("consent"' in html_lower
+        or "gtag('consent'" in gtm_lower
+        or 'gtag("consent"' in gtm_lower
+    )
+    if gcd_match or gcs_match:
+        cm_parts = []
+        if gcs_match:
+            cm_parts.append(f'gcs={gcs_match.group(1)}')
+        if gcd_match:
+            cm_parts.append(f'gcd={gcd_match.group(1)[:16]}')
+        evidence_items.append(f"Google Consent Mode v2 signals ({', '.join(cm_parts)}) @ {page_url}")
 
     high_conf_ga4 = set(GA4_STRICT_10CHAR_REGEX.findall(combined_source))
     high_conf_ga4.update(m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(combined_source))
@@ -198,7 +221,7 @@ def detect_tech_with_evidence(
             ga4_confidence = 'High'
         else:
             ga4_confidence = 'Medium (GTM Single Macro)'
-        ga4_src_label = 'live_html' if any(gid in html for gid in all_ga4_set) else (
+        ga4_src_label = 'live_html' if any(gid in html_without_pw_comments for gid in all_ga4_set) else (
             'pw_network' if any(gid.lower() in pw_net_lower for gid in all_ga4_set) else 'gtm_container'
         )
         src_note = 'page HTML' if ga4_src_label == 'live_html' else (
@@ -246,7 +269,7 @@ def detect_tech_with_evidence(
     if has_aw_sig:
         found_tech.append('Google Ads Conversion')
         aw_src_label = 'live_html' if (
-            any(a in html for a in aw_ids) or 'googleadservices.com' in html_lower
+            any(a in html_without_pw_comments for a in aw_ids) or 'googleadservices.com' in html_lower
         ) else ('pw_network' if 'googlead' in pw_net_lower else 'gtm_container')
         if aw_ids:
             snip = extract_code_snippet(combined_source, aw_ids[0])
@@ -304,11 +327,11 @@ def detect_tech_with_evidence(
         if 'WordPress' not in found_tech:
             found_tech.append('WordPress')
 
-    has_cookie_banner = any(
-        marker in html_lower or marker in gtm_lower
-        for marker in COOKIE_CONSENT_MARKERS
+    has_cookie_banner = (
+        has_consent_mode_v2_signals
+        or any(marker in html_lower or marker in gtm_lower for marker in COOKIE_CONSENT_MARKERS)
     )
-    if has_cookie_banner:
+    if has_cookie_banner and not (gcd_match or gcs_match):
         evidence_items.append(f'Cookie Consent / CMP Banner detected @ {page_url}')
 
     return {
@@ -322,6 +345,7 @@ def detect_tech_with_evidence(
         'has_ga4': 'Google Analytics (GA4)' in found_tech,
         'has_gtm': 'Google Tag Manager' in found_tech,
         'has_sgtm': has_sgtm,
+        'has_consent_mode_v2_signals': has_consent_mode_v2_signals,
         'all_ga4_ids': '; '.join(capped_ga4_list) if capped_ga4_list else None,
         'all_ga4_ids_count': total_ga4_count if total_ga4_count > 0 else None,
         'ga4_detection_confidence': ga4_confidence,
