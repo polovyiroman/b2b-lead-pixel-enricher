@@ -12,6 +12,7 @@ from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MAX_DISPLAY_GA4_IDS,
     SGTM_CUSTOM_LOADER_REGEX,
+    SGTM_FIRST_PARTY_COLLECT_REGEX,
     compute_snapshot_age_days,
 )
 from .contacts import (
@@ -52,10 +53,9 @@ SALES_ACTIONABILITY_ENUM_VALUES = (
     'unqualified',
 )
 
-# Stage 2 (#6): Додано recovery_verified_at та max_recovery_age_days=90 (expiry)
 KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
     'liki24.com': {
-        'recovery_verified_at': '2026-10-27T12:00:00Z',
+        'recovery_verified_at': '2026-10-28T07:05:00Z',
         'max_recovery_age_days': 90,
         'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
         'all_ga4_ids': 'G-FRYX20Z9FG',
@@ -65,9 +65,9 @@ KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
         'has_google_ads': True,
         'has_meta_pixel': True,
         'technology_evidence': (
-            'Google Tag Manager: id=GTM-K9N292M @ https://liki24.com/ | '
+            'Google Tag Manager: id=GTM-WKBQXZX @ https://liki24.com/ | '
             'Google Analytics (GA4) [High]: id=G-FRYX20Z9FG @ https://liki24.com/ | '
-            'Google Ads Conversion: conversion_async.js @ https://liki24.com/ | '
+            'Google Ads Conversion: id=AW-807292156,AW-837057934 @ https://liki24.com/ | '
             'Meta Pixel: "fbevents.js" @ https://liki24.com/'
         ),
     }
@@ -107,7 +107,6 @@ KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
     'unicredit.it': 'IT',
 }
 
-# Stage 1 (#3 P1-D/P1-E): Додано grammarly.com, laredoute.fr, zalando.de (економія ~220s без втрати curl-даних)
 KNOWN_PW_HOPELESS = {
     'coolblue.nl',
     'otto.de',
@@ -124,16 +123,6 @@ def derive_sales_actionability_class(
     sales_readiness_verdict: str | None,
     company_category: str = '',
 ) -> str:
-    """
-    Stage 2 (#5 P1-1b Fix): Мапить текстовий sales_readiness_verdict у строгий 6-значний enum
-    для 1-клік фільтрації SDR у CRM/CSV:
-    - 'sales_ready'
-    - 'partnership'
-    - 'gatekeeper'
-    - 'tech_only'
-    - 'partner_agency'
-    - 'unqualified'
-    """
     if company_category == 'B2B Agency / Marketing Media':
         return 'partner_agency'
     v = (sales_readiness_verdict or '').strip()
@@ -173,7 +162,10 @@ def has_verified_sgtm_in_cache(c_rec: dict) -> bool:
     if not c_rec.get('has_sgtm'):
         return False
     ev_str = str(c_rec.get('technology_evidence') or '')
-    return bool(SGTM_CUSTOM_LOADER_REGEX.search(ev_str))
+    return bool(
+        SGTM_CUSTOM_LOADER_REGEX.search(ev_str)
+        or SGTM_FIRST_PARTY_COLLECT_REGEX.search(ev_str)
+    )
 
 
 def sanitize_stale_sgtm_strings(
@@ -199,7 +191,6 @@ def sanitize_stale_sgtm_strings(
 
 def _preserve_or_cap_ga4_fields(record: dict) -> None:
     raw_ids = record.get('all_ga4_ids')
-    # P0-B Fix: Якщо в старому кеші залишився плейсхолдер G-ROZETKA-GA4, очищуємо його
     if raw_ids and 'ROZETKA' in str(raw_ids).upper():
         record['all_ga4_ids'] = None
         record['all_ga4_ids_count'] = None
@@ -223,10 +214,6 @@ def _preserve_or_cap_ga4_fields(record: dict) -> None:
 
 
 def heal_poisoned_cache_record(canonical_domain: str, c_rec: dict | None) -> dict | None:
-    """
-    Stage 2 (#6 P1-A Fix): Перевіряє recovery_verified_at та max_recovery_age_days перед застосуванням
-    KNOWN_POISONED_CACHE_RECOVERY, щоб manual override мав чіткий TTL і не діяв вічно.
-    """
     dom_low = (canonical_domain or '').lower()
     recovery = KNOWN_POISONED_CACHE_RECOVERY.get(dom_low)
     if not recovery:
@@ -389,6 +376,7 @@ def merge_missing_techs_from_cache(
         'has_ga4': has_ga4_merged,
         'has_gtm': bool(c_rec.get('has_gtm') or tech_info.get('has_gtm') or ('Google Tag Manager' in merged_techs)),
         'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
+        'has_consent_mode_v2_signals': bool(tech_info.get('has_consent_mode_v2_signals')),
         'all_ga4_ids': capped_ga4_ids,
         'all_ga4_ids_count': true_ga4_cnt if true_ga4_cnt > 0 else None,
         'ga4_detection_confidence': capped_ga4_conf,
