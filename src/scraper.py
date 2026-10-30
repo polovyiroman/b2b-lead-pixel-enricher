@@ -28,11 +28,20 @@ from .contacts import (
     pick_best_social_candidate,
 )
 
+# Must-Have #3: Спочатку пробуємо patchright (stealth CDP без Runtime.enable leak),
+# якщо не встановлено у контейнері — плавно переходимо на стандартний playwright
 try:
-    from playwright.async_api import async_playwright
+    from patchright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
+    _USING_PATCHRIGHT = True
 except ImportError:
-    _PLAYWRIGHT_AVAILABLE = False
+    try:
+        from playwright.async_api import async_playwright
+        _PLAYWRIGHT_AVAILABLE = True
+        _USING_PATCHRIGHT = False
+    except ImportError:
+        _PLAYWRIGHT_AVAILABLE = False
+        _USING_PATCHRIGHT = False
 
 _SHARED_PW = None
 _SHARED_BROWSER = None
