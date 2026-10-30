@@ -35,6 +35,29 @@ SHORT_SUMMARY_LABELS = {
 
 _PW_NET_REQ_REGEX = re.compile(r'<!--\s*pw_net_req:\s*(.+?)\s*-->', re.I)
 
+ESP_RETENTION_SIGNATURES = (
+    'static.klaviyo.com',
+    'klaviyo.push',
+    'js.hs-scripts.com',
+    'hs-analytics',
+    'esputnik.com',
+    'sendpulse.com',
+    'webpushs.com',
+    'omnisend.com',
+    'omnisnippet',
+    'customer.io',
+    'braze.com',
+    'appboy.min.js',
+    'bloomreach',
+    'exponea',
+    'insider.js',
+    'useinsider.com',
+    'emarsys',
+    'scarabresearch.com',
+    'retailrocket',
+    'mindbox',
+)
+
 
 def extract_code_snippet(source_text: str, match_str: str, max_len: int = 80) -> str:
     idx = source_text.lower().find(match_str.lower())
@@ -113,6 +136,72 @@ def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache
     return json.dumps(evidence_map, ensure_ascii=False) if evidence_map else None
 
 
+def detect_broken_attribution_red_flags(
+    tech_info: dict,
+    company_category: str = '',
+    is_eu_gdpr: bool = False,
+    pw_used: bool = False,
+) -> list[str]:
+    """
+    Killer Feature #3: Детектор 4 технічних проблем втрати рекламного трафіку (Red Flags):
+    1. AdBlocker Signal Loss: Активні платні пікселі (Meta / Google Ads / TikTok) без Server-Side GTM (sGTM).
+    2. EU Consent Mode v2 Risk: Домен у ЄС з активним Google Ads та CMP-банером/Playwright, але без сигналів gcs/gcd.
+    3. Duplicate GA4 Tagging: Один і той самий G-XXXX ID зашитий одночасно в HTML сторінки та всередині GTM-контейнера.
+    4. Abandoned Cart Retention Leak: E-commerce з платним трафіком без жодної ESP/Retention-системи (Klaviyo/HubSpot/SendPulse/eSputnik).
+    """
+    if tech_info.get('tech_scan_completeness') not in ('full', 'partial_cached'):
+        return []
+
+    flags: list[str] = []
+    has_meta = bool(tech_info.get('has_meta_pixel'))
+    has_gads = bool(tech_info.get('has_google_ads'))
+    has_tiktok = bool(tech_info.get('has_tiktok_pixel'))
+    has_sgtm = bool(tech_info.get('has_sgtm'))
+    has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
+    has_consent_banner = bool(tech_info.get('has_cookie_banner'))
+    dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
+    has_esp = bool(
+        tech_info.get('has_klaviyo')
+        or tech_info.get('has_hubspot')
+        or tech_info.get('has_esp_retention')
+    )
+
+    paid_count = sum(1 for x in (has_meta, has_gads, has_tiktok) if x)
+
+    # Red Flag 3: Duplicate GA4 Tagging (найбільш конкретний технічний баг — ставимо першим)
+    if dup_ga4_ids:
+        dup_str = ', '.join(dup_ga4_ids[:2])
+        flags.append(
+            f'Duplicate GA4 Tagging ({dup_str} hardcoded in HTML and duplicated inside GTM container — risks double pageview/event counting)'
+        )
+
+    # Red Flag 2: EU Consent Mode v2 Risk
+    if (
+        is_eu_gdpr
+        and has_gads
+        and not has_cm_v2
+        and tech_info.get('tech_scan_completeness') == 'full'
+        and (pw_used or has_consent_banner)
+    ):
+        flags.append(
+            'EU Consent Mode v2 Gap (Google Ads active in EEA jurisdiction without gcs/gcd consent signals observed)'
+        )
+
+    # Red Flag 1: AdBlocker / ITP Signal Loss
+    if paid_count >= 2 and not has_sgtm:
+        flags.append(
+            'Client-Side AdBlocker & ITP Loss (Multi-pixel paid traffic running without Server-Side GTM — estimated 20-30% attribution loss)'
+        )
+
+    # Red Flag 4: Abandoned Cart Retention Leak
+    if company_category == 'E-commerce / Retail Brand' and paid_count >= 1 and not has_esp:
+        flags.append(
+            'E-commerce Retention Gap (Paid acquisition active without observable ESP/Klaviyo/CRM cart-recovery pixel)'
+        )
+
+    return flags
+
+
 def detect_tech_with_evidence(
     html: str,
     gtm_js: str,
@@ -154,7 +243,6 @@ def detect_tech_with_evidence(
             'ids': [],
         }
 
-    # Проблема №2 Fix: Перевіряємо як кастомний завантажувач gtm.js, так і first-party /g/collect?...&tid=G-XXXX
     sgtm_loader_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
     sgtm_collect_match = SGTM_FIRST_PARTY_COLLECT_REGEX.search(combined_source)
     sgtm_match = sgtm_loader_match or sgtm_collect_match
@@ -170,7 +258,6 @@ def detect_tech_with_evidence(
             'endpoint': sgtm_snip,
         }
 
-    # Крок 2 Fix: Детекція сигналів Google Consent Mode v2 (gcs=G1.. / gcd=...) у мережевих запитах або коді
     gcs_match = CONSENT_MODE_V2_GCS_REGEX.search(combined_source)
     gcd_match = CONSENT_MODE_V2_GCD_REGEX.search(combined_source)
     has_consent_mode_v2_signals = bool(
@@ -189,12 +276,18 @@ def detect_tech_with_evidence(
             cm_parts.append(f'gcd={gcd_match.group(1)[:16]}')
         evidence_items.append(f"Google Consent Mode v2 signals ({', '.join(cm_parts)}) @ {page_url}")
 
+    # Для детекції Duplicate GA4 Tagging розділяємо ID, знайдені прямо в статичному HTML, та ID всередині GTM-контейнера
+    html_direct_ga4 = {m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html_without_pw_comments)}
+    html_direct_ga4.update(m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(html_without_pw_comments))
+
     high_conf_ga4 = set(GA4_STRICT_10CHAR_REGEX.findall(combined_source))
     high_conf_ga4.update(m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(combined_source))
     high_conf_ga4.update(m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(combined_source))
     high_conf_ga4.update(m.upper() for m in GA4_WIRE_REGEX.findall(combined_source))
 
     gtm_macro_ga4 = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)} if gtm_js else set()
+    duplicate_ga4_ids = sorted(html_direct_ga4 & gtm_macro_ga4)
+
     all_ga4_set = sorted(high_conf_ga4 | gtm_macro_ga4)
     total_ga4_count = len(all_ga4_set)
     capped_ga4_list = all_ga4_set[:MAX_DISPLAY_GA4_IDS]
@@ -240,6 +333,8 @@ def detect_tech_with_evidence(
         }
         if total_ga4_count > MAX_DISPLAY_GA4_IDS:
             ga4_ev_entry['total_ids_count'] = total_ga4_count
+        if duplicate_ga4_ids:
+            ga4_ev_entry['duplicate_html_and_gtm_ids'] = duplicate_ga4_ids[:5]
         evidence_json_map['Google Analytics (GA4)'] = ga4_ev_entry
     elif has_ga4_endpoint_only:
         found_tech.append('Google Analytics (GA4)')
@@ -327,6 +422,11 @@ def detect_tech_with_evidence(
         if 'WordPress' not in found_tech:
             found_tech.append('WordPress')
 
+    has_esp_retention = any(
+        esp_sig in html_lower or esp_sig in gtm_lower or esp_sig in pw_net_lower
+        for esp_sig in ESP_RETENTION_SIGNATURES
+    )
+
     has_cookie_banner = (
         has_consent_mode_v2_signals
         or any(marker in html_lower or marker in gtm_lower for marker in COOKIE_CONSENT_MARKERS)
@@ -342,10 +442,12 @@ def detect_tech_with_evidence(
         'has_pinterest_tag': 'Pinterest Tag' in found_tech,
         'has_hubspot': 'HubSpot' in found_tech,
         'has_klaviyo': 'Klaviyo' in found_tech,
+        'has_esp_retention': has_esp_retention,
         'has_ga4': 'Google Analytics (GA4)' in found_tech,
         'has_gtm': 'Google Tag Manager' in found_tech,
         'has_sgtm': has_sgtm,
         'has_consent_mode_v2_signals': has_consent_mode_v2_signals,
+        'duplicate_ga4_ids': duplicate_ga4_ids,
         'all_ga4_ids': '; '.join(capped_ga4_list) if capped_ga4_list else None,
         'all_ga4_ids_count': total_ga4_count if total_ga4_count > 0 else None,
         'ga4_detection_confidence': ga4_confidence,
