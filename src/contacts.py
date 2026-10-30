@@ -300,6 +300,50 @@ def generate_dm_email_pattern_candidates(
     return [f'{f_init}.{last}@{dom}', f'{first}.{last}@{dom}', f'{first}@{dom}']
 
 
+async def verify_predicted_emails_via_api(
+    client: AsyncSession,
+    candidates: list[str],
+    reoon_api_key: str | None = None,
+    millionverifier_api_key: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Killer Feature #4 (v21.1):
+    Якщо передано опціональний ключ Reoon або MillionVerifier, перевіряє топ-3 згенеровані
+    гіпотези пошти ЛПР (напр. i.shevkoplyas@sendpulse.ua, ihor.shevkoplyas@sendpulse.ua)
+    і повертає першу адресу зі статусом 'safe' / 'valid' / 'ok' для автозаміни best_email!
+    """
+    r_key = (reoon_api_key or os.environ.get('REOON_API_KEY') or '').strip()
+    mv_key = (millionverifier_api_key or os.environ.get('MILLIONVERIFIER_API_KEY') or '').strip()
+    if (not r_key and not mv_key) or not candidates:
+        return None, None
+
+    for cand in candidates[:3]:
+        if r_key:
+            try:
+                url = f'https://emailverifier.reoon.com/api/v1/verify?email={cand}&key={r_key}&mode=quick'
+                resp = await client.get(url, timeout=6.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    st = str(data.get('status') or '').lower()
+                    if st in ('safe', 'valid', 'deliverable'):
+                        return cand, f'verified_deliverable_via_reoon ({st})'
+            except Exception:
+                pass
+        if mv_key:
+            try:
+                url = f'https://api.millionverifier.com/api/v3/?api={mv_key}&email={cand}&timeout=5'
+                resp = await client.get(url, timeout=6.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    res_code = str(data.get('result') or '').lower()
+                    if res_code in ('ok', 'valid', 'deliverable'):
+                        return cand, f'verified_deliverable_via_millionverifier ({res_code})'
+            except Exception:
+                pass
+
+    return None, None
+
+
 def is_valid_Scraped_email(email: str, canonical_domain: str) -> tuple[bool, bool]:
     if not email or '@' not in email or len(email) > 90:
         return False, False
@@ -492,11 +536,6 @@ async def verify_email_deliverability_deep(
 
 
 def _is_acceptable_e164_length(e164_str: str, target_region: str) -> bool:
-    """
-    Must-Have Fix #1 (v21.0):
-    Відсікає короткі 6-8 цифрові числа (артикули, індекси, ціни типу 016 99 -> +49 1699).
-    Дозволяє >= 10 цифр (або рівно 9 цифр ТІЛЬКИ для DE офіційних міських номерів +4940..., як +49 40 64610 на otto.de).
-    """
     digits = re.sub(r'\D', '', e164_str or '')
     if len(digits) >= 10 and len(digits) <= 15:
         return True
@@ -510,11 +549,6 @@ def extract_valid_phones(
     raw_tel_links: list[tuple[str, str]],
     default_region: str = 'US'
 ) -> list[tuple[str, int]]:
-    """
-    v21.0 Fix:
-    1. Передає у PhoneNumberMatcher ТІЛЬКИ єдиний target_region самого домену (без чужого 'DE' на NL/UA сайтах).
-    2. Перевіряє мінімальну довжину E164 через _is_acceptable_e164_length (блокує +49 1699 та +49 1649).
-    """
     target_region = (default_region or 'US').upper().strip()
     expected_prefix = REGION_DIALING_PREFIX_MAP.get(target_region, '+1')
     candidates: dict[str, int] = {}
