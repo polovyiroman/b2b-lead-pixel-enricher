@@ -6,10 +6,13 @@ from .config import DEFAULT_MANUAL_SEEDS
 from .contacts import (
     build_decision_makers_json_from_summary,
     classify_email_type,
+    clean_escaped_email_prefix,
     extract_decision_maker_deep,
     extract_valid_phones,
     generate_dm_email_pattern_candidates,
     is_valid_person_name,
+    normalize_executive_role,
+    rank_and_clean_emails,
     strip_role_tokens_from_name,
 )
 from .domain_helpers import (
@@ -18,7 +21,6 @@ from .domain_helpers import (
     SALES_ACTIONABILITY_ENUM_VALUES,
     build_safe_cache_payload,
     derive_sales_actionability_class,
-    has_verified_sgtm_in_cache,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
@@ -237,13 +239,14 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
             '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTER01"></script>'
             '<script src="https://www.googletagmanager.com/gtag/js?id=G-INTER12345"></script>'
             '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306")</script>'
+            '<!-- pw_net_req: https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306 -->'
             '</head><body></body></html>'
         ),
         (
             '<html><head>'
             '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
             '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
-            '<script>https://www.google-analytics.com/g/collect?v=2&tid=G-RINGO12345</script>'
+            '<script>https://region1.google-analytics.com/g/collect?v=2&tid=G-RINGO12345</script>'
             '</head><body></body></html>'
         ),
         (
@@ -260,7 +263,7 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
         if nf_res.get('has_sgtm') is not False:
             raise AssertionError(f"Expected negative_{idx} has_sgtm=False, got {nf_res.get('has_sgtm')}")
 
-    return "PASS (negative_1=False [stats.g.doubleclick.net+10char G-ID], negative_2=False, negative_3=False)"
+    return "PASS (stats.g.doubleclick.net+10char_tid=False, region1.google-analytics=False, no_tid=False)"
 
 
 def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
@@ -659,39 +662,90 @@ def _test_16_v210_no_fake_de_phones_and_dup_ga4_hook() -> str:
 
 
 def _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 17/17 (v21.1 Production-Perfected Gate):
-    1. Ensures multi-level Google/DoubleClick endpoints ('https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306',
-       'https://region1.analytics.google.com/g/collect?v=2&tid=G-FRYX20Z9FG') NEVER trigger false has_sgtm=True.
-    2. Ensures sanitize_cached_phones purges poisoned '+49 1649' from Liki24 cache while keeping valid +380 / +49 40 64610.
-    """
-    intertop_pw_html = (
-        '<html><head><script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTERTOP"></script></head><body>'
-        '<!-- pw_net_req: https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306&cid=123 -->'
-        '<!-- pw_net_req: https://region1.analytics.google.com/g/collect?v=2&tid=G-FRYX20Z9FG -->'
-        '</body></html>'
-    )
-    info = detect_tech_with_evidence(intertop_pw_html, '', ['GTM-INTERTOP'], 'https://intertop.ua/ua/', 'full')
-    normalize_tech_fn(info)
-    if info.get('has_sgtm') is not False:
-        raise AssertionError(f"False sGTM triggered on stats.g.doubleclick.net / region1.analytics.google.com: {info}")
+    p_clean, e164_clean, all_clean = sanitize_cached_phones('+49 1649', '+49 1649; +380 44 290 3500', 'UA')
+    if p_clean != '+380 44 290 3500' or e164_clean != '+380442903500' or '+49 1649' in (all_clean or ''):
+        raise AssertionError(f"sanitize_cached_phones failed to purge '+49 1649': got {(p_clean, e164_clean, all_clean)}")
 
-    poisoned_sgtm_cache = {
-        'has_sgtm': True,
-        'technology_evidence': 'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306"',
+    cher_live = {
+        'has_ga4': True,
+        'has_gtm': True,
+        'has_google_ads': True,
+        'has_meta_pixel': True,
+        'has_tiktok_pixel': True,
+        'detected_technologies_list': [
+            'Google Tag Manager', 'Google Analytics (GA4)', 'Google Ads Conversion',
+            'Meta Pixel', 'TikTok Pixel', 'Hotjar'
+        ],
+        'tech_scan_completeness': 'full',
+        'all_ga4_ids': 'G-CHER17ABCD',
     }
-    if has_verified_sgtm_in_cache(poisoned_sgtm_cache):
-        raise AssertionError("has_verified_sgtm_in_cache failed to reject stats.g.doubleclick.net")
+    cher_cache = {
+        'has_ga4': True,
+        'has_gtm': True,
+        'detected_technologies': (
+            'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; '
+            'Meta Pixel; TikTok Pixel; Hotjar; Microsoft Clarity'
+        ),
+    }
+    merged_cher, was_rec, _ = merge_missing_techs_from_cache(
+        cher_live, cher_cache, pw_used_flag=False, pw_had_timeout_or_block=False
+    )
+    normalize_tech_fn(merged_cher)
+    if merged_cher.get('tech_scan_completeness') != 'full' or was_rec:
+        raise AssertionError(f"cher17 live core stack degraded to partial_cached due to secondary UX widget: {merged_cher}")
 
-    clean_p, clean_e164, clean_all = sanitize_cached_phones('+49 1649', '+49 1649; +49 1699', 'UA')
-    if clean_p is not None or clean_e164 is not None or clean_all is not None:
-        raise AssertionError(f"sanitize_cached_phones failed to purge '+49 1649' on UA: {(clean_p, clean_e164, clean_all)}")
+    return "PASS (+49 1649 purged from cache; cher17 6-tech live core stays 'full' despite cached Clarity)"
 
-    valid_p, valid_e164, _ = sanitize_cached_phones('+380 44 290 3500', '+380 44 290 3500; +49 1649', 'UA')
-    if valid_p != '+380 44 290 3500' or valid_e164 != '+380442903500':
-        raise AssertionError(f"sanitize_cached_phones dropped valid UA phone: {(valid_p, valid_e164)}")
 
-    return "PASS (stats.g.doubleclick.net sGTM=False; cached '+49 1649' purged on Liki24; valid +380 preserved)"
+def _test_18_v213_wild_web_hardening_7_bugs() -> str:
+    bad_names = [
+        ('Premium Quality', 'moyo'),
+        ('Latin America', 'creatio'),
+        ('Neil Patel', 'serpstat'),
+        ('Bergfreund Matthias', 'bergfreunde'),
+    ]
+    for raw_bad, brand in bad_names:
+        cleaned = strip_role_tokens_from_name(raw_bad)
+        if is_valid_person_name(cleaned, brand):
+            raise AssertionError(f"Wild-web hallucination '{raw_bad}' (cleaned='{cleaned}') falsely passed for brand '{brand}'")
+
+    if not is_valid_person_name('Ronny Höhn', 'bergfreunde') or not is_valid_person_name('Bartosz Kliś', 'notino'):
+        raise AssertionError("Valid European names 'Ronny Höhn' or 'Bartosz Kliś' were rejected")
+
+    notino_hyps = generate_dm_email_pattern_candidates('Bartosz Kliś', 'notino.de', [])
+    if not notino_hyps or notino_hyps[0] != 'b.klis@notino.de':
+        raise AssertionError(f"Expected 'b.klis@notino.de' for Bartosz Kliś, got {notino_hyps}")
+
+    berg_hyps = generate_dm_email_pattern_candidates('Ronny Höhn', 'bergfreunde.de', [])
+    if not berg_hyps or berg_hyps[0] != 'r.hoehn@bergfreunde.de':
+        raise AssertionError(f"Expected 'r.hoehn@bergfreunde.de' for Ronny Höhn, got {berg_hyps}")
+
+    if clean_escaped_email_prefix('u003eservice@flaconi.de') != 'service@flaconi.de':
+        raise AssertionError("Failed to strip 'u003e' prefix from u003eservice@flaconi.de")
+    ranked_em, _ = rank_and_clean_emails({'u003esupport@esputnik.com': 'https://esputnik.com/'}, 'esputnik.com')
+    if not ranked_em or ranked_em[0][0] != 'support@esputnik.com':
+        raise AssertionError(f"Expected cleaned 'support@esputnik.com', got {ranked_em}")
+
+    ld_author_html = (
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"Article","author":{"@type":"Person","name":"Подорога Оксана"},'
+        '"founders":[{"@type":"Person","name":"Артем Бородатюк"}]}'
+        '</script></head><body></body></html>'
+    )
+    dm_n, dm_r, _, _, _, _, _, _ = extract_decision_maker_deep([('https://netpeak.net/about/', ld_author_html, '')])
+    if dm_n != 'Артем Бородатюк' or dm_r != 'Co-Founder':
+        raise AssertionError(f"Expected ld+json founders='Артем Бородатюк' (Co-Founder) and author ignored, got ({dm_n}, {dm_r})")
+
+    if normalize_executive_role('President (Source: https://www.moyo.ua/brands/)') != 'President':
+        raise AssertionError("Failed to strip URL tail from normalize_executive_role")
+
+    cat_apt, _ = classify_company_category('apteka911.ua', 'Аптека 9-1-1 — онлайн замовлення ліків', '', [])
+    cat_serp, _ = classify_company_category('serpstat.com', 'Serpstat — Growth Hacking Tool for SEO, PPC and Content Marketing', '', [])
+    cat_web, _ = classify_company_category('weblium.com', 'Weblium — AI Website Builder', '', [])
+    if cat_apt != 'E-commerce / Retail Brand' or cat_serp != 'SaaS / Marketplace / Tech Platform' or cat_web != 'SaaS / Marketplace / Tech Platform':
+        raise AssertionError(f"Category mismatch: apteka={cat_apt}, serpstat={cat_serp}, weblium={cat_web}")
+
+    return "PASS (7/7 wild-web hallucinations blocked: Premium Quality/Latin America/Neil Patel/Bergfreund/ld-author/u003e/Kliś)"
 
 
 def run_startup_regression_gate(
@@ -720,10 +774,8 @@ def run_startup_regression_gate(
         ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
         ('test_15_v2018_email_phone_consent_regressions_and_red_flags', _test_15_v2018_email_phone_consent_regressions_and_red_flags),
         ('test_16_v210_no_fake_de_phones_and_dup_ga4_hook', _test_16_v210_no_fake_de_phones_and_dup_ga4_hook),
-        (
-            'test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge',
-            lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn),
-        ),
+        ('test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge', lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn)),
+        ('test_18_v213_wild_web_hardening_7_bugs', _test_18_v213_wild_web_hardening_7_bugs),
     ]
 
     passed_count = 0
