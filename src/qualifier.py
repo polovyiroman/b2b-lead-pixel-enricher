@@ -24,6 +24,16 @@ KNOWN_DTC_ECOM_DOMAINS = {
     'laredoute.fr',
     'docmorris.de',
     'coolblue.nl',
+    'notino.de',
+    'flaconi.de',
+    'douglas.de',
+    'thomann.de',
+    'bergfreunde.de',
+    'moyo.ua',
+    'yakaboo.ua',
+    'apteka911.ua',
+    'stls.store',
+    'stylus.ua',
 }
 
 
@@ -59,7 +69,8 @@ def classify_company_category(
         'agenzia web', 'agenzia di marketing', 'agenzia digitale', 'agenzia comunicazione',
         'marketingbureau', 'internetbureau', 'online marketing bureau', 'mediabureau',
         'agencja marketingowa', 'agencja interaktywna', 'agencja seo', 'agencja reklamowa',
-        'agência digital', 'agência de marketing', 'webbyrå', 'reklambyrå', 'kommunikationsbyrå', 'mediebyrå'
+        'agência digital', 'agência de marketing', 'webbyrå', 'reklambyrå', 'kommunikationsbyrå', 'mediebyrå',
+        'promodo', 'netpeak'
     )
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
@@ -70,7 +81,9 @@ def classify_company_category(
         'бренд взуття', 'жіночого одягу', 'женского белья', 'каталог товарів',
         'checkout', 'add to cart', 'кошик', 'shoes', 'apparel', 'clothing',
         'млн товарів', 'знижки до', 'кешбек', 'доставка ліків', 'замовити ліки',
+        'аптека', 'apteka', 'ліки', 'pharmacy', 'онлайн-аптека', 'медикаменти',
         'onlineshop', 'online-shop', 'warenkorb', 'versandkostenfrei', 'jetzt kaufen', 'bestellen',
+        'parfümerie', 'parfumerie', 'drogerie', 'outdoor', 'klettern', 'bergfreunde', 'musikhaus',
         'boutique en ligne', 'livraison gratuite', 'panier', 'acheter en ligne', 'magasin en ligne',
         'tienda online', 'carrito', 'envío gratis', 'comprar online', 'tienda en línea',
         'negozio online', 'carrello', 'spedizione gratuita', 'acquista online', 'shopping online',
@@ -127,7 +140,12 @@ def classify_company_category(
         'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
         'email service', 'automation service', 'chatbot', 'cloud-lösung', 'softwarelösung',
         'logiciel saas', 'plateforme cloud', 'software de gestión', 'piattaforma cloud',
-        'oprogramowanie dla firm', 'system crm', 'ringostat', 'sendpulse', 'macpaw', 'readdle', 'grammarly'
+        'oprogramowanie dla firm', 'system crm', 'ringostat', 'sendpulse', 'macpaw', 'readdle', 'grammarly',
+        'seo', 'serp', 'keyword', 'keywords', 'backlink', 'backlinks', 'site audit', 'rank tracker',
+        'website builder', 'конструктор сайтів', 'створення сайту', 'ai website builder',
+        'helpdesk', 'live chat', 'customer communication', 'customer data platform', 'cdp',
+        'omnichannel', 'no-code', 'low-code', 'workflow automation',
+        'serpstat', 'weblium', 'esputnik', 'creatio', 'helpcrunch'
     )
     if any(k in text for k in saas_keywords):
         return 'SaaS / Marketplace / Tech Platform', 'high'
@@ -313,8 +331,6 @@ def build_sales_hook(
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
-    # v21.0 Must-Have #2: Якщо на сайті знайдено Duplicate GA4 Tagging (як G-XM6L5ZM306 на intertop.ua),
-    # виносимо цей конкретний технічний баг прямо в sales_hook!
     if dup_ga4_ids:
         dup_id = dup_ga4_ids[0]
         return (
