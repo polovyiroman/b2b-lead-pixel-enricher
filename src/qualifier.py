@@ -306,15 +306,24 @@ def build_sales_hook(
     has_li = bool(tech_info.get('has_linkedin_pixel'))
     has_consent = bool(tech_info.get('has_cookie_banner'))
     has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
+    dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
 
     dm_intro = f'{dm_name} ({dm_role})' if dm_name else 'Marketing Lead'
     li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
-    # Критичний фікс #3: Спрацьовує ТІЛЬКИ якщо реально запускався браузер (pw_used=True)
-    # або якщо на сторінці знайдено активний CMP-банер (has_consent=True), але в GTM немає gtag('consent') / gcs / gcd.
-    # На статичних curl-сканах без банера (як docmorris.de) хибного попередження більше немає!
+    # v21.0 Must-Have #2: Якщо на сайті знайдено Duplicate GA4 Tagging (як G-XM6L5ZM306 на intertop.ua),
+    # виносимо цей конкретний технічний баг прямо в sales_hook!
+    if dup_ga4_ids:
+        dup_id = dup_ga4_ids[0]
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str} [Red Flag: Duplicate GA4 Tagging ({dup_id} in both HTML & GTM)]. "
+            f"Opening Hook: \"Noticed {brand}'s GA4 property ({dup_id}) is hardcoded directly in the page HTML "
+            f"and simultaneously firing inside your GTM container — are you seeing inflated pageviews/sessions or double-counted conversions in GA4?\""
+        )
+
     cm_v2_gap_note = ''
     if (
         is_eu_gdpr
@@ -397,7 +406,8 @@ def evaluate_qualification_v180(
     dm_source_type: str | None,
     linkedin_url: str | None,
     had_marketplace_pollution: bool = False,
-    pw_status_str: str = 'not_needed'
+    pw_status_str: str = 'not_needed',
+    predicted_dm_email: str | None = None,
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
     detected_list = tech_info.get('detected_technologies_list', [])
     ad_tags = []
@@ -680,9 +690,10 @@ def evaluate_qualification_v180(
         if has_real_signals
         else ' to initiate B2B discovery (verify tracking stack manually first)'
     )
+    pred_email_clause = f'; test predicted DM email {predicted_dm_email} via verifier' if predicted_dm_email else ''
 
     if is_agency:
-        next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{phone_note}"
+        next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{pred_email_clause}{phone_note}"
     elif company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
     elif not all_signals and not best_email and not primary_phone:
@@ -696,11 +707,11 @@ def evaluate_qualification_v180(
     elif dm_name and is_same_person_li:
         next_action = (
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url}"
-            f"{stack_ref_clause}"
+            f"{stack_ref_clause}{pred_email_clause}"
         )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         next_action = (
-            f"Contact {dm_name} ({dm_role}) via LinkedIn or send B2B discovery proposal to {best_email}"
+            f"Contact {dm_name} ({dm_role}) via LinkedIn{pred_email_clause} or send B2B discovery proposal to {best_email}"
             f"{stack_ref_clause}{phone_note}"
         )
     elif best_email_type in (
@@ -709,10 +720,16 @@ def evaluate_qualification_v180(
         'department_or_general_inbox', 'influencer_gifting_inbox'
     ):
         dm_hint = f" ({dm_name})" if dm_name else ""
-        next_action = (
-            f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-            f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
-        )
+        if predicted_dm_email and dm_name:
+            next_action = (
+                f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
+                f"test predicted DM email {predicted_dm_email} via verifier or message {dm_name} via decision_maker_search_query on LinkedIn{phone_note}"
+            )
+        else:
+            next_action = (
+                f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
+                f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
+            )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
             f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
@@ -721,19 +738,19 @@ def evaluate_qualification_v180(
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
             f"Send tailored discovery audit offer to {best_email} ({best_email_type})"
-            f"{stack_ref_clause}"
+            f"{stack_ref_clause}{pred_email_clause}"
         )
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
         dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
-            f"Locate CMO / Head of E-commerce{dm_hint} via decision_maker_search_query on LinkedIn first; "
+            f"Locate CMO / Head of E-commerce{dm_hint} via decision_maker_search_query on LinkedIn{pred_email_clause} first; "
             f"use {best_email} only for warm gatekeeper routing / referral request"
         )
     elif primary_phone:
-        next_action = f"Use decision_maker_search_query on LinkedIn or call {primary_phone} for routing"
+        next_action = f"Use decision_maker_search_query on LinkedIn{pred_email_clause} or call {primary_phone} for routing"
     else:
         next_action = (
-            f"Run decision_maker_search_query in LinkedIn / Apollo to locate marketing decision-maker{phone_note}"
+            f"Run decision_maker_search_query in LinkedIn / Apollo{pred_email_clause} to locate marketing decision-maker{phone_note}"
         )
 
     return (
