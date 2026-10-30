@@ -18,10 +18,12 @@ from .domain_helpers import (
     SALES_ACTIONABILITY_ENUM_VALUES,
     build_safe_cache_payload,
     derive_sales_actionability_class,
+    has_verified_sgtm_in_cache,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
     sanitize_cached_dms,
+    sanitize_cached_phones,
 )
 from .qualifier import (
     build_sales_hook,
@@ -234,14 +236,14 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
             '<html><head>'
             '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTER01"></script>'
             '<script src="https://www.googletagmanager.com/gtag/js?id=G-INTER12345"></script>'
-            '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XXXX")</script>'
+            '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306")</script>'
             '</head><body></body></html>'
         ),
         (
             '<html><head>'
             '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
             '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
-            '<script>https://www.google-analytics.com/g/collect?v=2&tid=G-YYYY</script>'
+            '<script>https://www.google-analytics.com/g/collect?v=2&tid=G-RINGO12345</script>'
             '</head><body></body></html>'
         ),
         (
@@ -258,7 +260,7 @@ def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -
         if nf_res.get('has_sgtm') is not False:
             raise AssertionError(f"Expected negative_{idx} has_sgtm=False, got {nf_res.get('has_sgtm')}")
 
-    return "PASS (negative_1=False, negative_2=False, negative_3=False)"
+    return "PASS (negative_1=False [stats.g.doubleclick.net+10char G-ID], negative_2=False, negative_3=False)"
 
 
 def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
@@ -292,7 +294,7 @@ def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
         'detected_signals': 'Meta Pixel, GA4, GTM, sGTM',
         'technology_evidence': (
             'Google Tag Manager: id=GTM-LIKI @ https://liki24.com/ | '
-            'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2" @ https://liki24.com/'
+            'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-FRYX20Z9FG" @ https://liki24.com/'
         ),
         'tech_scan_completeness': 'partial_cached',
     }
@@ -606,12 +608,6 @@ def _test_15_v2018_email_phone_consent_regressions_and_red_flags() -> str:
 
 
 def _test_16_v210_no_fake_de_phones_and_dup_ga4_hook() -> str:
-    """
-    Test 16/16 (v21.0 Market-Ready Gate):
-    1. Ensures short numbers ('016 99', '016 49', '016 8176') on NL/UA pages NEVER parse as German +49 phones.
-    2. Ensures valid 9-digit Hamburg landline '+49 40 64610' on DE pages (otto.de) is preserved.
-    3. Ensures Duplicate GA4 Tagging is surfaced directly in build_sales_hook and predicted_dm_email in next_best_action.
-    """
     nl_fake = extract_valid_phones('Error code 016 99 on Coolblue WAF page', [], default_region='NL')
     ua_fake = extract_valid_phones('Артикул товару 016 49 або ціна 016 8176 грн', [], default_region='UA')
     if nl_fake or ua_fake:
@@ -662,6 +658,42 @@ def _test_16_v210_no_fake_de_phones_and_dup_ga4_hook() -> str:
     return "PASS (016 99 / 016 49 blocked on NL/UA; +49 40 64610 kept on DE; Dup GA4 in hook & DM email in next_action)"
 
 
+def _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn: Callable[[dict], None]) -> str:
+    """
+    Test 17/17 (v21.1 Production-Perfected Gate):
+    1. Ensures multi-level Google/DoubleClick endpoints ('https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306',
+       'https://region1.analytics.google.com/g/collect?v=2&tid=G-FRYX20Z9FG') NEVER trigger false has_sgtm=True.
+    2. Ensures sanitize_cached_phones purges poisoned '+49 1649' from Liki24 cache while keeping valid +380 / +49 40 64610.
+    """
+    intertop_pw_html = (
+        '<html><head><script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTERTOP"></script></head><body>'
+        '<!-- pw_net_req: https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306&cid=123 -->'
+        '<!-- pw_net_req: https://region1.analytics.google.com/g/collect?v=2&tid=G-FRYX20Z9FG -->'
+        '</body></html>'
+    )
+    info = detect_tech_with_evidence(intertop_pw_html, '', ['GTM-INTERTOP'], 'https://intertop.ua/ua/', 'full')
+    normalize_tech_fn(info)
+    if info.get('has_sgtm') is not False:
+        raise AssertionError(f"False sGTM triggered on stats.g.doubleclick.net / region1.analytics.google.com: {info}")
+
+    poisoned_sgtm_cache = {
+        'has_sgtm': True,
+        'technology_evidence': 'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306"',
+    }
+    if has_verified_sgtm_in_cache(poisoned_sgtm_cache):
+        raise AssertionError("has_verified_sgtm_in_cache failed to reject stats.g.doubleclick.net")
+
+    clean_p, clean_e164, clean_all = sanitize_cached_phones('+49 1649', '+49 1649; +49 1699', 'UA')
+    if clean_p is not None or clean_e164 is not None or clean_all is not None:
+        raise AssertionError(f"sanitize_cached_phones failed to purge '+49 1649' on UA: {(clean_p, clean_e164, clean_all)}")
+
+    valid_p, valid_e164, _ = sanitize_cached_phones('+380 44 290 3500', '+380 44 290 3500; +49 1649', 'UA')
+    if valid_p != '+380 44 290 3500' or valid_e164 != '+380442903500':
+        raise AssertionError(f"sanitize_cached_phones dropped valid UA phone: {(valid_p, valid_e164)}")
+
+    return "PASS (stats.g.doubleclick.net sGTM=False; cached '+49 1649' purged on Liki24; valid +380 preserved)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -688,6 +720,10 @@ def run_startup_regression_gate(
         ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
         ('test_15_v2018_email_phone_consent_regressions_and_red_flags', _test_15_v2018_email_phone_consent_regressions_and_red_flags),
         ('test_16_v210_no_fake_de_phones_and_dup_ga4_hook', _test_16_v210_no_fake_de_phones_and_dup_ga4_hook),
+        (
+            'test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge',
+            lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn),
+        ),
     ]
 
     passed_count = 0
