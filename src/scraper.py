@@ -28,8 +28,6 @@ from .contacts import (
     pick_best_social_candidate,
 )
 
-# Must-Have #3: Спочатку пробуємо patchright (stealth CDP без Runtime.enable leak),
-# якщо не встановлено у контейнері — плавно переходимо на стандартний playwright
 try:
     from patchright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
@@ -269,6 +267,12 @@ async def fetch_html_safely(
 
 
 async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str], str]:
+    """
+    Баг №3 Fix (v21.1):
+    Якщо проксі моргнув під час скачування googletagmanager.com/gtm.js (як на inweb.ua),
+    автоматично виконує другу спробу напряму (proxy=None), бо Google Tag Manager CDN
+    ніколи не блокує дата-центрові IP.
+    """
     gtm_ids = sorted({
         m.upper() for m in GTM_ID_REGEX.findall(html)
         if is_valid_gtm_id(m)
@@ -278,12 +282,16 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
 
     async def _fetch_one(gid: str) -> str:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gid}'
-        try:
-            resp = await client.get(gtm_url, timeout=6.0)
-            if resp.status_code == 200 and resp.text:
-                return resp.text[:450_000]
-        except Exception:
-            pass
+        for use_direct in (False, True):
+            try:
+                kwargs: dict = {'timeout': 6.0}
+                if use_direct:
+                    kwargs['proxy'] = None
+                resp = await client.get(gtm_url, **kwargs)
+                if resp.status_code == 200 and resp.text:
+                    return resp.text[:450_000]
+            except Exception:
+                continue
         return ''
 
     scripts = await asyncio.gather(*(_fetch_one(gid) for gid in gtm_ids[:2]))
