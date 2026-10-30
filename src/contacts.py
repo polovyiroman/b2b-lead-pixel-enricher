@@ -65,7 +65,7 @@ GENERIC_SINGLE_WORD_LOCALS = {
     'retail', 'opt', 'pay', 'payment', 'payments', 'delivery', 'shipping',
     'track', 'tracking', 'status', 'order', 'orders', 'claim', 'claims',
     'warranty', 'repair', 'service', 'services', 'feedback', 'review',
-    'reviews', 'rating', ' career', 'work', 'talent', 'people', 'culture',
+    'reviews', 'rating', 'career', 'work', 'talent', 'people', 'culture',
     'events', 'event', 'webinar', 'demo', 'trial', 'free', 'start', 'join',
     'hello', 'hi', 'hey', 'info', 'mail', 'email', 'contact', 'contacts',
     'office', 'team', 'support', 'help', 'care', 'sales', 'partner',
@@ -202,12 +202,6 @@ def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tup
 
 
 def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
-    """
-    Критичний фікс #1 (v20.18 Rollback & Hardening):
-    1. Підтримує формат 'ініціал.прізвище@domain' (напр. a.glazyrina@inweb.ua, r.skrupnyk@inweb.ua) -> 'personal_or_named_inbox'.
-    2. НЕ класифікує дефісні технічні пошти типу 'ip-external@grammarly.com' як іменні (іменний роздільник лише '.' або '_').
-    3. НЕ класифікує однотокенні загальні скриньки типу 'ask@inweb.ua', 'dclub@intertop.ua', 'return@intertop.ua' як іменні.
-    """
     if not email or '@' not in email:
         return None
     local, dom = email.lower().strip().split('@', 1)
@@ -243,9 +237,6 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if _matches_prefix_safely(local, tokens, GENERAL_OFFICE_PREFIXES):
         return 'general_office_inbox'
 
-    # Іменні пошти дозволені ТІЛЬКИ якщо в локальній частині немає дефіса (відсікає ip-external@grammarly.com)
-    # і є рівно 2 токени, розділені крапкою або підкресленням:
-    # або "ім'я.прізвище" (обидва >= 2), або "ініціал.прізвище" (len(t1)==1 та len(t2)>=3, як a.glazyrina@inweb.ua)
     if '-' not in local and ('_' in local or '.' in local):
         dot_tokens = [t for t in re.split(r'[._]+', local) if t]
         if len(dot_tokens) == 2:
@@ -270,11 +261,6 @@ def generate_dm_email_pattern_candidates(
     canonical_domain: str,
     observed_emails: list[str] | None = None,
 ) -> list[str]:
-    """
-    Killer Feature #1: Генератор гіпотез корпоративної пошти ЛПР (Email Pattern Permutation).
-    Якщо на домені вже є іменна пошта (напр. a.glazyrina@inweb.ua -> шаблон {f}.{last}@domain),
-    будує точну адресу для знайденого ЛПР (напр. o.mamontov@inweb.ua або i.shevkoplyas@sendpulse.com).
-    """
     if not dm_name or not canonical_domain:
         return []
     dom = canonical_domain.lower().strip().replace('www.', '')
@@ -289,7 +275,6 @@ def generate_dm_email_pattern_candidates(
     first, last = parts[0], parts[-1]
     f_init = first[0]
 
-    # Перевіряємо, який шаблон вже використовується на домені
     detected_pattern = None
     for em in (observed_emails or []):
         if '@' not in em:
@@ -434,10 +419,6 @@ async def query_doh_json(
     domain: str,
     record_type: str = 'MX'
 ) -> tuple[bool, list[dict]]:
-    """
-    Відновлений двокроковий DoH-резолвер із fallback на пряме з'єднання (use_direct in (False, True)),
-    щоб проксі ніколи не ламав перевірку MX/SPF.
-    """
     doh_endpoints = (
         f'https://dns.google/resolve?name={domain}&type={record_type}',
         f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
@@ -510,16 +491,29 @@ async def verify_email_deliverability_deep(
         return res
 
 
+def _is_acceptable_e164_length(e164_str: str, target_region: str) -> bool:
+    """
+    Must-Have Fix #1 (v21.0):
+    Відсікає короткі 6-8 цифрові числа (артикули, індекси, ціни типу 016 99 -> +49 1699).
+    Дозволяє >= 10 цифр (або рівно 9 цифр ТІЛЬКИ для DE офіційних міських номерів +4940..., як +49 40 64610 на otto.de).
+    """
+    digits = re.sub(r'\D', '', e164_str or '')
+    if len(digits) >= 10 and len(digits) <= 15:
+        return True
+    if len(digits) == 9 and target_region == 'DE' and e164_str.startswith('+4940'):
+        return True
+    return False
+
+
 def extract_valid_phones(
     text: str,
     raw_tel_links: list[tuple[str, str]],
     default_region: str = 'US'
 ) -> list[tuple[str, int]]:
     """
-    Критичний фікс #2 (v20.18 Rollback & Hardening):
-    Повернено валідацію через бібліотеку Google phonenumbers + region_bonus = 35 за збіг країни номера
-    з default_region домену (щоб на ringostat.com та livepage.ua перемагали українські +380 44...,
-    на chubbiesshorts.com / glossier.com відсікалися фейкові склейки, а на otto.de знаходився +49 40 64610).
+    v21.0 Fix:
+    1. Передає у PhoneNumberMatcher ТІЛЬКИ єдиний target_region самого домену (без чужого 'DE' на NL/UA сайтах).
+    2. Перевіряє мінімальну довжину E164 через _is_acceptable_e164_length (блокує +49 1699 та +49 1649).
     """
     target_region = (default_region or 'US').upper().strip()
     expected_prefix = REGION_DIALING_PREFIX_MAP.get(target_region, '+1')
@@ -534,25 +528,28 @@ def extract_valid_phones(
                 parsed_num = phonenumbers.parse(cleaned_raw, target_region)
                 if not phonenumbers.is_valid_number(parsed_num):
                     return
-                formatted_intl = phonenumbers.format_number(
-                    parsed_num, phonenumbers.PhoneNumberFormat.INTERNATIONAL
-                )
                 e164_str = phonenumbers.format_number(
                     parsed_num, phonenumbers.PhoneNumberFormat.E164
+                )
+                if not _is_acceptable_e164_length(e164_str, target_region):
+                    return
+                formatted_intl = phonenumbers.format_number(
+                    parsed_num, phonenumbers.PhoneNumberFormat.INTERNATIONAL
                 )
                 num_region = (phonenumbers.region_code_for_number(parsed_num) or '').upper()
             except Exception:
                 return
         else:
             digits = re.sub(r'\D', '', cleaned_raw)
-            if len(digits) < 9 or len(digits) > 15:
+            if len(digits) < 10 or len(digits) > 15:
                 return
             e164_str = cleaned_raw if cleaned_raw.startswith('+') else f'{expected_prefix}{digits[-10:]}'
+            if not _is_acceptable_e164_length(e164_str, target_region):
+                return
             formatted_intl = e164_str
             num_region = target_region if e164_str.startswith(expected_prefix) else ''
 
         score = base_score
-        # Region bonus = 35: garantує пріоритет +380 на UA сайтах (ringostat.com, livepage.ua) над +1 номерами
         if num_region == target_region or e164_str.startswith(expected_prefix):
             score += 35
 
@@ -569,33 +566,34 @@ def extract_valid_phones(
         _add_validated_candidate(tel_str, ctx, 50)
 
     if _PHONENUMBERS_AVAILABLE:
-        for match_region in dict.fromkeys((target_region, 'DE', 'UA', 'GB', 'US')):
-            try:
-                for m in phonenumbers.PhoneNumberMatcher(text[:120000], match_region):
-                    num_obj = m.number
-                    if not phonenumbers.is_valid_number(num_obj):
-                        continue
-                    intl_str = phonenumbers.format_number(
-                        num_obj, phonenumbers.PhoneNumberFormat.INTERNATIONAL
-                    )
-                    e164_s = phonenumbers.format_number(
-                        num_obj, phonenumbers.PhoneNumberFormat.E164
-                    )
-                    n_reg = (phonenumbers.region_code_for_number(num_obj) or '').upper()
-                    sc = 25
-                    if n_reg == target_region or e164_s.startswith(expected_prefix):
-                        sc += 35
-                    w_start = max(0, m.start - 50)
-                    w_end = min(len(text), m.end + 50)
-                    ctx_w = text[w_start:w_end].lower()
-                    if any(k in ctx_w for k in B2B_PHONE_KEYWORDS):
-                        sc += 30
-                    elif any(k in ctx_w for k in RETAIL_PHONE_KEYWORDS):
-                        sc -= 10
-                    if intl_str not in candidates or sc > candidates[intl_str]:
-                        candidates[intl_str] = sc
-            except Exception:
-                continue
+        try:
+            for m in phonenumbers.PhoneNumberMatcher(text[:120000], target_region):
+                num_obj = m.number
+                if not phonenumbers.is_valid_number(num_obj):
+                    continue
+                e164_s = phonenumbers.format_number(
+                    num_obj, phonenumbers.PhoneNumberFormat.E164
+                )
+                if not _is_acceptable_e164_length(e164_s, target_region):
+                    continue
+                intl_str = phonenumbers.format_number(
+                    num_obj, phonenumbers.PhoneNumberFormat.INTERNATIONAL
+                )
+                n_reg = (phonenumbers.region_code_for_number(num_obj) or '').upper()
+                sc = 25
+                if n_reg == target_region or e164_s.startswith(expected_prefix):
+                    sc += 35
+                w_start = max(0, m.start - 50)
+                w_end = min(len(text), m.end + 50)
+                ctx_w = text[w_start:w_end].lower()
+                if any(k in ctx_w for k in B2B_PHONE_KEYWORDS):
+                    sc += 30
+                elif any(k in ctx_w for k in RETAIL_PHONE_KEYWORDS):
+                    sc -= 10
+                if intl_str not in candidates or sc > candidates[intl_str]:
+                    candidates[intl_str] = sc
+        except Exception:
+            pass
     else:
         for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', text[:120000]):
             w_start = max(0, m.start() - 50)
