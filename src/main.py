@@ -31,6 +31,8 @@ from .contacts import (
     extract_decision_maker_deep,
     extract_named_email_owner_hint,
     fetch_dm_via_serp_fallback,
+    generate_dm_email_pattern_candidates,
+    is_marketing_or_digital_role,
     rank_and_clean_emails,
     verify_email_deliverability_deep,
     verify_person_email_match,
@@ -93,6 +95,7 @@ from .scraper import (
 from .tech_detector import (
     build_evidence_json_from_cached_record,
     build_summary_from_cached_record,
+    detect_broken_attribution_red_flags,
     detect_tech_with_evidence,
 )
 
@@ -111,6 +114,7 @@ SDR_COMPACT_COLUMNS = (
     'detected_signals',
     'tech_scan_completeness',
     'sales_hook',
+    'sales_opportunity',
     'next_best_action',
     'decision_maker_search_query',
     'gdpr_jurisdiction',
@@ -120,7 +124,10 @@ SDR_COMPACT_COLUMNS = (
 
 def format_record_for_output_view(record: dict, output_view: str = 'full_audit') -> dict:
     if (output_view or 'full_audit').lower().strip() == 'sdr_compact':
-        return {col: record.get(col) for col in SDR_COMPACT_COLUMNS}
+        compact = {col: record.get(col) for col in SDR_COMPACT_COLUMNS}
+        opp = str(record.get('sales_opportunity') or '')
+        compact['pain_point_detected'] = opp.split(' | ')[0] if 'Red Flag' in opp else None
+        return compact
     return record
 
 
@@ -159,8 +166,6 @@ async def process_domain(
     pw_attempted_paths: list[str] = []
     pw_had_timeout_or_block = False
 
-    # Проблема №3 Fix: Тримаємо глобальний HTTP-семафор ТІЛЬКИ на час швидкого curl-запиту,
-    # звільняючи його перед очікуванням у черзі на Playwright (_PW_SEMAPHORE).
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
             client, root_url, proxy_config=proxy_config
@@ -464,6 +469,7 @@ async def process_domain(
                         cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_role'),
                         cached_copy.get('decision_maker_linkedin_url'), cached_copy.get('best_email'),
                         is_eu_gdpr=cached_copy['gdpr_eu_domain'],
+                        pw_used=False,
                     )
                     cached_copy['legal_basis_for_processing'] = (
                         'legitimate_interest_b2b'
@@ -698,8 +704,6 @@ async def process_domain(
     )
     remaining_pw_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
 
-    # Проблема №3 Fix: Другий виклик Playwright також виконується ПОЗА глобальним HTTP-семафором,
-    # щоб черга на браузер ніколи не блокувала швидкі curl-воркери!
     if is_playwright_available() and not pw_used_flag and remaining_pw_budget > 0 and (
         not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all
     ):
@@ -950,9 +954,9 @@ async def process_domain(
     country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
     dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
-    # Крок 1 Fix: Якщо на сайті немає ЛПР (як у більшості E-commerce) і передано SERPER_API_KEY —
-    # шукаємо CMO / Head of Marketing у Google SERP за нашим X-Ray запитом
-    if not dm_name:
+    # Must-Have #2: Запускаємо SERP-пошук CMO не лише коли dm_name is None,
+    # а й коли на сайті (зокрема на /impressum) знайдено лише не-маркетингового CEO без прямого LinkedIn
+    if not dm_name or (not is_marketing_or_digital_role(dm_role) and not dm_linkedin_url):
         async with semaphore:
             serp_name, serp_role, serp_li, serp_found_str = await fetch_dm_via_serp_fallback(
                 client, dm_search_query, brand_root, serper_api_key
@@ -963,7 +967,10 @@ async def process_domain(
             dm_linkedin_url = serp_li
             dm_source_url = serp_li
             dm_source_type = 'serp_linkedin_xray'
-            decision_makers_found_str = serp_found_str
+            if decision_makers_found_str:
+                decision_makers_found_str = f'{serp_found_str}; {decision_makers_found_str}'
+            else:
+                decision_makers_found_str = serp_found_str
 
     dm_name, dm_role, decision_makers_found_str = sanitize_cached_dms(
         dm_name, dm_role, decision_makers_found_str, brand_root, dm_linkedin_url
@@ -1036,6 +1043,23 @@ async def process_domain(
         linkedin_url, had_marketplace_pollution, pw_status_str
     )
 
+    # Killer Feature #3: Додаємо виявлені Red Flags втрат рекламного трафіку в sales_opportunity
+    red_flags = detect_broken_attribution_red_flags(
+        tech_info, company_category, is_eu_gdpr=is_eu_gdpr, pw_used=pw_used_flag
+    )
+    if red_flags and company_category != 'Non-Profit / Education / Institution':
+        rf_summary = '; '.join(red_flags[:2])
+        sales_opportunity = f'Red Flag: {rf_summary} | {sales_opportunity}'
+
+    # Killer Feature #1: Якщо знайдено ім'я ЛПР, але на сайті немає його прямої пошти —
+    # генеруємо корпоративні гіпотези пошти ({f}.{last}@domain) у email_source_note
+    if dm_name and not verify_person_email_match(dm_name, best_email):
+        dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
+        if dm_email_hyps and deliverability_check and 'domain_accepts_email' in deliverability_check:
+            hyp_str = ', '.join(dm_email_hyps[:2])
+            hyp_note = f'DM Email Pattern Hypothesis (MX Valid): {hyp_str}'
+            email_source_note = f'{email_source_note} | {hyp_note}' if email_source_note else hyp_note
+
     if cache_tech_recovered and cache_sources_count > 0:
         cache_warn = (
             f'Note: {cache_sources_count} tech(s) recovered from verified cache; '
@@ -1047,7 +1071,8 @@ async def process_domain(
         confidence_warning = f'{confidence_warning} | {empty_warn}' if (confidence_warning and confidence_warning != 'None' and 'tag absence unverified' not in confidence_warning) else empty_warn
 
     sales_hook = build_sales_hook(
-        canonical_domain, company_category, tech_info, dm_name, dm_role, dm_linkedin_url, best_email, is_eu_gdpr=is_eu_gdpr
+        canonical_domain, company_category, tech_info, dm_name, dm_role, dm_linkedin_url, best_email,
+        is_eu_gdpr=is_eu_gdpr, pw_used=pw_used_flag,
     )
 
     if best_email and deliverability_check and any(
