@@ -7,6 +7,8 @@ from .contacts import (
     build_decision_makers_json_from_summary,
     classify_email_type,
     extract_decision_maker_deep,
+    extract_valid_phones,
+    generate_dm_email_pattern_candidates,
     is_valid_person_name,
     strip_role_tokens_from_name,
 )
@@ -22,6 +24,7 @@ from .domain_helpers import (
     sanitize_cached_dms,
 )
 from .qualifier import (
+    build_sales_hook,
     classify_company_category,
     compute_data_quality_score,
 )
@@ -30,7 +33,10 @@ from .scraper import (
     get_clean_canonical_domain,
     prepare_domains,
 )
-from .tech_detector import detect_tech_with_evidence
+from .tech_detector import (
+    detect_broken_attribution_red_flags,
+    detect_tech_with_evidence,
+)
 
 
 def _test_01_corporate_entities() -> str:
@@ -517,12 +523,6 @@ def _test_13_subdomain_canonicalization() -> str:
 
 
 def _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn: Callable[[dict], None]) -> str:
-    """
-    Test 14/14 (v20.17 Deep Architecture Audit):
-    1. Verifies first-party sGTM collector (https://sgtm.brand.com/g/collect?v=2&tid=G-12345678AB&gcs=G111&gcd=13r3r3r3r5)
-       is detected as Server-Side GTM (has_sgtm=True) + Consent Mode v2 (has_consent_mode_v2_signals=True).
-    2. Verifies productsafety@aboutyou.com is classified as 'legal_or_hr_inbox' so customer-facing inboxes win.
-    """
     html_sgtm_collect = (
         '<html><head>'
         '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-STD1234"></script>'
@@ -542,6 +542,74 @@ def _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn: Cal
         raise AssertionError(f"Expected 'legal_or_hr_inbox' for productsafety@aboutyou.com, got '{ps_type}'")
 
     return "PASS (first-party sGTM /g/collect+tid=G- -> has_sgtm=True; gcs/gcd -> Consent Mode v2; productsafety@ -> legal)"
+
+
+def _test_15_v2018_email_phone_consent_regressions_and_red_flags() -> str:
+    """
+    Test 15/15 (v20.18 Audit Fixes & Killer Features):
+    1. Verifies 'a.glazyrina@inweb.ua' is 'personal_or_named_inbox', while 'ask@inweb.ua',
+       'dclub@intertop.ua', 'return@intertop.ua', and 'ip-external@grammarly.com' are NOT personal.
+    2. Verifies extract_valid_phones prioritizes Ukrainian +380 over US +1 on UA domains (region_bonus=35).
+    3. Verifies static curl scan without CMP banner (docmorris.de) does NOT trigger false [EU Consent Mode v2 gap].
+    4. Verifies Duplicate GA4 Tagging red flag and DM email pattern permutation.
+    """
+    for named_em, brand in (('a.glazyrina@inweb.ua', 'inweb'), ('r.skrupnyk@inweb.ua', 'inweb'), ('john.doe@company.com', 'company')):
+        got_t = classify_email_type(named_em, brand)
+        if got_t != 'personal_or_named_inbox':
+            raise AssertionError(f"Expected 'personal_or_named_inbox' for '{named_em}', got '{got_t}'")
+
+    for non_personal_em, brand in (
+        ('ask@inweb.ua', 'inweb'),
+        ('dclub@intertop.ua', 'intertop'),
+        ('return@intertop.ua', 'intertop'),
+        ('ip-external@grammarly.com', 'grammarly'),
+    ):
+        got_t = classify_email_type(non_personal_em, brand)
+        if got_t == 'personal_or_named_inbox':
+            raise AssertionError(f"Generic/hyphenated email '{non_personal_em}' falsely classified as personal_or_named_inbox")
+
+    phones = extract_valid_phones(
+        'US Support: +1 855 422 2555, Kyiv Office: +380 44 232 9210',
+        [('+18554222555', ''), ('+380442329210', 'Офіс продажів')],
+        default_region='UA',
+    )
+    if not phones or not phones[0][0].startswith('+380'):
+        raise AssertionError(f"Expected +380 phone to rank #1 for UA region, got {phones}")
+
+    docmorris_hook = build_sales_hook(
+        'docmorris.de',
+        'E-commerce / Retail Brand',
+        {
+            'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)', 'Google Ads Conversion'],
+            'has_gtm': True,
+            'has_ga4': True,
+            'has_google_ads': True,
+            'has_cookie_banner': False,
+            'has_consent_mode_v2_signals': False,
+            'tech_scan_completeness': 'full',
+        },
+        'Gundula Koele-Pabst',
+        'Executive Board / CEO (Vorstand)',
+        None,
+        'partnerwerden@docmorris.de',
+        is_eu_gdpr=True,
+        pw_used=False,
+    )
+    if 'EU Consent Mode v2 gap' in docmorris_hook:
+        raise AssertionError(f"False EU Consent Mode v2 gap triggered on static curl scan: {docmorris_hook}")
+
+    dup_html = "<html><head><script>gtag('config', 'G-DUP12345AB');</script></head></html>"
+    dup_gtm = '{"vtp_measurementId":"G-DUP12345AB"}'
+    dup_info = detect_tech_with_evidence(dup_html, dup_gtm, ['GTM-DUP001'], 'https://shop.example.com/', 'full')
+    red_flags = detect_broken_attribution_red_flags(dup_info, 'E-commerce / Retail Brand', is_eu_gdpr=False, pw_used=False)
+    if not any('Duplicate GA4 Tagging' in rf for rf in red_flags):
+        raise AssertionError(f"Expected Duplicate GA4 Tagging red flag, got {red_flags}")
+
+    hyps = generate_dm_email_pattern_candidates('Ігор Шевкопляс', 'sendpulse.ua', ['a.glazyrina@sendpulse.ua'])
+    if not hyps or hyps[0] != 'i.shevkoplyas@sendpulse.ua':
+        raise AssertionError(f"Expected 'i.shevkoplyas@sendpulse.ua' as #1 pattern hypothesis, got {hyps}")
+
+    return "PASS (a.glazyrina@->personal, ask@/ip-external@->non-personal; +380 #1 on UA; DocMorris hook clean; RedFlags OK)"
 
 
 def run_startup_regression_gate(
@@ -568,6 +636,7 @@ def run_startup_regression_gate(
         ('test_12_v2015_security_ssrf_rozetka_and_actionability', _test_12_v2015_security_ssrf_rozetka_and_actionability_enum),
         ('test_13_subdomain_canonicalization', _test_13_subdomain_canonicalization),
         ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
+        ('test_15_v2018_email_phone_consent_regressions_and_red_flags', _test_15_v2018_email_phone_consent_regressions_and_red_flags),
     ]
 
     passed_count = 0
