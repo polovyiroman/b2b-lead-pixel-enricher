@@ -127,6 +127,11 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
         compact = {col: record.get(col) for col in SDR_COMPACT_COLUMNS}
         opp = str(record.get('sales_opportunity') or '')
         compact['pain_point_detected'] = opp.split(' | ')[0] if 'Red Flag' in opp else None
+        note = str(record.get('email_source_note') or '')
+        if 'DM Email Pattern Hypothesis (MX Valid): ' in note:
+            compact['predicted_dm_email'] = note.split('DM Email Pattern Hypothesis (MX Valid): ', 1)[1].split(',')[0].strip()
+        else:
+            compact['predicted_dm_email'] = None
         return compact
     return record
 
@@ -954,8 +959,6 @@ async def process_domain(
     country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
     dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
-    # Must-Have #2: Запускаємо SERP-пошук CMO не лише коли dm_name is None,
-    # а й коли на сайті (зокрема на /impressum) знайдено лише не-маркетингового CEO без прямого LinkedIn
     if not dm_name or (not is_marketing_or_digital_role(dm_role) and not dm_linkedin_url):
         async with semaphore:
             serp_name, serp_role, serp_li, serp_found_str = await fetch_dm_via_serp_fallback(
@@ -1032,6 +1035,16 @@ async def process_domain(
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
             return seeded_rec
 
+    # v21.0: Спочатку обчислюємо predicted_dm_email, щоб передати його прямо у evaluate_qualification_v180 (next_best_action)
+    predicted_dm_email = None
+    if dm_name and not verify_person_email_match(dm_name, best_email):
+        dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
+        if dm_email_hyps and (not deliverability_check or 'domain_accepts_email' in deliverability_check):
+            predicted_dm_email = dm_email_hyps[0]
+            hyp_str = ', '.join(dm_email_hyps[:2])
+            hyp_note = f'DM Email Pattern Hypothesis (MX Valid): {hyp_str}'
+            email_source_note = f'{email_source_note} | {hyp_note}' if email_source_note else hyp_note
+
     linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
     (
         sales_readiness_verdict, icp_fit_tier, technical_signal_strength,
@@ -1040,25 +1053,16 @@ async def process_domain(
     ) = evaluate_qualification_v180(
         company_category, tech_info, best_email, best_email_type, primary_phone,
         dm_name, dm_role, dm_linkedin_url, dm_source_is_legal, dm_source_type,
-        linkedin_url, had_marketplace_pollution, pw_status_str
+        linkedin_url, had_marketplace_pollution, pw_status_str,
+        predicted_dm_email=predicted_dm_email,
     )
 
-    # Killer Feature #3: Додаємо виявлені Red Flags втрат рекламного трафіку в sales_opportunity
     red_flags = detect_broken_attribution_red_flags(
         tech_info, company_category, is_eu_gdpr=is_eu_gdpr, pw_used=pw_used_flag
     )
     if red_flags and company_category != 'Non-Profit / Education / Institution':
         rf_summary = '; '.join(red_flags[:2])
         sales_opportunity = f'Red Flag: {rf_summary} | {sales_opportunity}'
-
-    # Killer Feature #1: Якщо знайдено ім'я ЛПР, але на сайті немає його прямої пошти —
-    # генеруємо корпоративні гіпотези пошти ({f}.{last}@domain) у email_source_note
-    if dm_name and not verify_person_email_match(dm_name, best_email):
-        dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
-        if dm_email_hyps and deliverability_check and 'domain_accepts_email' in deliverability_check:
-            hyp_str = ', '.join(dm_email_hyps[:2])
-            hyp_note = f'DM Email Pattern Hypothesis (MX Valid): {hyp_str}'
-            email_source_note = f'{email_source_note} | {hyp_note}' if email_source_note else hyp_note
 
     if cache_tech_recovered and cache_sources_count > 0:
         cache_warn = (
