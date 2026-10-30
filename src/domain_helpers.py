@@ -45,6 +45,13 @@ TECH_FLAG_TO_NAME_MAP = (
     ('has_sgtm', 'Server-Side GTM (sGTM)'),
 )
 
+SECONDARY_UX_WIDGET_TECHS = {
+    'Microsoft Clarity',
+    'Hotjar',
+    'Intercom',
+    'Pinterest Tag',
+}
+
 SALES_ACTIONABILITY_ENUM_VALUES = (
     'sales_ready',
     'partnership',
@@ -125,12 +132,6 @@ def sanitize_cached_phones(
     raw_all_phones: str | None,
     target_region: str = 'US',
 ) -> tuple[str | None, str | None, str | None]:
-    """
-    Баг №2 Fix (v21.1):
-    Очищує отруєні короткі телефони з KV-кешу (наприклад, '+49 1649' на liki24.com або '+49 1699' на coolblue.nl),
-    перевіряючи кожен номер через _is_acceptable_e164_length.
-    Повертає (clean_primary_phone, clean_e164_phone, clean_all_phones).
-    """
     reg = (target_region or 'US').upper().strip()
     valid_list: list[str] = []
     candidates = []
@@ -330,8 +331,16 @@ def merge_missing_techs_from_cache(
     pw_used_flag: bool,
     pw_had_timeout_or_block: bool,
 ) -> tuple[dict, bool, int]:
+    """
+    Колізія №1 Fix (v21.2 Gold Master):
+    Якщо живий скан не мав таймаутів/блоків (not pw_had_timeout_or_block and live_comp == 'full'),
+    знайшов живе ядро стеку (has_ga4_live and has_gtm_live та len(curr_techs) >= 4), а з кешу
+    відсутні лише другорядні UX-віджети (напр. Microsoft Clarity на cher17.com),
+    залишаємо tech_scan_completeness = 'full' без штрафу -15 балів!
+    """
     curr_techs = tech_info.get('detected_technologies_list') or []
     has_ga4_live = bool(tech_info.get('has_ga4'))
+    has_gtm_live = bool(tech_info.get('has_gtm'))
     live_comp = tech_info.get('tech_scan_completeness', 'full')
 
     raw_t = c_rec.get('detected_technologies') or ''
@@ -344,11 +353,17 @@ def merge_missing_techs_from_cache(
     if c_rec.get('_partial_write') and has_ga4_live and len(curr_techs) >= len(cached_techs):
         return tech_info, False, 0
 
+    missing_techs = [t for t in cached_techs if t not in curr_techs]
+    missing_core_techs = [t for t in missing_techs if t not in SECONDARY_UX_WIDGET_TECHS]
+
     live_is_clean_full = (
         has_ga4_live
         and not pw_had_timeout_or_block
         and live_comp == 'full'
-        and len(curr_techs) >= len(cached_techs)
+        and (
+            len(curr_techs) >= len(cached_techs)
+            or (has_gtm_live and len(curr_techs) >= 4 and not missing_core_techs)
+        )
     )
 
     if live_is_clean_full:
@@ -365,7 +380,6 @@ def merge_missing_techs_from_cache(
     if not cached_techs:
         return tech_info, False, 0
 
-    missing_techs = [t for t in cached_techs if t not in curr_techs]
     if not missing_techs and has_ga4_live:
         return tech_info, False, 0
 
@@ -380,7 +394,7 @@ def merge_missing_techs_from_cache(
         pw_had_timeout_or_block,
         live_found_something,
         live_comp,
-        has_ga4_live and not missing_techs,
+        has_ga4_live and not missing_core_techs,
     )
 
     cache_sources_count = 0
@@ -505,10 +519,18 @@ def sanitize_cached_dms(
 
 
 def contact_link_priority(url: str) -> tuple[int, int]:
+    """
+    Колізія №2 Fix (v21.2 Gold Master):
+    Додано 'partner', 'b2b', 'wholesale', 'kooperation', 'seller' у пріоритет 1,
+    щоб сторінки типу /hilfe-kontakt/partner-werden (docmorris.de) завжди потрапляли в allowed_sub_links[:4].
+    """
     path = urlparse(url).path.lower()
     if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return (0, len(path))
-    if any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto', 'get-in-touch')):
+    if any(k in path for k in (
+        'partner', 'b2b', 'wholesale', 'kooperation', 'seller',
+        'contact', 'kontakt', 'kontakty', 'contatti', 'contacto', 'get-in-touch'
+    )):
         return (1, len(path))
     if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'zespol', 'equipe')):
         return (2, len(path))
