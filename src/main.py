@@ -36,6 +36,7 @@ from .contacts import (
     rank_and_clean_emails,
     verify_email_deliverability_deep,
     verify_person_email_match,
+    verify_predicted_emails_via_api,
 )
 from .domain_helpers import (
     KNOWN_POISONED_CACHE_RECOVERY,
@@ -62,6 +63,7 @@ from .domain_helpers import (
     resolve_cache_merged_completeness,
     resolve_effective_phone_region,
     sanitize_cached_dms,
+    sanitize_cached_phones,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -162,6 +164,8 @@ async def process_domain(
     thread_pool: ThreadPoolExecutor,
     semaphore: asyncio.Semaphore,
     serper_api_key: str | None = None,
+    reoon_api_key: str | None = None,
+    millionverifier_api_key: str | None = None,
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
@@ -329,12 +333,25 @@ async def process_domain(
                         continue
 
                     cached_copy = {k: v for k, v in cached_record.items() if not k.startswith('_')}
+                    _cached_eff_reg = resolve_effective_phone_region(canonical_domain, default_region, '')
+                    c_p, c_e164, c_all_p = sanitize_cached_phones(
+                        cached_copy.get('primary_phone'),
+                        cached_copy.get('all_phones'),
+                        _cached_eff_reg,
+                    )
+                    cached_copy['primary_phone'] = c_p
+                    cached_copy['e164_phone'] = c_e164
+                    cached_copy['all_phones'] = c_all_p
+                    if not c_p:
+                        cached_copy['phone_source_url'] = None
+
                     cached_copy['input_domain'] = domain_key
                     cached_copy['canonical_domain'] = canonical_domain
                     cached_copy['aliases'] = aliases_str
                     cached_copy['input_was_redirected'] = was_redirected
                     cached_copy['redirect_chain'] = redirect_chain_str
-                    cached_copy['status'] = f"cached_{cached_copy['status']} (live_{fail_status})"
+                    base_st = 'success' if (cached_copy.get('best_email') or c_p) else 'no_contacts_found'
+                    cached_copy['status'] = f"cached_{base_st} (live_{fail_status})"
                     cached_copy['cached_snapshot_source'] = 'evergreen_cache' if is_evergreen else 'versioned_cache'
                     cached_copy['cached_snapshot_age_days'] = age_days if age_days is not None else 0
                     cached_copy['error_message'] = truncate_error_msg(
@@ -843,6 +860,8 @@ async def process_domain(
 
     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
+    # Баг №2 Fix (v21.1): Під час відновлення контактів із кешу обов'язково фільтруємо телефон
+    # через sanitize_cached_phones(..., effective_region), щоб старий +49 1649 на liki24.com миттєво відсіявся!
     if not ranked_emails_with_src and cache_store is not None:
         for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
             try:
@@ -855,7 +874,13 @@ async def process_domain(
                         if extra_em.strip():
                             email_sources.setdefault(extra_em.strip(), c_src)
                     if not phone_map and c_rec.get('primary_phone'):
-                        phone_map[str(c_rec['primary_phone']).strip()] = (50, str(c_rec.get('phone_source_url') or clean_website_url))
+                        clean_c_phone, _, _ = sanitize_cached_phones(
+                            c_rec.get('primary_phone'),
+                            c_rec.get('all_phones'),
+                            effective_region,
+                        )
+                        if clean_c_phone:
+                            phone_map[clean_c_phone] = (50, str(c_rec.get('phone_source_url') or clean_website_url))
                     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
                     break
             except Exception:
@@ -1035,15 +1060,29 @@ async def process_domain(
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
             return seeded_rec
 
-    # v21.0: Спочатку обчислюємо predicted_dm_email, щоб передати його прямо у evaluate_qualification_v180 (next_best_action)
     predicted_dm_email = None
     if dm_name and not verify_person_email_match(dm_name, best_email):
         dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
         if dm_email_hyps and (not deliverability_check or 'domain_accepts_email' in deliverability_check):
-            predicted_dm_email = dm_email_hyps[0]
-            hyp_str = ', '.join(dm_email_hyps[:2])
-            hyp_note = f'DM Email Pattern Hypothesis (MX Valid): {hyp_str}'
-            email_source_note = f'{email_source_note} | {hyp_note}' if email_source_note else hyp_note
+            # Якщо підключений Reoon / MillionVerifier — перевіряємо гіпотези на льоту і підставляємо валідну в best_email!
+            async with semaphore:
+                verified_dm_em, verified_dm_note = await verify_predicted_emails_via_api(
+                    client, dm_email_hyps, reoon_api_key=reoon_api_key, millionverifier_api_key=millionverifier_api_key
+                )
+            if verified_dm_em:
+                best_email = verified_dm_em
+                best_email_type = 'personal_or_named_inbox'
+                email_domain = f'{canonical_domain} (matches_site)'
+                email_source_type = 'pattern_verified_api'
+                email_source_note = f'Verified DM personal email via API ({verified_dm_note})'
+                deliverability_check = f'{deliverability_check}; {verified_dm_note}' if deliverability_check else verified_dm_note
+                if verified_dm_em not in all_emails_list:
+                    all_emails_list.insert(0, verified_dm_em)
+            else:
+                predicted_dm_email = dm_email_hyps[0]
+                hyp_str = ', '.join(dm_email_hyps[:2])
+                hyp_note = f'DM Email Pattern Hypothesis (MX Valid): {hyp_str}'
+                email_source_note = f'{email_source_note} | {hyp_note}' if email_source_note else hyp_note
 
     linkedin_url = socials_with_source.get('linkedin', (None, None))[0]
     (
@@ -1247,6 +1286,8 @@ async def main() -> None:
         proxy_settings = actor_input.get('proxyConfiguration')
         output_view = str(actor_input.get('outputView') or 'full_audit').strip()
         serper_api_key = actor_input.get('serperApiKey') or actor_input.get('serper_api_key')
+        reoon_api_key = actor_input.get('reoonApiKey') or actor_input.get('reoon_api_key')
+        millionverifier_api_key = actor_input.get('millionVerifierApiKey') or actor_input.get('millionverifier_api_key')
 
         user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
         manual_seeds = {**DEFAULT_MANUAL_SEEDS}
@@ -1300,6 +1341,8 @@ async def main() -> None:
                             scan_contacts, unpack_gtm, default_region, proxy_config,
                             cache_store, manual_seeds, thread_pool, semaphore,
                             serper_api_key=serper_api_key,
+                            reoon_api_key=reoon_api_key,
+                            millionverifier_api_key=millionverifier_api_key,
                         ),
                         domain_key, initial_aliases,
                     )
