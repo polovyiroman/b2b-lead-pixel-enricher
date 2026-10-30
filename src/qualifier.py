@@ -283,6 +283,7 @@ def build_sales_hook(
     dm_linkedin_url: str | None,
     best_email: str | None,
     is_eu_gdpr: bool = False,
+    pw_used: bool = False,
 ) -> str:
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
@@ -311,9 +312,17 @@ def build_sales_hook(
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
-    # Крок 2 Fix: Якщо домен у юрисдикції ЄС, крутить Google Ads, але не передає сигнали Google Consent Mode v2 (gcs/gcd)
+    # Критичний фікс #3: Спрацьовує ТІЛЬКИ якщо реально запускався браузер (pw_used=True)
+    # або якщо на сторінці знайдено активний CMP-банер (has_consent=True), але в GTM немає gtag('consent') / gcs / gcd.
+    # На статичних curl-сканах без банера (як docmorris.de) хибного попередження більше немає!
     cm_v2_gap_note = ''
-    if is_eu_gdpr and has_gads and not has_cm_v2 and tech_info.get('tech_scan_completeness') == 'full':
+    if (
+        is_eu_gdpr
+        and has_gads
+        and not has_cm_v2
+        and tech_info.get('tech_scan_completeness') == 'full'
+        and (pw_used or has_consent)
+    ):
         cm_v2_gap_note = ' [EU Consent Mode v2 gap: Google Ads active without gcs/gcd parameters observed]'
 
     paid_channels = [c for c, flag in (('Meta', has_meta), ('Google Ads', has_gads), ('TikTok', has_tiktok), ('LinkedIn', has_li)) if flag]
@@ -831,6 +840,7 @@ def build_manual_seed_record(
         seed.get('decision_maker_linkedin_url'),
         best_email,
         is_eu_gdpr=is_eu_gdpr,
+        pw_used=False,
     )
 
     deliv_str = seed.get(
