@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 26
+CACHE_SCHEMA_VERSION = 27
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -18,9 +18,6 @@ SCHEMA_PHONE_REGEX = re.compile(
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
-# Баг №1 Fix (v21.1): Додано крапку у символьний клас піддомену (?!(?:[a-z0-9.-]+\.)?
-# щоб багаторівневі піддомени Google/DoubleClick (напр. stats.g.doubleclick.net, region1.google-analytics.com)
-# гарантовано виключалися і ніколи не давали хибний has_sgtm=True.
 SGTM_CUSTOM_LOADER_REGEX = re.compile(
     r'https?://(?!(?:[a-z0-9.-]+\.)?'
     r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
@@ -95,7 +92,7 @@ SOFT_404_TITLE_REGEX = re.compile(
 DM_SOURCE_BLACKLIST = re.compile(
     r'/(?:privacy|policy|datenschutz|gdpr|cookie|dmca|testimonial|testimonials|'
     r'reviews|case-studies|case-study|clients|stories|politique-de-confidentialite|'
-    r'privacidad|polityka-prywatnosci|privacybeleid)\b',
+    r'privacidad|polityka-prywatnosci|privacybeleid|brands|brand|catalog|katalog)\b',
     re.IGNORECASE
 )
 DM_LEGAL_SOURCE_FLAG = re.compile(
@@ -184,11 +181,13 @@ TESTIMONIAL_TEXT_MARKERS = (
     'client review', 'case study', 'дякуємо команді', 'користуємося сервісом',
     'kundenstimmen', 'das sagen unsere kunden', 'referenzen', 'témoignages',
     'avis clients', 'testimonios', 'opiniones de clientes', 'recensioni',
-    'opinie klientów', 'klantervaringen'
+    'opinie klientów', 'klantervaringen', 'what experts say', 'trusted by'
 )
 
+# Баг №3 Fix (v21.3): Додано світових авторів цитат на SaaS-лендингах (Neil Patel, Rand Fishkin, Brian Dean)
 FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
-    'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич'
+    'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич',
+    'neil patel', 'ніл патель', 'нил патель', 'rand fishkin', 'brian dean', 'gary vaynerchuk'
 }
 
 CORPORATE_ENTITY_TOKENS = {
@@ -204,9 +203,10 @@ CORPORATE_ENTITY_TOKENS = {
     'global', 'europe', 'deutschland', 'germany', 'austria', 'switzerland', 'schweiz',
     'commerce', 'retail', 'trading', 'trade', 'handels', 'handel', 'vertriebs',
     'apotheke', 'versandapotheke', 'pharma', 'healthcare', 'medical', 'klinik',
-    'bpo', 'gfh'
+    'bpo', 'gfh', 'premium', 'quality'
 }
 
+# Баг №2 Fix (v21.3): Додано географічні макрорегіони (Latin, America, North, South, Central, Asia, Pacific, Middle, East, Africa)
 CITY_NAMES_BLACKLIST = {
     'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
     'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
@@ -229,7 +229,11 @@ CITY_NAMES_BLACKLIST = {
     'new york', 'los angeles', 'chicago', 'houston', 'phoenix', 'philadelphia',
     'san antonio', 'san diego', 'dallas', 'austin', 'san jose', 'san francisco',
     'seattle', 'denver', 'boston', 'atlanta', 'miami', 'katy', 'irving', 'plano',
-    'wilmington', 'dover', 'delaware', 'california', 'texas', 'florida', 'limassol', 'nicosia'
+    'wilmington', 'dover', 'delaware', 'california', 'texas', 'florida', 'limassol', 'nicosia',
+    'latin', 'america', 'americas', 'north', 'south', 'central', 'eastern', 'western',
+    'northern', 'southern', 'asia', 'pacific', 'apac', 'emea', 'latam', 'middle', 'east',
+    'africa', 'ukraina', 'ukraine', 'poland', 'polska', 'france', 'spain', 'italia', 'italy',
+    'nederland', 'netherlands', 'belgium', 'nordic', 'nordics', 'baltics', 'baltic'
 }
 
 UI_ACTION_WORDS_BLACKLIST = {
@@ -239,7 +243,9 @@ UI_ACTION_WORDS_BLACKLIST = {
     'read', 'more', 'view', 'author', 'speaker', 'expert', 'blog', 'article',
     'client', 'building', 'link', 'seo', 'ppc', 'smm', 'growth', 'team', 'about',
     'mehr', 'weiterlesen', 'kontakt', 'impressum', 'lire', 'suite', 'ver', 'más',
-    'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere'
+    'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere',
+    'premium', 'quality', 'best', 'top', 'original', 'official', 'exclusive', 'standard',
+    'luxury', 'high', 'super', 'ultra', 'smart', 'pro', 'plus', 'max', 'prime'
 }
 
 DEPARTMENT_PREFIX_BLACKLIST = {
@@ -257,20 +263,20 @@ DEPARTMENT_PREFIX_BLACKLIST = {
     'recht', 'finanzen', 'personal', 'einkauf', 'vertrieb', 'logistik', 'konzern',
     'gruppe', 'unternehmen', 'immer', 'durabilité', 'stratégie', 'responsabilité',
     'sostenibilità', 'strategia', 'responsabilità', 'comunicazione', 'stampa',
-    'laadpalen', 'zonnepanelen', 'energie', 'installatie'
+    'laadpalen', 'zonnepanelen', 'energie', 'installatie', 'regional', 'national'
 }
 DEPARTMENT_PREFIX_BLACKLIST.update(CORPORATE_ENTITY_TOKENS)
 
 ROLE_TOKEN_BLACKLIST = {
     'officer', 'director', 'manager', 'president', 'chief', 'head', 'lead',
-    'partner', 'chairman', 'executive', 'founder', 'cofounder', 'co-founder',
+    'partner', 'chairman', 'executive', 'founder', 'cofounder', 'co-founder', 'founders',
     'owner', 'vice', 'deputy', 'general', 'commercial', 'marketing', 'digital',
     'ceo', 'cmo', 'cto', 'coo', 'cfo', 'vp', 'svp', 'avp', 'admin', 'editor',
     'директор', 'директорка', 'керівник', 'керівниця', 'начальник', 'президент',
     'засновник', 'засновниця', 'співзасновник', 'співзасновниця', 'власник',
     'власниця', 'голова', 'заступник', 'менеджер', 'партнер', 'ректор', 'декан',
     'керівники', 'менеджери', 'директори', 'засновники', 'співробітники', 'власники',
-    'executives', 'managers', 'directors', 'founders', 'employees', 'owners',
+    'executives', 'managers', 'directors', 'employees', 'owners',
     'leitung', 'führungskräfte', 'dirigeants', 'directivos', 'dirigenti', 'bestuurders',
     'geschäftsführer', 'geschäftsführerin', 'geschäftsführung', 'inhaber', 'inhaberin',
     'gründer', 'gründerin', 'mitgründer', 'vorstand', 'vorstandsvorsitzender',
@@ -346,6 +352,7 @@ ROLE_NORMALIZATION_MAP = {
     'aufsichtsratsvorsitzender': 'Chairman of the Supervisory Board',
     'pdg': 'Chief Executive Officer (CEO)',
     'président-directeur général': 'Chief Executive Officer (CEO)',
+    'president': 'President',
     'président': 'President / CEO',
     'présidente': 'President / CEO',
     'directeur général': 'Managing Director / CEO',
@@ -376,6 +383,7 @@ ROLE_NORMALIZATION_MAP = {
     'administrerende direktør': 'Managing Director / CEO',
     'daglig leder': 'Managing Director / CEO',
     'founder': 'Founder',
+    'founders': 'Co-Founder',
     'засновник': 'Founder',
     'засновниця': 'Founder',
     'gründer': 'Founder',
@@ -471,15 +479,32 @@ STOP_NAME_WORDS = {
     'Brussels', 'Stockholm', 'Oslo', 'Copenhagen', 'Helsinki', 'Lisbon', 'Warsaw',
     'Warszawa', 'Prague', 'Praha', 'Budapest', 'Kyiv', 'Kiev', 'Lviv', 'Kharkiv', 'Odesa',
     'Katy', 'Austin', 'Dallas', 'Houston', 'Capital', 'Gesellschaft', 'Verwaltungs',
-    'Verwaltung', 'Beteiligungs', 'BPO', 'GFH'
+    'Verwaltung', 'Beteiligungs', 'BPO', 'GFH',
+    'Premium', 'Quality', 'Best', 'Top', 'Original', 'Exclusive', 'Standard', 'Luxury',
+    'Latin', 'America', 'Americas', 'North', 'South', 'Central', 'Eastern', 'Western',
+    'Northern', 'Southern', 'Asia', 'Pacific', 'Middle', 'East', 'Africa', 'Global',
+    'National', 'Regional', 'Europe', 'European'
 }
 
+# Баг №6 Fix (v21.3): Додано європейські діакритичні символи (польські ś, ć, ł, ń, ą, ę, ź, ż; німецькі ö, ü, ä, ß; чеські/французькі/скандинавські)
+# щоб Bartosz Kliś -> b.klis@notino.de (а не b.kli@notino.de), Ronny Höhn -> r.hoehn@bergfreunde.de
 UA_TO_LATIN = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g', 'д': 'd', 'е': 'e',
     'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y',
     'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
     'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
-    'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya', '\'': '', '’': ''
+    'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya',
+    'ы': 'y', 'э': 'e', 'ъ': '', 'ё': 'yo',
+    'ś': 's', 'ć': 'c', 'ł': 'l', 'ń': 'n', 'ą': 'a', 'ę': 'e', 'ź': 'z', 'ż': 'z', 'ó': 'o',
+    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss',
+    'č': 'c', 'ď': 'd', 'ě': 'e', 'ň': 'n', 'ř': 'r', 'š': 's', 'ť': 't', 'ů': 'u', 'ž': 'z', 'ý': 'y',
+    'á': 'a', 'à': 'a', 'â': 'a', 'ã': 'a', 'å': 'a', 'æ': 'ae',
+    'ç': 'c', 'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
+    'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
+    'ñ': 'n', 'ò': 'o', 'ô': 'o', 'õ': 'o', 'ø': 'o',
+    'ú': 'u', 'ù': 'u', 'û': 'u', 'ÿ': 'y',
+    'ă': 'a', 'î': 'i', 'ș': 's', 'ț': 't', 'ş': 's', 'ţ': 't', 'ğ': 'g', 'ı': 'i',
+    '\'': '', '’': ''
 }
 
 JUNK_EMAIL_DOMAINS = {
