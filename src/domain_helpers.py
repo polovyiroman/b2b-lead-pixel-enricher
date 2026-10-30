@@ -16,6 +16,7 @@ from .config import (
     compute_snapshot_age_days,
 )
 from .contacts import (
+    _is_acceptable_e164_length,
     is_valid_person_name,
     normalize_executive_role,
     strip_role_tokens_from_name,
@@ -119,6 +120,41 @@ PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
 MIN_VALID_RESCUE_HTML_BYTES = 2500
 
 
+def sanitize_cached_phones(
+    raw_primary_phone: str | None,
+    raw_all_phones: str | None,
+    target_region: str = 'US',
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Баг №2 Fix (v21.1):
+    Очищує отруєні короткі телефони з KV-кешу (наприклад, '+49 1649' на liki24.com або '+49 1699' на coolblue.nl),
+    перевіряючи кожен номер через _is_acceptable_e164_length.
+    Повертає (clean_primary_phone, clean_e164_phone, clean_all_phones).
+    """
+    reg = (target_region or 'US').upper().strip()
+    valid_list: list[str] = []
+    candidates = []
+    if raw_primary_phone and str(raw_primary_phone).strip():
+        candidates.append(str(raw_primary_phone).strip())
+    if raw_all_phones:
+        for p in str(raw_all_phones).split(';'):
+            p_str = p.strip()
+            if p_str and p_str not in candidates:
+                candidates.append(p_str)
+
+    for p_cand in candidates:
+        e164_cand = re.sub(r'[^\d+]', '', p_cand)
+        if _is_acceptable_e164_length(e164_cand, reg):
+            valid_list.append(p_cand)
+
+    if not valid_list:
+        return None, None, None
+
+    best_p = valid_list[0]
+    best_e164 = re.sub(r'[\s\-()]', '', best_p)
+    return best_p, best_e164, '; '.join(valid_list[:3])
+
+
 def derive_sales_actionability_class(
     sales_readiness_verdict: str | None,
     company_category: str = '',
@@ -162,6 +198,8 @@ def has_verified_sgtm_in_cache(c_rec: dict) -> bool:
     if not c_rec.get('has_sgtm'):
         return False
     ev_str = str(c_rec.get('technology_evidence') or '')
+    if 'doubleclick.net' in ev_str.lower() and not SGTM_CUSTOM_LOADER_REGEX.search(ev_str):
+        return False
     return bool(
         SGTM_CUSTOM_LOADER_REGEX.search(ev_str)
         or SGTM_FIRST_PARTY_COLLECT_REGEX.search(ev_str)
@@ -373,10 +411,12 @@ def merge_missing_techs_from_cache(
         'has_pinterest_tag': bool(c_rec.get('has_pinterest_tag') or tech_info.get('has_pinterest_tag') or ('Pinterest Tag' in merged_techs)),
         'has_hubspot': bool(c_rec.get('has_hubspot') or tech_info.get('has_hubspot') or ('HubSpot' in merged_techs)),
         'has_klaviyo': bool(c_rec.get('has_klaviyo') or tech_info.get('has_klaviyo') or ('Klaviyo' in merged_techs)),
+        'has_esp_retention': bool(tech_info.get('has_esp_retention')),
         'has_ga4': has_ga4_merged,
         'has_gtm': bool(c_rec.get('has_gtm') or tech_info.get('has_gtm') or ('Google Tag Manager' in merged_techs)),
         'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
         'has_consent_mode_v2_signals': bool(tech_info.get('has_consent_mode_v2_signals')),
+        'duplicate_ga4_ids': tech_info.get('duplicate_ga4_ids') or [],
         'all_ga4_ids': capped_ga4_ids,
         'all_ga4_ids_count': true_ga4_cnt if true_ga4_cnt > 0 else None,
         'ga4_detection_confidence': capped_ga4_conf,
