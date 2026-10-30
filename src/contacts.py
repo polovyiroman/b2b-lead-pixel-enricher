@@ -6,6 +6,12 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
+try:
+    import phonenumbers
+    _PHONENUMBERS_AVAILABLE = True
+except ImportError:
+    _PHONENUMBERS_AVAILABLE = False
+
 from .config import (
     B2B_PARTNERSHIP_PREFIXES,
     B2B_PHONE_KEYWORDS,
@@ -47,11 +53,27 @@ from .config import (
     UI_ACTION_WORDS_BLACKLIST,
     VERTRETEN_DURCH_PATTERN,
     WHOLESALE_MERCH_PREFIXES,
-    clean_url_port,
 )
 
 _DNS_MX_CACHE: dict[str, str] = {}
 _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
+
+GENERIC_SINGLE_WORD_LOCALS = {
+    'ask', 'dclub', 'return', 'returns', 'club', 'bonus', 'loyalty', 'card',
+    'cards', 'gift', 'gifts', 'promo', 'action', 'actions', 'subscribe',
+    'sub', 'news', 'app', 'apps', 'mobile', 'web', 'site', 'portal', 'b2c',
+    'retail', 'opt', 'pay', 'payment', 'payments', 'delivery', 'shipping',
+    'track', 'tracking', 'status', 'order', 'orders', 'claim', 'claims',
+    'warranty', 'repair', 'service', 'services', 'feedback', 'review',
+    'reviews', 'rating', ' career', 'work', 'talent', 'people', 'culture',
+    'events', 'event', 'webinar', 'demo', 'trial', 'free', 'start', 'join',
+    'hello', 'hi', 'hey', 'info', 'mail', 'email', 'contact', 'contacts',
+    'office', 'team', 'support', 'help', 'care', 'sales', 'partner',
+    'partners', 'b2b', 'press', 'media', 'pr', 'legal', 'privacy', 'gdpr',
+    'dpo', 'compliance', 'security', 'abuse', 'post', 'inbox', 'general',
+    'external', 'internal', 'ip', 'it', 'dev', 'tech', 'api', 'sdk', 'bot',
+    'system', 'notifications', 'notify', 'alert', 'alerts', 'billing',
+}
 
 
 def decode_cf_email(cf_hex: str) -> str | None:
@@ -140,7 +162,7 @@ def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
     if not dm_name or not email or '@' not in email:
         return False
     local = email.split('@', 1)[0].lower()
-    if local in NON_PERSON_TOKENS:
+    if local in NON_PERSON_TOKENS or local in GENERIC_SINGLE_WORD_LOCALS:
         return False
     parts = [transliterate_ua_to_latin(p) for p in dm_name.split() if len(p) >= 2]
     if len(parts) < 2:
@@ -160,7 +182,7 @@ def verify_person_linkedin_match(dm_name: str | None, linkedin_url: str | None) 
         return False
     slug = linkedin_url.lower().split('linkedin.com/in/', 1)[1].split('/')[0].split('?')[0]
     slug_clean = re.sub(r'[^a-z]', '', slug)
-    parts = [ re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2 ]
+    parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2]
     parts = [p for p in parts if len(p) >= 3]
     if len(parts) < 2:
         return False
@@ -180,6 +202,12 @@ def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tup
 
 
 def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
+    """
+    Критичний фікс #1 (v20.18 Rollback & Hardening):
+    1. Підтримує формат 'ініціал.прізвище@domain' (напр. a.glazyrina@inweb.ua, r.skrupnyk@inweb.ua) -> 'personal_or_named_inbox'.
+    2. НЕ класифікує дефісні технічні пошти типу 'ip-external@grammarly.com' як іменні (іменний роздільник лише '.' або '_').
+    3. НЕ класифікує однотокенні загальні скриньки типу 'ask@inweb.ua', 'dclub@intertop.ua', 'return@intertop.ua' як іменні.
+    """
     if not email or '@' not in email:
         return None
     local, dom = email.lower().strip().split('@', 1)
@@ -215,14 +243,76 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if _matches_prefix_safely(local, tokens, GENERAL_OFFICE_PREFIXES):
         return 'general_office_inbox'
 
-    if len(tokens) == 2 and all(len(t) >= 2 and t.isalpha() and t not in NON_PERSON_TOKENS for t in tokens):
-        return 'personal_or_named_inbox'
-    if len(tokens) == 1 and local.isalpha() and 3 <= len(local) <= 12 and local not in NON_PERSON_TOKENS:
-        if b_low and local == b_low:
-            return 'general_office_inbox'
-        return 'personal_or_named_inbox'
+    # Іменні пошти дозволені ТІЛЬКИ якщо в локальній частині немає дефіса (відсікає ip-external@grammarly.com)
+    # і є рівно 2 токени, розділені крапкою або підкресленням:
+    # або "ім'я.прізвище" (обидва >= 2), або "ініціал.прізвище" (len(t1)==1 та len(t2)>=3, як a.glazyrina@inweb.ua)
+    if '-' not in local and ('_' in local or '.' in local):
+        dot_tokens = [t for t in re.split(r'[._]+', local) if t]
+        if len(dot_tokens) == 2:
+            t1, t2 = dot_tokens[0], dot_tokens[1]
+            if (
+                t1.isalpha()
+                and t2.isalpha()
+                and t1 not in NON_PERSON_TOKENS
+                and t2 not in NON_PERSON_TOKENS
+                and t1 not in GENERIC_SINGLE_WORD_LOCALS
+                and t2 not in GENERIC_SINGLE_WORD_LOCALS
+                and (not b_low or (t1 != b_low and t2 != b_low))
+            ):
+                if (len(t1) >= 2 and len(t2) >= 2) or (len(t1) == 1 and len(t2) >= 3) or (len(t1) >= 3 and len(t2) == 1):
+                    return 'personal_or_named_inbox'
 
     return 'department_or_general_inbox'
+
+
+def generate_dm_email_pattern_candidates(
+    dm_name: str | None,
+    canonical_domain: str,
+    observed_emails: list[str] | None = None,
+) -> list[str]:
+    """
+    Killer Feature #1: Генератор гіпотез корпоративної пошти ЛПР (Email Pattern Permutation).
+    Якщо на домені вже є іменна пошта (напр. a.glazyrina@inweb.ua -> шаблон {f}.{last}@domain),
+    будує точну адресу для знайденого ЛПР (напр. o.mamontov@inweb.ua або i.shevkoplyas@sendpulse.com).
+    """
+    if not dm_name or not canonical_domain:
+        return []
+    dom = canonical_domain.lower().strip().replace('www.', '')
+    if not dom or dom in PUBLIC_WEBMAIL_DOMAINS:
+        return []
+
+    raw_parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2]
+    parts = [p for p in raw_parts if len(p) >= 2]
+    if len(parts) < 2:
+        return []
+
+    first, last = parts[0], parts[-1]
+    f_init = first[0]
+
+    # Перевіряємо, який шаблон вже використовується на домені
+    detected_pattern = None
+    for em in (observed_emails or []):
+        if '@' not in em:
+            continue
+        loc, em_dom = em.lower().strip().split('@', 1)
+        if em_dom != dom or '-' in loc:
+            continue
+        if '.' in loc:
+            sub = loc.split('.')
+            if len(sub) == 2 and sub[0].isalpha() and sub[1].isalpha():
+                if len(sub[0]) == 1 and len(sub[1]) >= 3:
+                    detected_pattern = 'f.last'
+                    break
+                if len(sub[0]) >= 2 and len(sub[1]) >= 2:
+                    detected_pattern = 'first.last'
+                    break
+
+    if detected_pattern == 'f.last':
+        return [f'{f_init}.{last}@{dom}', f'{first}.{last}@{dom}', f'{first}@{dom}']
+    if detected_pattern == 'first.last':
+        return [f'{first}.{last}@{dom}', f'{f_init}.{last}@{dom}', f'{first}@{dom}']
+
+    return [f'{f_init}.{last}@{dom}', f'{first}.{last}@{dom}', f'{first}@{dom}']
 
 
 def is_valid_Scraped_email(email: str, canonical_domain: str) -> tuple[bool, bool]:
@@ -339,6 +429,36 @@ def extract_named_email_owner_hint(
     return None
 
 
+async def query_doh_json(
+    client: AsyncSession,
+    domain: str,
+    record_type: str = 'MX'
+) -> tuple[bool, list[dict]]:
+    """
+    Відновлений двокроковий DoH-резолвер із fallback на пряме з'єднання (use_direct in (False, True)),
+    щоб проксі ніколи не ламав перевірку MX/SPF.
+    """
+    doh_endpoints = (
+        f'https://dns.google/resolve?name={domain}&type={record_type}',
+        f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
+        f'https://dns.quad9.net:5053/dns-query?name={domain}&type={record_type}',
+    )
+    for use_direct in (False, True):
+        for ep in doh_endpoints:
+            try:
+                kwargs: dict = {'headers': {'Accept': 'application/dns-json'}, 'timeout': 4.0}
+                if use_direct:
+                    kwargs['proxy'] = None
+                resp = await client.get(ep, **kwargs)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    answers = data.get('Answer') or []
+                    return True, answers
+            except Exception:
+                continue
+    return False, []
+
+
 async def verify_email_deliverability_deep(
     client: AsyncSession,
     email: str | None,
@@ -358,24 +478,7 @@ async def verify_email_deliverability_deep(
         if dom in _DNS_MX_CACHE:
             return _DNS_MX_CACHE[dom]
 
-        doh_endpoints = (
-            f'https://dns.google/resolve?name={dom}&type=MX',
-            f'https://cloudflare-dns.com/dns-query?name={dom}&type=MX',
-        )
-        mx_answers = []
-        dns_ok = False
-        for ep in doh_endpoints:
-            try:
-                resp = await client.get(ep, headers={'Accept': 'application/dns-json'}, timeout=4.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    dns_ok = True
-                    mx_answers = data.get('Answer') or []
-                    if mx_answers:
-                        break
-            except Exception:
-                continue
-
+        dns_ok, mx_answers = await query_doh_json(client, dom, 'MX')
         if not dns_ok:
             res = 'dns_lookup_timeout_or_error (verify_manually)'
             _DNS_MX_CACHE[dom] = res
@@ -398,18 +501,8 @@ async def verify_email_deliverability_deep(
         else:
             provider = 'Custom MX'
 
-        spf_present = False
-        try:
-            txt_resp = await client.get(
-                f'https://dns.google/resolve?name={dom}&type=TXT',
-                headers={'Accept': 'application/dns-json'},
-                timeout=3.5
-            )
-            if txt_resp.status_code == 200:
-                txt_ans = txt_resp.json().get('Answer') or []
-                spf_present = any('v=spf1' in str(a.get('data', '')).lower() for a in txt_ans)
-        except Exception:
-            pass
+        _, txt_ans = await query_doh_json(client, dom, 'TXT')
+        spf_present = any('v=spf1' in str(a.get('data', '')).lower() for a in txt_ans)
 
         spf_tag = 'SPF_present' if spf_present else 'SPF_unverified'
         res = f'domain_accepts_email ({provider}; MX_found; {spf_tag})'
@@ -422,48 +515,92 @@ def extract_valid_phones(
     raw_tel_links: list[tuple[str, str]],
     default_region: str = 'US'
 ) -> list[tuple[str, int]]:
-    dial_pref = REGION_DIALING_PREFIX_MAP.get(default_region.upper(), '+1')
+    """
+    Критичний фікс #2 (v20.18 Rollback & Hardening):
+    Повернено валідацію через бібліотеку Google phonenumbers + region_bonus = 35 за збіг країни номера
+    з default_region домену (щоб на ringostat.com та livepage.ua перемагали українські +380 44...,
+    на chubbiesshorts.com / glossier.com відсікалися фейкові склейки, а на otto.de знаходився +49 40 64610).
+    """
+    target_region = (default_region or 'US').upper().strip()
+    expected_prefix = REGION_DIALING_PREFIX_MAP.get(target_region, '+1')
     candidates: dict[str, int] = {}
 
-    def _score_phone(raw_p: str, ctx: str, is_href: bool) -> None:
-        cleaned = re.sub(r'[^\d+]', '', raw_p)
-        if cleaned.startswith('00'):
-            cleaned = '+' + cleaned[2:]
-        digits_only = re.sub(r'\D', '', cleaned)
-        if len(digits_only) < 9 or len(digits_only) > 15:
+    def _add_validated_candidate(raw_str: str, ctx: str, base_score: int) -> None:
+        if not raw_str:
             return
-        if re.search(r'(\d)\1{6,}', digits_only):
-            return
-        if digits_only.startswith(('199', '200', '201', '202')) and len(digits_only) == 8:
-            return
-
-        if not cleaned.startswith('+'):
-            if default_region == 'UA' and digits_only.startswith('0') and len(digits_only) == 10:
-                cleaned = '+38' + digits_only
-            elif default_region == 'DE' and digits_only.startswith('0') and 10 <= len(digits_only) <= 12:
-                cleaned = '+49' + digits_only[1:]
-            elif len(digits_only) >= 10:
-                cleaned = f'{dial_pref}{digits_only[-10:]}' if dial_pref == '+1' else f'+{digits_only}'
-            else:
+        cleaned_raw = raw_str.strip()
+        if _PHONENUMBERS_AVAILABLE:
+            try:
+                parsed_num = phonenumbers.parse(cleaned_raw, target_region)
+                if not phonenumbers.is_valid_number(parsed_num):
+                    return
+                formatted_intl = phonenumbers.format_number(
+                    parsed_num, phonenumbers.PhoneNumberFormat.INTERNATIONAL
+                )
+                e164_str = phonenumbers.format_number(
+                    parsed_num, phonenumbers.PhoneNumberFormat.E164
+                )
+                num_region = (phonenumbers.region_code_for_number(parsed_num) or '').upper()
+            except Exception:
                 return
+        else:
+            digits = re.sub(r'\D', '', cleaned_raw)
+            if len(digits) < 9 or len(digits) > 15:
+                return
+            e164_str = cleaned_raw if cleaned_raw.startswith('+') else f'{expected_prefix}{digits[-10:]}'
+            formatted_intl = e164_str
+            num_region = target_region if e164_str.startswith(expected_prefix) else ''
 
-        score = 50 if is_href else 25
+        score = base_score
+        # Region bonus = 35: garantує пріоритет +380 на UA сайтах (ringostat.com, livepage.ua) над +1 номерами
+        if num_region == target_region or e164_str.startswith(expected_prefix):
+            score += 35
+
         ctx_low = (ctx or '').lower()
         if any(k in ctx_low for k in B2B_PHONE_KEYWORDS):
             score += 30
         elif any(k in ctx_low for k in RETAIL_PHONE_KEYWORDS):
             score -= 10
-        if cleaned not in candidates or score > candidates[cleaned]:
-            candidates[cleaned] = score
+
+        if formatted_intl not in candidates or score > candidates[formatted_intl]:
+            candidates[formatted_intl] = score
 
     for tel_str, ctx in raw_tel_links:
-        _score_phone(tel_str, ctx, True)
+        _add_validated_candidate(tel_str, ctx, 50)
 
-    for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', text):
-        val = m.group(0)
-        start = max(0, m.start() - 50)
-        end = min(len(text), m.end() + 50)
-        _score_phone(val, text[start:end], False)
+    if _PHONENUMBERS_AVAILABLE:
+        for match_region in dict.fromkeys((target_region, 'DE', 'UA', 'GB', 'US')):
+            try:
+                for m in phonenumbers.PhoneNumberMatcher(text[:120000], match_region):
+                    num_obj = m.number
+                    if not phonenumbers.is_valid_number(num_obj):
+                        continue
+                    intl_str = phonenumbers.format_number(
+                        num_obj, phonenumbers.PhoneNumberFormat.INTERNATIONAL
+                    )
+                    e164_s = phonenumbers.format_number(
+                        num_obj, phonenumbers.PhoneNumberFormat.E164
+                    )
+                    n_reg = (phonenumbers.region_code_for_number(num_obj) or '').upper()
+                    sc = 25
+                    if n_reg == target_region or e164_s.startswith(expected_prefix):
+                        sc += 35
+                    w_start = max(0, m.start - 50)
+                    w_end = min(len(text), m.end + 50)
+                    ctx_w = text[w_start:w_end].lower()
+                    if any(k in ctx_w for k in B2B_PHONE_KEYWORDS):
+                        sc += 30
+                    elif any(k in ctx_w for k in RETAIL_PHONE_KEYWORDS):
+                        sc -= 10
+                    if intl_str not in candidates or sc > candidates[intl_str]:
+                        candidates[intl_str] = sc
+            except Exception:
+                continue
+    else:
+        for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', text[:120000]):
+            w_start = max(0, m.start() - 50)
+            w_end = min(len(text), m.end() + 50)
+            _add_validated_candidate(m.group(0), text[w_start:w_end], 25)
 
     ranked = sorted(candidates.items(), key=lambda x: (-x[1], x[0]))
     return ranked[:3]
@@ -561,7 +698,7 @@ def _dm_role_priority_weight(role_str: str | None) -> int:
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
         return -30
-    if any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'growth', 'digital')):
+    if any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'growth', 'digital', 'performance')):
         return 24
     if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
         return 20
@@ -570,6 +707,11 @@ def _dm_role_priority_weight(role_str: str | None) -> int:
     if 'owner' in r_low:
         return 16
     return 10
+
+
+def is_marketing_or_digital_role(role_str: str | None) -> bool:
+    r_low = (role_str or '').lower()
+    return any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'ecommerce', 'growth', 'digital', 'performance', 'acquisition', 'cro', 'маркетинг'))
 
 
 def build_decision_makers_json_from_summary(
@@ -778,13 +920,6 @@ async def fetch_dm_via_serp_fallback(
     brand_root: str = '',
     serper_api_key: str | None = None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
-    """
-    Крок 1 (Автоматичний пошук ЛПР через Google SERP / Serper.dev):
-    Коли сайт не публікує імена CMO/CEO (як більшість великих інтернет-магазинів),
-    робить 1 легкий запит до Serper.dev із нашим decision_maker_search_query
-    і розбирає заголовки LinkedIn ('Ім'я Прізвище - Посада - Компанія | LinkedIn')
-    за допомогою наших детермінованих функцій strip_role_tokens_from_name та verify_person_linkedin_match.
-    """
     api_key = (serper_api_key or os.environ.get('SERPER_API_KEY') or '').strip()
     if not api_key or not search_query:
         return None, None, None, None
@@ -816,7 +951,6 @@ async def fetch_dm_via_serp_fallback(
             if not clean_li:
                 continue
 
-            # Типовий заголовок LinkedIn: "Іван Петренко - Chief Marketing Officer - Comfy | LinkedIn"
             title_no_suffix = re.sub(r'\s*[\|\-–—]\s*LinkedIn.*$', '', title, flags=re.I)
             segments = [s.strip() for s in re.split(r'\s+[\-–—|•]\s+', title_no_suffix) if s.strip()]
             if not segments:
