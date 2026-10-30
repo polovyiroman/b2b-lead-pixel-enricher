@@ -27,6 +27,7 @@ from .qualifier import (
     build_sales_hook,
     classify_company_category,
     compute_data_quality_score,
+    evaluate_qualification_v180,
 )
 from .scraper import (
     _is_safe_domain,
@@ -545,14 +546,6 @@ def _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn: Cal
 
 
 def _test_15_v2018_email_phone_consent_regressions_and_red_flags() -> str:
-    """
-    Test 15/15 (v20.18 Audit Fixes & Killer Features):
-    1. Verifies 'a.glazyrina@inweb.ua' is 'personal_or_named_inbox', while 'ask@inweb.ua',
-       'dclub@intertop.ua', 'return@intertop.ua', and 'ip-external@grammarly.com' are NOT personal.
-    2. Verifies extract_valid_phones prioritizes Ukrainian +380 over US +1 on UA domains (region_bonus=35).
-    3. Verifies static curl scan without CMP banner (docmorris.de) does NOT trigger false [EU Consent Mode v2 gap].
-    4. Verifies Duplicate GA4 Tagging red flag and DM email pattern permutation.
-    """
     for named_em, brand in (('a.glazyrina@inweb.ua', 'inweb'), ('r.skrupnyk@inweb.ua', 'inweb'), ('john.doe@company.com', 'company')):
         got_t = classify_email_type(named_em, brand)
         if got_t != 'personal_or_named_inbox':
@@ -612,6 +605,63 @@ def _test_15_v2018_email_phone_consent_regressions_and_red_flags() -> str:
     return "PASS (a.glazyrina@->personal, ask@/ip-external@->non-personal; +380 #1 on UA; DocMorris hook clean; RedFlags OK)"
 
 
+def _test_16_v210_no_fake_de_phones_and_dup_ga4_hook() -> str:
+    """
+    Test 16/16 (v21.0 Market-Ready Gate):
+    1. Ensures short numbers ('016 99', '016 49', '016 8176') on NL/UA pages NEVER parse as German +49 phones.
+    2. Ensures valid 9-digit Hamburg landline '+49 40 64610' on DE pages (otto.de) is preserved.
+    3. Ensures Duplicate GA4 Tagging is surfaced directly in build_sales_hook and predicted_dm_email in next_best_action.
+    """
+    nl_fake = extract_valid_phones('Error code 016 99 on Coolblue WAF page', [], default_region='NL')
+    ua_fake = extract_valid_phones('Артикул товару 016 49 або ціна 016 8176 грн', [], default_region='UA')
+    if nl_fake or ua_fake:
+        raise AssertionError(f"Fake short DE phone leaked on NL/UA region: nl={nl_fake}, ua={ua_fake}")
+
+    otto_phones = extract_valid_phones('Telefon: +49 40 64610', [('+49 40 64610', 'Impressum')], default_region='DE')
+    if not otto_phones or '+49 40 64610' not in otto_phones[0][0]:
+        raise AssertionError(f"Valid otto.de phone '+49 40 64610' was rejected: {otto_phones}")
+
+    intertop_hook = build_sales_hook(
+        'intertop.ua',
+        'E-commerce / Retail Brand',
+        {
+            'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)', 'Meta Pixel'],
+            'has_gtm': True,
+            'has_ga4': True,
+            'has_meta_pixel': True,
+            'duplicate_ga4_ids': ['G-XM6L5ZM306'],
+            'tech_scan_completeness': 'full',
+        },
+        None,
+        None,
+        None,
+        'office@intertop.ua',
+    )
+    if 'Duplicate GA4 Tagging (G-XM6L5ZM306' not in intertop_hook:
+        raise AssertionError(f"Duplicate GA4 Tagging missing from sales_hook: {intertop_hook}")
+
+    _, _, _, _, _, _, _, _, next_act = evaluate_qualification_v180(
+        'SaaS / Marketplace / Tech Platform',
+        {'detected_technologies_list': ['Google Analytics (GA4)'], 'has_ga4': True, 'tech_scan_completeness': 'full'},
+        'support@sendpulse.com',
+        'customer_support_inbox',
+        None,
+        'Ігор Шевкопляс',
+        'Head of Marketing',
+        None,
+        False,
+        'about_page',
+        None,
+        False,
+        'not_needed',
+        predicted_dm_email='i.shevkoplyas@sendpulse.ua',
+    )
+    if 'i.shevkoplyas@sendpulse.ua' not in next_act:
+        raise AssertionError(f"predicted_dm_email missing from next_best_action: {next_act}")
+
+    return "PASS (016 99 / 016 49 blocked on NL/UA; +49 40 64610 kept on DE; Dup GA4 in hook & DM email in next_action)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -637,6 +687,7 @@ def run_startup_regression_gate(
         ('test_13_subdomain_canonicalization', _test_13_subdomain_canonicalization),
         ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
         ('test_15_v2018_email_phone_consent_regressions_and_red_flags', _test_15_v2018_email_phone_consent_regressions_and_red_flags),
+        ('test_16_v210_no_fake_de_phones_and_dup_ga4_hook', _test_16_v210_no_fake_de_phones_and_dup_ga4_hook),
     ]
 
     passed_count = 0
