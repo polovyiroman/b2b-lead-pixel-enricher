@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 25
+CACHE_SCHEMA_VERSION = 26
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -18,8 +18,11 @@ SCHEMA_PHONE_REGEX = re.compile(
 
 GTM_ID_REGEX = re.compile(r'\bGTM-[A-Z0-9]{5,10}\b', re.IGNORECASE)
 
+# Баг №1 Fix (v21.1): Додано крапку у символьний клас піддомену (?!(?:[a-z0-9.-]+\.)?
+# щоб багаторівневі піддомени Google/DoubleClick (напр. stats.g.doubleclick.net, region1.google-analytics.com)
+# гарантовано виключалися і ніколи не давали хибний has_sgtm=True.
 SGTM_CUSTOM_LOADER_REGEX = re.compile(
-    r'https?://(?!(?:[a-z0-9-]+\.)?'
+    r'https?://(?!(?:[a-z0-9.-]+\.)?'
     r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
     r'doubleclick\.net|googleadservices\.com|googlesyndication\.com|'
     r'google\.com|googleapis\.com|gstatic\.com)\b)'
@@ -27,11 +30,8 @@ SGTM_CUSTOM_LOADER_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Проблема №2 Fix: Ловить first-party sGTM collector URL (напр. https://sgtm.brand.com/g/collect?v=2&tid=G-XXXX),
-# коли gtm.js завантажено зі стандартного googletagmanager.com, але суворо виключає домени Google/DoubleClick
-# і вимагає обов'язкової наявності параметра tid=G- у query string (щоб test_06 negative_3 залишався False).
 SGTM_FIRST_PARTY_COLLECT_REGEX = re.compile(
-    r'https?://(?!(?:[a-z0-9-]+\.)?'
+    r'https?://(?!(?:[a-z0-9.-]+\.)?'
     r'(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|'
     r'doubleclick\.net|googleadservices\.com|googlesyndication\.com|'
     r'google\.com|googleapis\.com|gstatic\.com)\b)'
@@ -595,8 +595,6 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
-# P2-D Fix: Додано productsafety / produktsicherheit / recall до LOW_PRIORITY_PREFIXES,
-# щоб на aboutyou.de не вигравав внутрішній комплаєнс-інбокс productsafety@aboutyou.com
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
