@@ -123,6 +123,15 @@ SDR_COMPACT_COLUMNS = (
     'data_confidence_warning',
 )
 
+LOW_VALUE_LIVE_EMAIL_TYPES = {
+    'customer_support_inbox',
+    'legal_or_hr_inbox',
+    'pr_and_media_inbox',
+    'influencer_gifting_inbox',
+    'department_or_general_inbox',
+    'admissions_or_department_inbox',
+}
+
 
 def format_record_for_output_view(record: dict, output_view: str = 'full_audit') -> dict:
     if (output_view or 'full_audit').lower().strip() == 'sdr_compact':
@@ -860,16 +869,19 @@ async def process_domain(
 
     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
-    # Баг №2 Fix (v21.1): Під час відновлення контактів із кешу обов'язково фільтруємо телефон
-    # через sanitize_cached_phones(..., effective_region), щоб старий +49 1649 на liki24.com миттєво відсіявся!
-    if not ranked_emails_with_src and cache_store is not None:
+    # Колізія №2 Fix (v21.2 Gold Master):
+    # Підтягуємо пошти з кешу не лише коли ranked_emails_with_src порожній,
+    # а й коли поточний найкращий email є низькопріоритетним (напр. service@docmorris.de -> customer_support_inbox),
+    # щоб високопріоритетний partnerwerden@docmorris.de (b2b_partnerships) із кешу не губився!
+    prelim_best_type = classify_email_type(ranked_emails_with_src[0][0], brand_root) if ranked_emails_with_src else None
+    if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES) and cache_store is not None:
         for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
                 if isinstance(c_rec, dict) and c_rec.get('best_email'):
                     c_em = str(c_rec['best_email']).strip()
                     c_src = str(c_rec.get('email_source_url') or clean_website_url)
-                    email_sources[c_em] = c_src
+                    email_sources.setdefault(c_em, c_src)
                     for extra_em in str(c_rec.get('all_emails') or '').split(';'):
                         if extra_em.strip():
                             email_sources.setdefault(extra_em.strip(), c_src)
@@ -1064,7 +1076,6 @@ async def process_domain(
     if dm_name and not verify_person_email_match(dm_name, best_email):
         dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
         if dm_email_hyps and (not deliverability_check or 'domain_accepts_email' in deliverability_check):
-            # Якщо підключений Reoon / MillionVerifier — перевіряємо гіпотези на льоту і підставляємо валідну в best_email!
             async with semaphore:
                 verified_dm_em, verified_dm_note = await verify_predicted_emails_via_api(
                     client, dm_email_hyps, reoon_api_key=reoon_api_key, millionverifier_api_key=millionverifier_api_key
