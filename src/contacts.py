@@ -76,6 +76,19 @@ GENERIC_SINGLE_WORD_LOCALS = {
 }
 
 
+def clean_escaped_email_prefix(raw_email: str | None) -> str:
+    """
+    Баг №7 Fix (v21.3):
+    Зрізає JSON/URL-екранування на початку пошти (напр. 'u003eservice@flaconi.de' -> 'service@flaconi.de',
+    'u003esupport@esputnik.com' -> 'support@esputnik.com', '%20info@...', '3ainfo@...').
+    """
+    if not raw_email:
+        return ''
+    em = raw_email.strip().strip('.,;:/|()[]<>\"\'')
+    em = re.sub(r'^(?:\\?u00[0-9a-f]{2}|%[0-9a-f]{2}|3a|2f|20)+', '', em, flags=re.I)
+    return em.strip().strip('.,;:/|()[]<>\"\'').lower()
+
+
 def decode_cf_email(cf_hex: str) -> str | None:
     try:
         r = int(cf_hex[:2], 16)
@@ -88,20 +101,34 @@ def decode_cf_email(cf_hex: str) -> str | None:
 
 
 def transliterate_ua_to_latin(text: str) -> str:
+    """
+    Баг №6 Fix (v21.3):
+    Транслітерує як кирилицю, так і європейські діакритичні знаки (ś->s, ć->c, ł->l, ö->oe, ü->ue, ä->ae, ß->ss),
+    щоб Bartosz Kliś -> 'bartosz klis' (гіпотеза b.klis@notino.de замість b.kli@notino.de).
+    """
     return ''.join(UA_TO_LATIN.get(ch, ch) for ch in text.lower())
 
 
 def normalize_executive_role(raw_role: str | None) -> str | None:
+    """
+    Баг №1/№4 Fix (v21.3):
+    Очищує raw_role від URL/дужкових хвостів типу 'President (Source: https://...'
+    і відхиляє не-керівні ролі типу 'author' чи 'member'.
+    """
     if not raw_role:
         return None
-    clean = ' '.join(str(raw_role).split()).strip(' ,—–-:|()•')
+    clean = re.sub(r'\s*\((?:source|джерело|from|http)[^)]*\)?.*$', '', str(raw_role), flags=re.I)
+    clean = re.sub(r'https?://\S+', '', clean, flags=re.I)
+    clean = ' '.join(clean.split()).strip(' ,—–-:|()•')
     low = clean.lower()
+    if low in ('author', 'member', 'members', 'employee', 'employees', 'contributor', 'writer', 'editor'):
+        return None
     if low in ROLE_NORMALIZATION_MAP:
         return ROLE_NORMALIZATION_MAP[low]
     for k, v in ROLE_NORMALIZATION_MAP.items():
         if re.search(rf'\b{re.escape(k)}\b', low):
             return v
-    return clean
+    return clean[:60] if clean else None
 
 
 def strip_role_tokens_from_name(raw_name: str) -> str:
@@ -148,8 +175,12 @@ def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
             return False
         if p_low in DEPARTMENT_PREFIX_BLACKLIST or p_low in UI_ACTION_WORDS_BLACKLIST:
             return False
-        if b_low and len(b_low) >= 4 and p_low == b_low and p_low not in ('otto',):
-            return False
+        if b_low and len(b_low) >= 4 and p_low not in ('otto',):
+            if p_low == b_low:
+                return False
+            # Баг №5 Fix (v21.3): Відсікає морфологічні префікси бренду (напр. 'Bergfreund Matthias' на bergfreunde.de)
+            if len(b_low) >= 6 and len(p_low) >= 6 and (p_low.startswith(b_low[:6]) or b_low.startswith(p_low[:6])):
+                return False
         for sub_part in p_clean.split('-'):
             if not sub_part or len(sub_part) < 2:
                 return False
@@ -161,7 +192,7 @@ def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
 def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
     if not dm_name or not email or '@' not in email:
         return False
-    local = email.split('@', 1)[0].lower()
+    local = clean_escaped_email_prefix(email).split('@', 1)[0].lower()
     if local in NON_PERSON_TOKENS or local in GENERIC_SINGLE_WORD_LOCALS:
         return False
     parts = [transliterate_ua_to_latin(p) for p in dm_name.split() if len(p) >= 2]
@@ -204,7 +235,10 @@ def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tup
 def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if not email or '@' not in email:
         return None
-    local, dom = email.lower().strip().split('@', 1)
+    clean_em = clean_escaped_email_prefix(email)
+    if '@' not in clean_em:
+        return None
+    local, dom = clean_em.split('@', 1)
     tokens = [t for t in re.split(r'[._+\-]+', local) if t]
     norm_local = re.sub(r'[._+\-]', '', local)
     b_low = (brand_root or '').lower().strip()
@@ -267,6 +301,10 @@ def generate_dm_email_pattern_candidates(
     if not dom or dom in PUBLIC_WEBMAIL_DOMAINS:
         return []
 
+    brand_root = dom.split('.')[0]
+    if not is_valid_person_name(dm_name, brand_root):
+        return []
+
     raw_parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2]
     parts = [p for p in raw_parts if len(p) >= 2]
     if len(parts) < 2:
@@ -277,9 +315,10 @@ def generate_dm_email_pattern_candidates(
 
     detected_pattern = None
     for em in (observed_emails or []):
-        if '@' not in em:
+        clean_em = clean_escaped_email_prefix(em)
+        if '@' not in clean_em:
             continue
-        loc, em_dom = em.lower().strip().split('@', 1)
+        loc, em_dom = clean_em.split('@', 1)
         if em_dom != dom or '-' in loc:
             continue
         if '.' in loc:
@@ -306,12 +345,6 @@ async def verify_predicted_emails_via_api(
     reoon_api_key: str | None = None,
     millionverifier_api_key: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """
-    Killer Feature #4 (v21.1):
-    Якщо передано опціональний ключ Reoon або MillionVerifier, перевіряє топ-3 згенеровані
-    гіпотези пошти ЛПР (напр. i.shevkoplyas@sendpulse.ua, ihor.shevkoplyas@sendpulse.ua)
-    і повертає першу адресу зі статусом 'safe' / 'valid' / 'ok' для автозаміни best_email!
-    """
     r_key = (reoon_api_key or os.environ.get('REOON_API_KEY') or '').strip()
     mv_key = (millionverifier_api_key or os.environ.get('MILLIONVERIFIER_API_KEY') or '').strip()
     if (not r_key and not mv_key) or not candidates:
@@ -347,7 +380,9 @@ async def verify_predicted_emails_via_api(
 def is_valid_Scraped_email(email: str, canonical_domain: str) -> tuple[bool, bool]:
     if not email or '@' not in email or len(email) > 90:
         return False, False
-    em_low = email.lower().strip().strip('.,;:/|()[]<>\"\'')
+    em_low = clean_escaped_email_prefix(email)
+    if not em_low or '@' not in em_low:
+        return False, False
     if any(em_low.endswith(ext) for ext in JUNK_EXTENSIONS):
         return False, False
     local, dom = em_low.split('@', 1)
@@ -404,7 +439,7 @@ def rank_and_clean_emails(
     had_external_pollution = False
 
     for raw_em, src_url in email_sources.items():
-        em = raw_em.strip().strip('.,;:/|()[]<>\"\'').lower()
+        em = clean_escaped_email_prefix(raw_em)
         is_val, is_ext = is_valid_Scraped_email(em, canonical_domain)
         if not is_val:
             if is_ext:
@@ -820,16 +855,18 @@ def extract_decision_maker_deep(
                         for node in (graph if isinstance(graph, list) else [obj]):
                             if not isinstance(node, dict):
                                 continue
-                            for key_role in ('founder', 'founders', 'employee', 'employees', 'member', 'members', 'author'):
+                            # Баг №4 Fix (v21.3): Прибрано 'author', 'member', 'members', щоб автори блог-постів
+                            # (Подорога Оксана на apteka911.ua, Светлана Клименко на esputnik.com) ніколи не ставали ЛПР!
+                            for key_role in ('founder', 'founders', 'employee', 'employees'):
                                 val = node.get(key_role)
                                 p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
                                 for person in p_list:
                                     if not isinstance(person, dict):
                                         continue
                                     p_name = strip_role_tokens_from_name(str(person.get('name', '')))
-                                    p_job = str(person.get('jobTitle') or key_role)
-                                    if is_valid_person_name(p_name, brand_root):
-                                        norm_r = normalize_executive_role(p_job) or 'Founder'
+                                    p_job = str(person.get('jobTitle') or ('Co-Founder' if key_role == 'founders' else 'Founder'))
+                                    norm_r = normalize_executive_role(p_job)
+                                    if is_valid_person_name(p_name, brand_root) and norm_r:
                                         sc = _dm_role_priority_weight(norm_r) + page_bonus + 10
                                         k_low = p_name.lower()
                                         if k_low not in candidates or sc > candidates[k_low]['score']:
