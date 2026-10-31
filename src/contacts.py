@@ -75,13 +75,17 @@ GENERIC_SINGLE_WORD_LOCALS = {
     'system', 'notifications', 'notify', 'alert', 'alerts', 'billing',
 }
 
+NON_EXECUTIVE_ROLE_REJECT_SET = {
+    'author', 'authors', 'member', 'members', 'employee', 'employees',
+    'contributor', 'writer', 'editor', 'copywriter', 'journalist',
+    'blogger', 'reviewer', 'pharmacist', 'doctor', 'consultant',
+    'specialist', 'intern', 'assistant', 'support', 'moderator',
+    'автор', 'авторка', 'редактор', 'журналіст', 'фармацевт', 'провізор',
+    'спеціаліст', 'консультант', 'співробітник',
+}
+
 
 def clean_escaped_email_prefix(raw_email: str | None) -> str:
-    """
-    Баг №7 Fix (v21.3):
-    Зрізає JSON/URL-екранування на початку пошти (напр. 'u003eservice@flaconi.de' -> 'service@flaconi.de',
-    'u003esupport@esputnik.com' -> 'support@esputnik.com', '%20info@...', '3ainfo@...').
-    """
     if not raw_email:
         return ''
     em = raw_email.strip().strip('.,;:/|()[]<>\"\'')
@@ -101,19 +105,14 @@ def decode_cf_email(cf_hex: str) -> str | None:
 
 
 def transliterate_ua_to_latin(text: str) -> str:
-    """
-    Баг №6 Fix (v21.3):
-    Транслітерує як кирилицю, так і європейські діакритичні знаки (ś->s, ć->c, ł->l, ö->oe, ü->ue, ä->ae, ß->ss),
-    щоб Bartosz Kliś -> 'bartosz klis' (гіпотеза b.klis@notino.de замість b.kli@notino.de).
-    """
     return ''.join(UA_TO_LATIN.get(ch, ch) for ch in text.lower())
 
 
 def normalize_executive_role(raw_role: str | None) -> str | None:
     """
-    Баг №1/№4 Fix (v21.3):
-    Очищує raw_role від URL/дужкових хвостів типу 'President (Source: https://...'
-    і відхиляє не-керівні ролі типу 'author' чи 'member'.
+    P0-1 Fix (v21.4):
+    Очищує raw_role від URL/дужкових хвостів і суворо відхиляє будь-які не-керівні ролі
+    ('author', 'employee', 'member', 'editor', 'pharmacist' тощо), повертаючи None.
     """
     if not raw_role:
         return None
@@ -121,13 +120,15 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
     clean = re.sub(r'https?://\S+', '', clean, flags=re.I)
     clean = ' '.join(clean.split()).strip(' ,—–-:|()•')
     low = clean.lower()
-    if low in ('author', 'member', 'members', 'employee', 'employees', 'contributor', 'writer', 'editor'):
+    if not low or low in NON_EXECUTIVE_ROLE_REJECT_SET:
         return None
     if low in ROLE_NORMALIZATION_MAP:
         return ROLE_NORMALIZATION_MAP[low]
     for k, v in ROLE_NORMALIZATION_MAP.items():
         if re.search(rf'\b{re.escape(k)}\b', low):
             return v
+    if any(bad_tok in low.split() for bad_tok in NON_EXECUTIVE_ROLE_REJECT_SET):
+        return None
     return clean[:60] if clean else None
 
 
@@ -178,7 +179,6 @@ def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
         if b_low and len(b_low) >= 4 and p_low not in ('otto',):
             if p_low == b_low:
                 return False
-            # Баг №5 Fix (v21.3): Відсікає морфологічні префікси бренду (напр. 'Bergfreund Matthias' на bergfreunde.de)
             if len(b_low) >= 6 and len(p_low) >= 6 and (p_low.startswith(b_low[:6]) or b_low.startswith(p_low[:6])):
                 return False
         for sub_part in p_clean.split('-'):
@@ -796,6 +796,9 @@ def build_decision_makers_json_from_summary(
         if not m:
             continue
         name, role, src_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        norm_role = normalize_executive_role(role)
+        if not norm_role:
+            continue
         li_match = None
         if primary_linkedin_url and (idx == 0 or verify_person_linkedin_match(name, primary_linkedin_url)):
             li_match = primary_linkedin_url
@@ -803,7 +806,7 @@ def build_decision_makers_json_from_summary(
             li_match = src_url
         items.append({
             'name': name,
-            'role': role,
+            'role': norm_role,
             'source_url': src_url,
             'source_type': classify_dm_source_type(src_url),
             'linkedin_url': li_match,
@@ -855,9 +858,9 @@ def extract_decision_maker_deep(
                         for node in (graph if isinstance(graph, list) else [obj]):
                             if not isinstance(node, dict):
                                 continue
-                            # Баг №4 Fix (v21.3): Прибрано 'author', 'member', 'members', щоб автори блог-постів
-                            # (Подорога Оксана на apteka911.ua, Светлана Клименко на esputnik.com) ніколи не ставали ЛПР!
-                            for key_role in ('founder', 'founders', 'employee', 'employees'):
+                            # P0-1 Fix (v21.4): Суворо тільки ('founder', 'founders') у JSON-LD!
+                            # Ключі 'employee', 'employees', 'author', 'member' повністю заборонені.
+                            for key_role in ('founder', 'founders'):
                                 val = node.get(key_role)
                                 p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
                                 for person in p_list:
@@ -920,7 +923,9 @@ def extract_decision_maker_deep(
                 cand_name = strip_role_tokens_from_name(raw_n)
                 if not is_valid_person_name(cand_name, brand_root):
                     continue
-                norm_r = normalize_executive_role(raw_r) or raw_r
+                norm_r = normalize_executive_role(raw_r)
+                if not norm_r:
+                    continue
                 sc = _dm_role_priority_weight(norm_r) + page_bonus
                 k_low = cand_name.lower()
                 if k_low not in candidates or sc > candidates[k_low]['score']:
