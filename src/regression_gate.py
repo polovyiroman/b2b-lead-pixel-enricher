@@ -19,7 +19,9 @@ from .domain_helpers import (
     KNOWN_POISONED_CACHE_RECOVERY,
     KNOWN_PW_HOPELESS,
     SALES_ACTIONABILITY_ENUM_VALUES,
+    build_compliance_note,
     build_safe_cache_payload,
+    derive_legal_basis_for_processing,
     derive_sales_actionability_class,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
@@ -749,14 +751,6 @@ def _test_18_v213_wild_web_hardening_7_bugs() -> str:
 
 
 def _test_19_v214_evidence_based_p0_fixes() -> str:
-    """
-    Test 19/19 (v21.4 Evidence-Based P0 Audit Gate):
-    1. Ensures cached 'author' / 'employee' DMs (eSputnik, Apteka911) are purged by sanitize_cached_dms.
-    2. Ensures Epicentrk (Marketplace Founder + b2b@) maps to 'partnership' (not 'sales_ready').
-    3. Ensures Flaconi (0 tech signals + partners@flaconi.de) maps to 'partnership' (not 'tech_only').
-    4. Ensures Shafa (1 tech signal + partial_gtm) gets floor score >= 12 (never 0).
-    5. Ensures unmatched staff email + separate DM does not double-count +15 DM bonus.
-    """
     c_n, c_r, c_found = sanitize_cached_dms(
         'Светлана Клименко',
         'author',
@@ -833,6 +827,69 @@ def _test_19_v214_evidence_based_p0_fixes() -> str:
     return "PASS (cached 'author' purged; Epicentrk/Flaconi->partnership; Shafa>=12; eSputnik score capped)"
 
 
+def _test_20_v215_six_audit_improvements() -> str:
+    """
+    Test 20/20 (v21.5 Production Audit & Transparency Gate):
+    1. apteka911.ua: apteka911.arenda@gmail.com -> legal_or_hr_inbox; apteka911@apteka911.com.ua -> general_office_inbox (#1).
+    2. flaconi.de: multi-executive Geschäftsführer extraction (Bastian Siebers, Alexandra Szarmach, Henry Brodski).
+    3. netpeak.net: unmatched named staff email (n.koshel@netpeak.net) + Co-Founder separated in build_sales_hook.
+    4. promodo.ua: empty brackets [] in cached decision_makers_found filled via fallback_source_url.
+    5. DE_UWG_7 legal_basis_for_processing and [Actor Retention Policy: 365d] compliance note verified.
+    """
+    if classify_email_type('apteka911.arenda@gmail.com', 'apteka911') != 'legal_or_hr_inbox':
+        raise AssertionError("apteka911.arenda@gmail.com was not classified as legal_or_hr_inbox")
+    if classify_email_type('apteka911@apteka911.com.ua', 'apteka911') != 'general_office_inbox':
+        raise AssertionError("apteka911@apteka911.com.ua was not classified as general_office_inbox")
+    ranked_apt, _ = rank_and_clean_emails(
+        {
+            'apteka911.arenda@gmail.com': 'https://apteka911.ua/contacts',
+            'apteka911@apteka911.com.ua': 'https://apteka911.ua/contacts',
+        },
+        'apteka911.ua',
+    )
+    if not ranked_apt or ranked_apt[0][0] != 'apteka911@apteka911.com.ua':
+        raise AssertionError(f"Expected apteka911@apteka911.com.ua to rank #1 over Gmail arenda, got {ranked_apt}")
+
+    flaconi_imp_text = 'Flaconi GmbH. Geschäftsführer: Bastian Siebers, Alexandra Szarmach, Henry Brodski. Handelsregister: Amtsgericht Berlin.'
+    _, _, _, _, _, _, flaconi_found, _ = extract_decision_maker_deep([
+        ('https://www.flaconi.de/impressum/', f'<html><body><p>{flaconi_imp_text}</p></body></html>', flaconi_imp_text)
+    ])
+    for exec_n in ('Bastian Siebers', 'Alexandra Szarmach', 'Henry Brodski'):
+        if exec_n not in (flaconi_found or ''):
+            raise AssertionError(f"Co-executive '{exec_n}' missing from flaconi decision_makers_found: {flaconi_found}")
+
+    netpeak_hook = build_sales_hook(
+        'netpeak.net',
+        'B2B Agency / Marketing Media',
+        {'detected_technologies_list': ['Google Tag Manager']},
+        'Андрей Чумаченко',
+        'Co-Founder',
+        None,
+        'n.koshel@netpeak.net',
+        best_email_type='personal_or_named_inbox',
+    )
+    if 'Named Contact: n.koshel@netpeak.net | Listed Co-Founder: Андрей Чумаченко' not in netpeak_hook:
+        raise AssertionError(f"Netpeak hook failed to separate unmatched named email from Co-Founder: {netpeak_hook}")
+
+    _, _, promodo_found = sanitize_cached_dms(
+        'Valeriia Lavska',
+        'Chief Marketing Officer (CMO)',
+        'Valeriia Lavska (Chief Marketing Officer (CMO)) []',
+        brand_root='promodo',
+        fallback_source_url='https://www.promodo.ua/about-us',
+    )
+    if '[https://www.promodo.ua/about-us]' not in (promodo_found or ''):
+        raise AssertionError(f"Empty brackets [] not filled in sanitize_cached_dms: {promodo_found}")
+
+    de_basis = derive_legal_basis_for_processing('flaconi.de', 'DE', True)
+    ua_basis = derive_legal_basis_for_processing('promodo.ua', 'UA', True)
+    de_note = build_compliance_note('flaconi.de', 'DE')
+    if 'DE_UWG_7' not in (de_basis or '') or 'corporate_outreach_allowed' not in (ua_basis or '') or '[Actor Retention Policy: 365d]' not in de_note:
+        raise AssertionError(f"Compliance metadata mismatch: de={de_basis}, ua={ua_basis}, note={de_note}")
+
+    return "PASS (apteka911 corporate #1; flaconi 3 co-execs; netpeak hook split; promodo URL filled; DE_UWG_7 OK)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -862,6 +919,7 @@ def run_startup_regression_gate(
         ('test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge', lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn)),
         ('test_18_v213_wild_web_hardening_7_bugs', _test_18_v213_wild_web_hardening_7_bugs),
         ('test_19_v214_evidence_based_p0_fixes', _test_19_v214_evidence_based_p0_fixes),
+        ('test_20_v215_six_audit_improvements', _test_20_v215_six_audit_improvements),
     ]
 
     passed_count = 0
