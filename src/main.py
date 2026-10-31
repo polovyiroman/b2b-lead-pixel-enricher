@@ -78,6 +78,7 @@ from .qualifier import (
 )
 from .regression_gate import run_startup_regression_gate
 from .scraper import (
+    _is_safe_domain,
     classify_failure_status,
     close_shared_playwright_browser,
     configure_pw,
@@ -149,6 +150,64 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
     return record
 
 
+def _is_cache_record_fresh(c_rec: dict | None, max_cache_age_days: int) -> bool:
+    """
+    v21.6: Перевіряє, чи дозволено читання з кешу (max_cache_age_days > 0)
+    і чи вік кешованого снепшота не перевищує встановлений ліміт (за замовчуванням 30 днів).
+    """
+    if not isinstance(c_rec, dict) or max_cache_age_days <= 0:
+        return False
+    prev_time = c_rec.get('last_checked_at')
+    if not prev_time:
+        return True
+    age_days = compute_snapshot_age_days(prev_time)
+    if age_days is not None and age_days > max_cache_age_days:
+        return False
+    return True
+
+
+async def _send_completion_webhook(
+    client: AsyncSession,
+    webhook_url: str | None,
+    run_telemetry: dict,
+    records: list[dict],
+) -> None:
+    """
+    v21.6: Нативний вбудований POST-вебхук для автоматичної доставки збагачених лідів
+    у n8n, Make, Clay.com, HubSpot, Pipedrive або Slack без сторонніх конекторів.
+    """
+    if not webhook_url or not isinstance(webhook_url, str):
+        return
+    clean_wh = webhook_url.strip()
+    if not clean_wh.startswith(('https://', 'http://')):
+        return
+    parsed_wh = urlparse(clean_wh)
+    if not _is_safe_domain(parsed_wh.netloc):
+        Actor.log.warning(f'[WEBHOOK SKIP] Unsafe or internal webhook host rejected: {parsed_wh.netloc}')
+        return
+
+    payload = {
+        'event': 'b2b_lead_pixel_enricher.run_completed',
+        'version': '21.6',
+        'summary': run_telemetry,
+        'records_count': len(records),
+        'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
+        'partnership_count': sum(1 for r in records if r.get('sales_actionability_class') in ('partnership', 'partner_agency')),
+        'records': records[:250],
+    }
+    try:
+        resp = await client.post(
+            clean_wh,
+            headers={'Content-Type': 'application/json'},
+            json=payload,
+            timeout=10.0,
+            proxy=None,
+        )
+        Actor.log.info(f'[WEBHOOK SENT] POST {clean_wh} -> HTTP {resp.status_code} ({len(records)} records)')
+    except Exception as exc:
+        Actor.log.warning(f'[WEBHOOK WARN] Failed to POST to {clean_wh}: {exc}')
+
+
 async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None:
     if proxy_config is None:
         return None
@@ -177,6 +236,8 @@ async def process_domain(
     serper_api_key: str | None = None,
     reoon_api_key: str | None = None,
     millionverifier_api_key: str | None = None,
+    max_cache_age_days: int = 30,
+    bypass_hopeless_waf: bool = False,
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
@@ -185,6 +246,7 @@ async def process_domain(
     pw_attempts_count = 0
     pw_attempted_paths: list[str] = []
     pw_had_timeout_or_block = False
+    allow_cache_reads = (cache_store is not None and max_cache_age_days > 0)
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
@@ -195,9 +257,12 @@ async def process_domain(
     canonical_domain = get_clean_canonical_domain(final_url, domain_key)
     brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
     is_pw_hopeless = (
-        canonical_domain in KNOWN_PW_HOPELESS
-        or domain_key in KNOWN_PW_HOPELESS
-        or is_dynamic_hopeless_waf(err_msg)
+        not bypass_hopeless_waf
+        and (
+            canonical_domain in KNOWN_PW_HOPELESS
+            or domain_key in KNOWN_PW_HOPELESS
+            or is_dynamic_hopeless_waf(err_msg)
+        )
     )
 
     if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
@@ -275,7 +340,7 @@ async def process_domain(
     if status == 0 or status >= 400 or not html:
         fail_status = classify_failure_status(status, err_msg)
         seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
-        if isinstance(seed_match, dict):
+        if isinstance(seed_match, dict) and max_cache_age_days > 0:
             _seed_hint = detect_country_hint(
                 canonical_domain,
                 seed_match.get('page_title') or '',
@@ -324,7 +389,7 @@ async def process_domain(
             if is_tier1_marketplace
             else (canonical_kv_key, input_kv_key, evergreen_kv_key)
         )
-        if cache_store is not None:
+        if allow_cache_reads:
             for candidate_key in cache_keys_order:
                 try:
                     cached_record = await cache_store.get_value(candidate_key)
@@ -340,7 +405,11 @@ async def process_domain(
 
                     prev_time = cached_record.get('last_checked_at', '')
                     age_days = compute_snapshot_age_days(prev_time)
-                    if is_evergreen and age_days is not None and age_days > EVERGREEN_MAX_AGE_DAYS:
+                    effective_max_age = min(max_cache_age_days, EVERGREEN_MAX_AGE_DAYS)
+                    if age_days is not None and age_days > effective_max_age:
+                        Actor.log.info(
+                            f'[CACHE EXPIRED] {canonical_domain} snapshot age={age_days}d exceeds maxCacheAgeDays={effective_max_age}d'
+                        )
                         continue
 
                     cached_copy = {k: v for k, v in cached_record.items() if not k.startswith('_')}
@@ -665,9 +734,12 @@ async def process_domain(
 
     effective_region = resolve_effective_phone_region(canonical_domain, default_region, html)
     is_pw_hopeless = (
-        canonical_domain in KNOWN_PW_HOPELESS
-        or domain_key in KNOWN_PW_HOPELESS
-        or is_dynamic_hopeless_waf(err_msg)
+        not bypass_hopeless_waf
+        and (
+            canonical_domain in KNOWN_PW_HOPELESS
+            or domain_key in KNOWN_PW_HOPELESS
+            or is_dynamic_hopeless_waf(err_msg)
+        )
     )
 
     (
@@ -864,11 +936,11 @@ async def process_domain(
     has_ga4_live_before_cache = bool(tech_info.get('has_ga4'))
     prior_cached_for_safe_write: dict | None = None
 
-    if cache_store is not None:
+    if allow_cache_reads:
         for c_key in (evergreen_kv_key, canonical_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
-                if isinstance(c_rec, dict) or canonical_domain in KNOWN_POISONED_CACHE_RECOVERY:
+                if _is_cache_record_fresh(c_rec, max_cache_age_days) or canonical_domain in KNOWN_POISONED_CACHE_RECOVERY:
                     c_rec = heal_poisoned_cache_record(canonical_domain, c_rec)
                     if isinstance(c_rec, dict) and (c_rec.get('has_ga4') or c_rec.get('detected_technologies') or c_rec.get('detected_cms')):
                         prior_cached_for_safe_write = c_rec
@@ -878,7 +950,7 @@ async def process_domain(
                         break
             except Exception:
                 pass
-    elif canonical_domain in KNOWN_POISONED_CACHE_RECOVERY:
+    elif canonical_domain in KNOWN_POISONED_CACHE_RECOVERY and max_cache_age_days > 0:
         healed = heal_poisoned_cache_record(canonical_domain, None)
         if isinstance(healed, dict):
             tech_info, cache_tech_recovered, cache_sources_count = merge_missing_techs_from_cache(
@@ -903,16 +975,12 @@ async def process_domain(
     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
     live_email_set = {em for em, _ in ranked_emails_with_src}
 
-    # Удосконалення №3 (v21.5):
-    # 1. Перевіряємо (c_rec.get('best_email') or c_rec.get('primary_phone')), щоб на сайтах без email (як eva.ua)
-    #    відновлювався кешований телефон +380 800 303 700!
-    # 2. Відстежуємо, чи був best_email взятий із кешу (not in live_email_set), щоб чесно додати суфікс _cached.
     prelim_best_type = classify_email_type(ranked_emails_with_src[0][0], brand_root) if ranked_emails_with_src else None
-    if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES or not phone_map) and cache_store is not None:
+    if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES or not phone_map) and allow_cache_reads:
         for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
-                if isinstance(c_rec, dict) and (c_rec.get('best_email') or c_rec.get('primary_phone')):
+                if _is_cache_record_fresh(c_rec, max_cache_age_days) and (c_rec.get('best_email') or c_rec.get('primary_phone')):
                     if c_rec.get('best_email') and (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES):
                         c_em = clean_escaped_email_prefix(str(c_rec['best_email']))
                         c_src = str(c_rec.get('email_source_url') or clean_website_url)
@@ -1005,11 +1073,11 @@ async def process_domain(
     live_dm_name = dm_name
     dm_was_from_cache = False
 
-    if cache_store is not None:
+    if allow_cache_reads:
         for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
-                if isinstance(c_rec, dict) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
+                if _is_cache_record_fresh(c_rec, max_cache_age_days) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
                     c_dm_li = c_rec.get('decision_maker_linkedin_url') or dm_linkedin_url
                     c_dm_src = c_rec.get('decision_maker_source_url') or dm_source_url or clean_website_url
                     c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
@@ -1092,7 +1160,7 @@ async def process_domain(
     is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
 
     seed_match = manual_seeds.get(canonical_domain) or manual_seeds.get(domain_key)
-    if isinstance(seed_match, dict):
+    if isinstance(seed_match, dict) and max_cache_age_days > 0:
         seed_tech_count = len([x.strip() for x in (seed_match.get('detected_technologies') or '').split(';') if x.strip()])
         seed_has_dm = bool(seed_match.get('decision_maker_name'))
         if (seed_has_dm and not dm_name) or (len(detected_tech_list) < seed_tech_count) or (not best_email and bool(seed_match.get('best_email'))):
@@ -1373,6 +1441,12 @@ async def main() -> None:
         reoon_api_key = actor_input.get('reoonApiKey') or actor_input.get('reoon_api_key')
         millionverifier_api_key = actor_input.get('millionVerifierApiKey') or actor_input.get('millionverifier_api_key')
 
+        force_fresh_scan = bool(actor_input.get('forceFreshScan', False))
+        raw_max_cache_age = actor_input.get('maxCacheAgeDays', 30)
+        max_cache_age_days = 0 if force_fresh_scan else max(0, int(raw_max_cache_age if raw_max_cache_age is not None else 30))
+        bypass_hopeless_waf = bool(actor_input.get('bypassHopelessWaf', False))
+        webhook_url = actor_input.get('webhookUrl') or actor_input.get('webhook_url')
+
         user_seeds = actor_input.get('manualSeeds') or actor_input.get('manual_seeds') or {}
         manual_seeds = {**DEFAULT_MANUAL_SEEDS}
         if isinstance(user_seeds, dict):
@@ -1414,6 +1488,7 @@ async def main() -> None:
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
         pushed_canonical_set: set[str] = set()
+        pushed_formatted_records: list[dict] = []
         metrics_counter = Counter()
 
         try:
@@ -1427,6 +1502,8 @@ async def main() -> None:
                             serper_api_key=serper_api_key,
                             reoon_api_key=reoon_api_key,
                             millionverifier_api_key=millionverifier_api_key,
+                            max_cache_age_days=max_cache_age_days,
+                            bypass_hopeless_waf=bypass_hopeless_waf,
                         ),
                         domain_key, initial_aliases,
                     )
@@ -1440,7 +1517,9 @@ async def main() -> None:
                         metrics_counter['deduped_canonical_aliases'] += 1
                         continue
                     pushed_canonical_set.add(cd)
-                    await Actor.push_data(format_record_for_output_view(result, output_view))
+                    formatted_rec = format_record_for_output_view(result, output_view)
+                    pushed_formatted_records.append(formatted_rec)
+                    await Actor.push_data(formatted_rec)
 
                     st = result['status']
                     metrics_counter[f'status_{st}'] += 1
@@ -1459,23 +1538,28 @@ async def main() -> None:
                         f"Email: {result['best_email'] or '-'}"
                     )
 
-            run_telemetry = {
-                'total_targets': total_domains,
-                'unique_canonical_domains_pushed': len(pushed_canonical_set),
-                'live_success_count': metrics_counter['status_success'] + metrics_counter['status_success (seed_merged)'],
-                'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
-                'playwright_rendered_count': metrics_counter['playwright_rendered'],
-                'no_contacts_count': metrics_counter['status_no_contacts_found'],
-                'blocked_count': metrics_counter['status_blocked'],
-                'timeout_unfinished_count': metrics_counter['status_run_timeout_unfinished'],
-                'checked_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            }
-            Actor.log.info(f'PIPELINE TELEMETRY SUMMARY: {json.dumps(run_telemetry)}')
-            if cache_store is not None:
-                try:
-                    await cache_store.set_value('LAST_RUN_METRICS', run_telemetry)
-                except Exception:
-                    pass
+                run_telemetry = {
+                    'total_targets': total_domains,
+                    'unique_canonical_domains_pushed': len(pushed_canonical_set),
+                    'live_success_count': metrics_counter['status_success'] + metrics_counter['status_success (seed_merged)'],
+                    'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
+                    'playwright_rendered_count': metrics_counter['playwright_rendered'],
+                    'no_contacts_count': metrics_counter['status_no_contacts_found'],
+                    'blocked_count': metrics_counter['status_blocked'],
+                    'timeout_unfinished_count': metrics_counter['status_run_timeout_unfinished'],
+                    'max_cache_age_days': max_cache_age_days,
+                    'bypass_hopeless_waf': bypass_hopeless_waf,
+                    'checked_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                }
+                Actor.log.info(f'PIPELINE TELEMETRY SUMMARY: {json.dumps(run_telemetry)}')
+                if cache_store is not None:
+                    try:
+                        await cache_store.set_value('LAST_RUN_METRICS', run_telemetry)
+                    except Exception:
+                        pass
+
+                if webhook_url:
+                    await _send_completion_webhook(client, webhook_url, run_telemetry, pushed_formatted_records)
         finally:
             await asyncio.sleep(0.05)
             await close_shared_playwright_browser()
