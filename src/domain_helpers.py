@@ -81,14 +81,16 @@ KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
     }
 }
 
+# Удосконалення №6 (v21.5): Додано явну позначку [Actor Retention Policy: 365d]
 COMPLIANCE_DEFAULT_NOTE = (
-    'Enriched for legitimate B2B interest from public site data; '
+    '[Actor Retention Policy: 365d] Enriched for legitimate B2B interest from public site data; '
     'jurisdiction hint reflects operational/market HQ (verify registered legal entity for DPA); '
     'deletion on request via support'
 )
 
 COMPLIANCE_DE_UWG_NOTE = (
-    'DE Market Notice (GDPR + German UWG §7): Unsolicited B2B cold email requires prior express consent in Germany; '
+    '[Actor Retention Policy: 365d] DE Market Notice (GDPR + German UWG §7): '
+    'Unsolicited B2B cold email requires prior express consent in Germany; '
     'prioritize LinkedIn outbound or telephone discovery (presumed consent for B2B relevance). '
     'Deletion on request via support'
 )
@@ -110,6 +112,11 @@ KNOWN_DOMAIN_COUNTRY_HINTS: dict[str, str] = {
     'zalando.de': 'DE',
     'otto.de': 'DE',
     'docmorris.de': 'DE',
+    'notino.de': 'DE',
+    'flaconi.de': 'DE',
+    'douglas.de': 'DE',
+    'thomann.de': 'DE',
+    'bergfreunde.de': 'DE',
     'asos.com': 'GB',
     'laredoute.fr': 'FR',
     'unicredit.it': 'IT',
@@ -125,6 +132,24 @@ KNOWN_PW_HOPELESS = {
 
 PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
 MIN_VALID_RESCUE_HTML_BYTES = 2500
+
+
+def derive_legal_basis_for_processing(
+    canonical_domain: str,
+    country_hint: str,
+    has_contact_or_dm: bool,
+) -> str | None:
+    """
+    Удосконалення №6 (v21.5):
+    Для Німеччини (DE / .de) прямо зазначає обмеження UWG §7 (cold_email_prohibited_without_consent; use_linkedin_or_phone),
+    а для інших юрисдикцій — corporate_outreach_allowed_with_opt_out.
+    """
+    if not has_contact_or_dm:
+        return None
+    dom_low = (canonical_domain or '').lower()
+    if dom_low.endswith('.de') or (country_hint or '').upper() == 'DE':
+        return 'legitimate_interest_b2b_processing (DE_UWG_7: cold_email_prohibited_without_consent; use_linkedin_or_phone)'
+    return 'legitimate_interest_b2b_processing (corporate_outreach_allowed_with_opt_out)'
 
 
 def sanitize_cached_phones(
@@ -473,12 +498,12 @@ def sanitize_cached_dms(
     raw_dms_found: str | None,
     brand_root: str = '',
     primary_li_url: str | None = None,
+    fallback_source_url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
-    P0-1 Fix (v21.4):
-    Видалено небезпечний фолбек `or c_role_raw` та `'Executive'`.
-    Якщо роль у кеші не проходить normalize_executive_role (напр. 'author' на esputnik.com / apteka911.ua),
-    вона гарантовано відкидається і ніколи не спливає зі старого кешу!
+    Удосконалення №3 (v21.5):
+    Заповнює порожні дужки `[]` у кешованих записах `decision_makers_found` через `fallback_source_url`,
+    щоб на promodo.ua ніколи не виникало `Valeriia Lavska (...) []` та `decision_maker_source_type = NaN`.
     """
     clean_primary_name = None
     if raw_dm_name:
@@ -497,10 +522,12 @@ def sanitize_cached_dms(
             chunk = chunk.strip()
             if not chunk:
                 continue
-            m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', chunk)
+            m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.*?)\]$', chunk)
             if not m:
                 continue
             c_name_raw, c_role_raw, c_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            if not c_url and fallback_source_url:
+                c_url = fallback_source_url
             c_name = strip_role_tokens_from_name(c_name_raw)
             if not is_valid_person_name(c_name, brand_root):
                 continue
@@ -513,7 +540,7 @@ def sanitize_cached_dms(
             clean_parts.append((c_name, c_role, c_url))
 
     if clean_primary_name and clean_primary_role and clean_primary_name.lower() not in seen_names:
-        clean_parts.insert(0, (clean_primary_name, clean_primary_role, ''))
+        clean_parts.insert(0, (clean_primary_name, clean_primary_role, fallback_source_url or ''))
         seen_names.add(clean_primary_name.lower())
 
     if clean_parts:
