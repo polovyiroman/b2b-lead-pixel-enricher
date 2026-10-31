@@ -401,18 +401,18 @@ async def process_domain(
                     cached_copy.setdefault('all_ga4_ids_count', None)
                     cached_copy.setdefault('tech_scan_completeness', 'partial_cached')
                     cached_copy.setdefault('category_confidence', 'high')
-                    cached_copy.setdefault(
-                        'marketplace_platform',
-                        is_marketplace_platform(
-                            canonical_domain,
-                            cached_copy.get('page_title') or '',
-                            cached_copy.get('meta_description') or ''
-                        )
+                    _c_is_mp = is_marketplace_platform(
+                        canonical_domain,
+                        cached_copy.get('page_title') or '',
+                        cached_copy.get('meta_description') or ''
                     )
+                    cached_copy['marketplace_platform'] = _c_is_mp
                     cached_copy.setdefault('marketplace_platform_pollution_detected', False)
                     cached_copy.setdefault('email_source_type', None)
                     cached_copy.setdefault('email_source_note', None)
-                    cached_copy.setdefault('decision_maker_source_type', classify_dm_source_type(cached_copy.get('decision_maker_source_url')))
+                    cached_copy['decision_maker_source_type'] = (
+                        classify_dm_source_type(cached_copy.get('decision_maker_source_url')) if c_dm_name else None
+                    )
                     cached_copy.setdefault('named_email_owner_role_hint', None)
 
                     normalize_cached_record_booleans(cached_copy)
@@ -470,6 +470,45 @@ async def process_domain(
                     )
                     cached_copy['company_category'] = _cat
                     cached_copy['category_confidence'] = _cat_conf
+
+                    _c_tech_info = {
+                        'detected_technologies_list': _cached_tech_list,
+                        'detected_cms_list': [x.strip() for x in (cached_copy.get('detected_cms') or '').split(';') if x.strip()],
+                        'detected_cms': cached_copy.get('detected_cms'),
+                        'has_gtm': cached_copy.get('has_gtm'),
+                        'has_sgtm': cached_copy.get('has_sgtm'),
+                        'has_ga4': cached_copy.get('has_ga4'),
+                        'has_meta_pixel': cached_copy.get('has_meta_pixel'),
+                        'has_google_ads': cached_copy.get('has_google_ads'),
+                        'has_tiktok_pixel': cached_copy.get('has_tiktok_pixel'),
+                        'has_linkedin_pixel': cached_copy.get('has_linkedin_pixel'),
+                        'has_pinterest_tag': cached_copy.get('has_pinterest_tag'),
+                        'has_hubspot': cached_copy.get('has_hubspot'),
+                        'has_klaviyo': cached_copy.get('has_klaviyo'),
+                        'has_cookie_banner': cached_copy.get('consent_mode_likely'),
+                        'tech_scan_completeness': cached_copy.get('tech_scan_completeness', 'partial_cached'),
+                    }
+                    (
+                        _c_verdict, _c_icp, _c_tech_sig, _c_contact_tier,
+                        _c_enrich_st, _, _c_det_sig, _c_opp, _c_next_act
+                    ) = evaluate_qualification_v180(
+                        _cat, _c_tech_info, cached_copy.get('best_email'), cached_copy.get('best_email_type'),
+                        cached_copy.get('primary_phone'), c_dm_name, c_dm_role,
+                        cached_copy.get('decision_maker_linkedin_url'), False,
+                        cached_copy.get('decision_maker_source_type'), cached_copy.get('linkedin_url'),
+                        bool(cached_copy.get('marketplace_platform_pollution_detected')),
+                        cached_copy['playwright_status'],
+                        is_mp_platform=_c_is_mp,
+                    )
+                    cached_copy['sales_readiness_verdict'] = _c_verdict
+                    cached_copy['icp_fit_tier'] = _c_icp
+                    cached_copy['technical_signal_strength'] = _c_tech_sig
+                    cached_copy['contact_quality_tier'] = _c_contact_tier
+                    cached_copy['contact_enrichment_status'] = _c_enrich_st
+                    cached_copy['detected_signals'] = _c_det_sig
+                    cached_copy['sales_opportunity'] = _c_opp
+                    cached_copy['next_best_action'] = _c_next_act
+
                     cached_copy['contact_quality_tier_human'] = derive_human_contact_tier(
                         cached_copy.get('contact_quality_tier'), _cat
                     )
@@ -484,19 +523,7 @@ async def process_domain(
                         is_same_person_email=verify_person_email_match(cached_copy.get('decision_maker_name'), cached_copy.get('best_email'))
                     )
                     cached_copy['sales_hook'] = build_sales_hook(
-                        canonical_domain, _cat,
-                        {
-                            'detected_technologies_list': _cached_tech_list,
-                            'detected_cms': cached_copy.get('detected_cms'),
-                            'has_gtm': cached_copy.get('has_gtm'),
-                            'has_sgtm': cached_copy.get('has_sgtm'),
-                            'has_ga4': cached_copy.get('has_ga4'),
-                            'has_meta_pixel': cached_copy.get('has_meta_pixel'),
-                            'has_google_ads': cached_copy.get('has_google_ads'),
-                            'has_tiktok_pixel': cached_copy.get('has_tiktok_pixel'),
-                            'has_linkedin_pixel': cached_copy.get('has_linkedin_pixel'),
-                            'has_cookie_banner': cached_copy.get('consent_mode_likely'),
-                        },
+                        canonical_domain, _cat, _c_tech_info,
                         cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_role'),
                         cached_copy.get('decision_maker_linkedin_url'), cached_copy.get('best_email'),
                         is_eu_gdpr=cached_copy['gdpr_eu_domain'],
@@ -869,10 +896,6 @@ async def process_domain(
 
     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
 
-    # Колізія №2 Fix (v21.2 Gold Master):
-    # Підтягуємо пошти з кешу не лише коли ranked_emails_with_src порожній,
-    # а й коли поточний найкращий email є низькопріоритетним (напр. service@docmorris.de -> customer_support_inbox),
-    # щоб високопріоритетний partnerwerden@docmorris.de (b2b_partnerships) із кешу не губився!
     prelim_best_type = classify_email_type(ranked_emails_with_src[0][0], brand_root) if ranked_emails_with_src else None
     if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES) and cache_store is not None:
         for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
@@ -1015,6 +1038,10 @@ async def process_domain(
     dm_name, dm_role, decision_makers_found_str = sanitize_cached_dms(
         dm_name, dm_role, decision_makers_found_str, brand_root, dm_linkedin_url
     )
+    if not dm_name:
+        dm_source_url = None
+        dm_source_type = None
+        dm_linkedin_url = None
     decision_makers_json_str = build_decision_makers_json_from_summary(decision_makers_found_str, dm_linkedin_url)
     if decision_makers_json_str:
         try:
@@ -1105,6 +1132,7 @@ async def process_domain(
         dm_name, dm_role, dm_linkedin_url, dm_source_is_legal, dm_source_type,
         linkedin_url, had_marketplace_pollution, pw_status_str,
         predicted_dm_email=predicted_dm_email,
+        is_mp_platform=is_mp_platform,
     )
 
     red_flags = detect_broken_attribution_red_flags(
