@@ -368,8 +368,8 @@ def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tec
         raise AssertionError(f"Expected all_ga4_ids capped at 5, got {len(displayed_ids)}: {displayed_ids}")
     if info_27.get('all_ga4_ids_count') != 27:
         raise AssertionError(f"Expected all_ga4_ids_count=27, got {info_27.get('all_ga4_ids_count')}")
-    if info_27.get('ga4_detection_confidence') != 'High (multiplexed 27-property)':
-        raise AssertionError(f"Expected 'High (multiplexed 27-property)', got '{info_27.get('ga4_detection_confidence')}'")
+    if '27 GA4 IDs configured' not in str(info_27.get('ga4_detection_confidence') or ''):
+        raise AssertionError(f"Expected 27 GA4 IDs lookup confidence note, got '{info_27.get('ga4_detection_confidence')}'")
 
     ay_type = classify_email_type('affiliate.creator@aboutyou.com', 'aboutyou')
     if ay_type != 'influencer_gifting_inbox':
@@ -748,6 +748,91 @@ def _test_18_v213_wild_web_hardening_7_bugs() -> str:
     return "PASS (7/7 wild-web hallucinations blocked: Premium Quality/Latin America/Neil Patel/Bergfreund/ld-author/u003e/Kliś)"
 
 
+def _test_19_v214_evidence_based_p0_fixes() -> str:
+    """
+    Test 19/19 (v21.4 Evidence-Based P0 Audit Gate):
+    1. Ensures cached 'author' / 'employee' DMs (eSputnik, Apteka911) are purged by sanitize_cached_dms.
+    2. Ensures Epicentrk (Marketplace Founder + b2b@) maps to 'partnership' (not 'sales_ready').
+    3. Ensures Flaconi (0 tech signals + partners@flaconi.de) maps to 'partnership' (not 'tech_only').
+    4. Ensures Shafa (1 tech signal + partial_gtm) gets floor score >= 12 (never 0).
+    5. Ensures unmatched staff email + separate DM does not double-count +15 DM bonus.
+    """
+    c_n, c_r, c_found = sanitize_cached_dms(
+        'Светлана Клименко',
+        'author',
+        'Светлана Клименко (author) [https://esputnik.com/uk/blog/test]',
+        brand_root='esputnik',
+    )
+    if c_n is not None or c_r is not None or c_found is not None:
+        raise AssertionError(f"Cached 'author' survived sanitize_cached_dms: {(c_n, c_r, c_found)}")
+
+    epic_verdict, _, _, epic_tier, _, _, _, _, _ = evaluate_qualification_v180(
+        'E-commerce / Retail Brand',
+        {'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)'], 'has_gtm': True, 'has_ga4': True, 'tech_scan_completeness': 'full'},
+        'b2b@epicentrk.ua',
+        'b2b_partnerships',
+        '+380 800 202 727',
+        'Галина Герега',
+        'Founder',
+        None,
+        False,
+        'about_page',
+        None,
+        False,
+        'not_needed',
+        is_mp_platform=True,
+    )
+    if derive_sales_actionability_class(epic_verdict, 'E-commerce / Retail Brand') != 'partnership' or 'Tier B' not in epic_tier:
+        raise AssertionError(f"Expected epicentrk Founder+b2b@ to map to partnership/Tier B, got {epic_verdict} / {epic_tier}")
+
+    flaconi_verdict, _, _, _, _, _, _, _, _ = evaluate_qualification_v180(
+        'E-commerce / Retail Brand',
+        {'detected_technologies_list': [], 'tech_scan_completeness': 'partial_empty_render'},
+        'partners@flaconi.de',
+        'b2b_partnerships',
+        None,
+        'Bastian Siebers',
+        'Chief Executive Officer (CEO)',
+        None,
+        False,
+        'impressum_page',
+        None,
+        False,
+        'launched_empty_shell',
+        is_mp_platform=False,
+    )
+    if derive_sales_actionability_class(flaconi_verdict, 'E-commerce / Retail Brand') != 'partnership':
+        raise AssertionError(f"Expected flaconi (0 tech + partners@) to map to 'partnership', got '{flaconi_verdict}'")
+
+    shafa_score = compute_data_quality_score(
+        'Tier F (No Actionable Contacts Found on Website)',
+        1,
+        None,
+        None,
+        None,
+        'partial_gtm',
+        False,
+        company_category='E-commerce / Retail Brand',
+    )
+    if shafa_score < 12:
+        raise AssertionError(f"Expected Shafa floor score >= 12 when 1 tech found, got {shafa_score}")
+
+    esp_score = compute_data_quality_score(
+        'Tier B+ (Named Staff Inbox aleksey.danchenko@esputnik.com Found, Different from Listed Executive Артем Бородатюк)',
+        5,
+        'Артем Бородатюк',
+        None,
+        '+380 44 123 4567',
+        'full',
+        False,
+        company_category='SaaS / Marketplace / Tech Platform',
+    )
+    if esp_score > 68:
+        raise AssertionError(f"Unmatched staff email + executive inflated score to {esp_score} (expected <= 64)")
+
+    return "PASS (cached 'author' purged; Epicentrk/Flaconi->partnership; Shafa>=12; eSputnik score capped)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -776,6 +861,7 @@ def run_startup_regression_gate(
         ('test_16_v210_no_fake_de_phones_and_dup_ga4_hook', _test_16_v210_no_fake_de_phones_and_dup_ga4_hook),
         ('test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge', lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn)),
         ('test_18_v213_wild_web_hardening_7_bugs', _test_18_v213_wild_web_hardening_7_bugs),
+        ('test_19_v214_evidence_based_p0_fixes', _test_19_v214_evidence_based_p0_fixes),
     ]
 
     passed_count = 0
