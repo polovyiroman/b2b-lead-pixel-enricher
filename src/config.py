@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 27
+CACHE_SCHEMA_VERSION = 28
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -184,7 +184,6 @@ TESTIMONIAL_TEXT_MARKERS = (
     'opinie klientów', 'klantervaringen', 'what experts say', 'trusted by'
 )
 
-# Баг №3 Fix (v21.3): Додано світових авторів цитат на SaaS-лендингах (Neil Patel, Rand Fishkin, Brian Dean)
 FOREIGN_TESTIMONIAL_NAMES_BLACKLIST = {
     'дієго сільва', 'diego silva', 'roman kohutkevych', 'роман когуткевич',
     'neil patel', 'ніл патель', 'нил патель', 'rand fishkin', 'brian dean', 'gary vaynerchuk'
@@ -206,7 +205,6 @@ CORPORATE_ENTITY_TOKENS = {
     'bpo', 'gfh', 'premium', 'quality'
 }
 
-# Баг №2 Fix (v21.3): Додано географічні макрорегіони (Latin, America, North, South, Central, Asia, Pacific, Middle, East, Africa)
 CITY_NAMES_BLACKLIST = {
     'hamburg', 'berlin', 'münchen', 'muenchen', 'munich', 'frankfurt', 'köln', 'koeln',
     'düsseldorf', 'duesseldorf', 'stuttgart', 'leipzig', 'dresden', 'hannover', 'bremen',
@@ -486,8 +484,6 @@ STOP_NAME_WORDS = {
     'National', 'Regional', 'Europe', 'European'
 }
 
-# Баг №6 Fix (v21.3): Додано європейські діакритичні символи (польські ś, ć, ł, ń, ą, ę, ź, ż; німецькі ö, ü, ä, ß; чеські/французькі/скандинавські)
-# щоб Bartosz Kliś -> b.klis@notino.de (а не b.kli@notino.de), Ronny Höhn -> r.hoehn@bergfreunde.de
 UA_TO_LATIN = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g', 'д': 'd', 'е': 'e',
     'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y',
@@ -620,11 +616,15 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
+# Удосконалення №1 (v21.5): Додано префікси оренди нерухомості та відмов від замовлень
+# ('arenda', 'orenda', 'rent', 'lease', 'leasing', 'realestate', 'immobilien', 'property', 'premises', 'revocation', 'widerruf', 'cancellation', 'storno')
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
     'productcompliance', 'productsafety', 'product-safety', 'produktsicherheit', 'recall',
     'impressum',
+    'arenda', 'orenda', 'rent', 'lease', 'leasing', 'realestate', 'immobilien',
+    'property', 'premises', 'revocation', 'widerruf', 'cancellation', 'storno',
     'gdpr', 'billing', 'invoice', 'invoices', 'accounting', 'finance',
     'jobs', 'careers', 'job', 'hr', 'recruiting', 'security', 'copyright', 'dmca', 'jira',
     'bewerbung', 'karriere', 'personal', 'buchhaltung', 'rechnung', 'rechnungen',
