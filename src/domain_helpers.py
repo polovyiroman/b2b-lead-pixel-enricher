@@ -247,7 +247,9 @@ def _preserve_or_cap_ga4_fields(record: dict) -> None:
     if true_cnt > 0:
         record['all_ga4_ids_count'] = true_cnt
     if true_cnt > MAX_DISPLAY_GA4_IDS:
-        record['ga4_detection_confidence'] = f'High (multiplexed {true_cnt}-property)'
+        record['ga4_detection_confidence'] = (
+            f'High ({true_cnt} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
+        )
     else:
         record['ga4_detection_confidence'] = capped_conf
 
@@ -331,13 +333,6 @@ def merge_missing_techs_from_cache(
     pw_used_flag: bool,
     pw_had_timeout_or_block: bool,
 ) -> tuple[dict, bool, int]:
-    """
-    Колізія №1 Fix (v21.2 Gold Master):
-    Якщо живий скан не мав таймаутів/блоків (not pw_had_timeout_or_block and live_comp == 'full'),
-    знайшов живе ядро стеку (has_ga4_live and has_gtm_live та len(curr_techs) >= 4), а з кешу
-    відсутні лише другорядні UX-віджети (напр. Microsoft Clarity на cher17.com),
-    залишаємо tech_scan_completeness = 'full' без штрафу -15 балів!
-    """
     curr_techs = tech_info.get('detected_technologies_list') or []
     has_ga4_live = bool(tech_info.get('has_ga4'))
     has_gtm_live = bool(tech_info.get('has_gtm'))
@@ -415,7 +410,9 @@ def merge_missing_techs_from_cache(
     capped_ga4_ids, parsed_ga4_cnt, capped_ga4_conf = cap_ga4_ids_and_confidence(raw_ga4_ids, raw_ga4_conf)
     true_ga4_cnt = max(int(existing_ga4_cnt or 0), parsed_ga4_cnt) if capped_ga4_ids else 0
     if true_ga4_cnt > MAX_DISPLAY_GA4_IDS:
-        capped_ga4_conf = f'High (multiplexed {true_ga4_cnt}-property)'
+        capped_ga4_conf = (
+            f'High ({true_ga4_cnt} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
+        )
 
     updated_info = {
         'has_meta_pixel': bool(c_rec.get('has_meta_pixel') or tech_info.get('has_meta_pixel') or ('Meta Pixel' in merged_techs)),
@@ -431,6 +428,7 @@ def merge_missing_techs_from_cache(
         'has_sgtm': bool(valid_cached_sgtm or tech_info.get('has_sgtm')),
         'has_consent_mode_v2_signals': bool(tech_info.get('has_consent_mode_v2_signals')),
         'duplicate_ga4_ids': tech_info.get('duplicate_ga4_ids') or [],
+        'duplicate_ga4_runtime_confirmed': bool(tech_info.get('duplicate_ga4_runtime_confirmed')),
         'all_ga4_ids': capped_ga4_ids,
         'all_ga4_ids_count': true_ga4_cnt if true_ga4_cnt > 0 else None,
         'ga4_detection_confidence': capped_ga4_conf,
@@ -476,6 +474,12 @@ def sanitize_cached_dms(
     brand_root: str = '',
     primary_li_url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
+    """
+    P0-1 Fix (v21.4):
+    Видалено небезпечний фолбек `or c_role_raw` та `'Executive'`.
+    Якщо роль у кеші не проходить normalize_executive_role (напр. 'author' на esputnik.com / apteka911.ua),
+    вона гарантовано відкидається і ніколи не спливає зі старого кешу!
+    """
     clean_primary_name = None
     if raw_dm_name:
         cand = strip_role_tokens_from_name(str(raw_dm_name))
@@ -483,6 +487,8 @@ def sanitize_cached_dms(
             clean_primary_name = cand
 
     clean_primary_role = normalize_executive_role(raw_dm_role) if raw_dm_role else None
+    if not clean_primary_role:
+        clean_primary_name = None
 
     clean_parts: list[tuple[str, str, str]] = []
     seen_names: set[str] = set()
@@ -498,14 +504,16 @@ def sanitize_cached_dms(
             c_name = strip_role_tokens_from_name(c_name_raw)
             if not is_valid_person_name(c_name, brand_root):
                 continue
+            c_role = normalize_executive_role(c_role_raw)
+            if not c_role:
+                continue
             if c_name.lower() in seen_names:
                 continue
             seen_names.add(c_name.lower())
-            c_role = normalize_executive_role(c_role_raw) or c_role_raw
             clean_parts.append((c_name, c_role, c_url))
 
-    if clean_primary_name and clean_primary_name.lower() not in seen_names:
-        clean_parts.insert(0, (clean_primary_name, clean_primary_role or 'Executive', ''))
+    if clean_primary_name and clean_primary_role and clean_primary_name.lower() not in seen_names:
+        clean_parts.insert(0, (clean_primary_name, clean_primary_role, ''))
         seen_names.add(clean_primary_name.lower())
 
     if clean_parts:
@@ -519,11 +527,6 @@ def sanitize_cached_dms(
 
 
 def contact_link_priority(url: str) -> tuple[int, int]:
-    """
-    Колізія №2 Fix (v21.2 Gold Master):
-    Додано 'partner', 'b2b', 'wholesale', 'kooperation', 'seller' у пріоритет 1,
-    щоб сторінки типу /hilfe-kontakt/partner-werden (docmorris.de) завжди потрапляли в allowed_sub_links[:4].
-    """
     path = urlparse(url).path.lower()
     if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return (0, len(path))
