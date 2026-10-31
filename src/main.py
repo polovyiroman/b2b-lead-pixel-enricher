@@ -28,6 +28,7 @@ from .contacts import (
     classify_dm_source_type,
     classify_email_source_type_and_note,
     classify_email_type,
+    clean_escaped_email_prefix,
     extract_decision_maker_deep,
     extract_named_email_owner_hint,
     fetch_dm_via_serp_fallback,
@@ -49,6 +50,7 @@ from .domain_helpers import (
     contact_link_priority,
     derive_gdpr_jurisdiction,
     derive_human_contact_tier,
+    derive_legal_basis_for_processing,
     derive_pii_fields,
     derive_sales_actionability_class,
     detect_country_hint,
@@ -300,10 +302,10 @@ async def process_domain(
                 seeded_rec.get('sales_readiness_verdict'), seeded_rec.get('company_category', '')
             )
             seeded_rec['gdpr_jurisdiction'] = _seed_jur
-            seeded_rec['legal_basis_for_processing'] = (
-                'legitimate_interest_b2b'
-                if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
-                else None
+            seeded_rec['legal_basis_for_processing'] = derive_legal_basis_for_processing(
+                canonical_domain,
+                _seed_hint,
+                bool(seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone')),
             )
             seeded_rec['data_subject_can_request_deletion'] = True
             seeded_rec['data_retention_policy_days'] = 365
@@ -381,18 +383,20 @@ async def process_domain(
                     )
                     cached_copy['phone_availability'] = 'public' if cached_copy.get('primary_phone') else 'not_public'
 
+                    c_fallback_src = cached_copy.get('decision_maker_source_url') or clean_website_url
                     c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
                         cached_copy.get('decision_maker_name'),
                         cached_copy.get('decision_maker_role'),
                         cached_copy.get('decision_makers_found'),
                         brand_root,
                         cached_copy.get('decision_maker_linkedin_url'),
+                        fallback_source_url=c_fallback_src,
                     )
                     cached_copy['decision_maker_name'] = c_dm_name
                     cached_copy['decision_maker_role'] = c_dm_role
                     cached_copy['decision_makers_found'] = c_dms_str
                     cached_copy['decision_makers_json'] = build_decision_makers_json_from_summary(
-                        c_dms_str, cached_copy.get('decision_maker_linkedin_url')
+                        c_dms_str, cached_copy.get('decision_maker_linkedin_url'), c_fallback_src
                     )
 
                     cached_copy.setdefault('detected_cms', None)
@@ -410,9 +414,10 @@ async def process_domain(
                     cached_copy.setdefault('marketplace_platform_pollution_detected', False)
                     cached_copy.setdefault('email_source_type', None)
                     cached_copy.setdefault('email_source_note', None)
-                    cached_copy['decision_maker_source_type'] = (
-                        classify_dm_source_type(cached_copy.get('decision_maker_source_url')) if c_dm_name else None
-                    )
+                    raw_c_dm_src_type = classify_dm_source_type(c_fallback_src) if c_dm_name else None
+                    if raw_c_dm_src_type and not raw_c_dm_src_type.endswith('_cached'):
+                        raw_c_dm_src_type = f'{raw_c_dm_src_type}_cached'
+                    cached_copy['decision_maker_source_type'] = raw_c_dm_src_type
                     cached_copy.setdefault('named_email_owner_role_hint', None)
 
                     normalize_cached_record_booleans(cached_copy)
@@ -528,11 +533,12 @@ async def process_domain(
                         cached_copy.get('decision_maker_linkedin_url'), cached_copy.get('best_email'),
                         is_eu_gdpr=cached_copy['gdpr_eu_domain'],
                         pw_used=False,
+                        best_email_type=cached_copy.get('best_email_type'),
                     )
-                    cached_copy['legal_basis_for_processing'] = (
-                        'legitimate_interest_b2b'
-                        if (cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone'))
-                        else None
+                    cached_copy['legal_basis_for_processing'] = derive_legal_basis_for_processing(
+                        canonical_domain,
+                        _c_hint,
+                        bool(cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone')),
                     )
                     cached_copy['data_subject_can_request_deletion'] = True
                     cached_copy['data_retention_policy_days'] = 365
@@ -895,19 +901,28 @@ async def process_domain(
     )
 
     ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
+    live_email_set = {em for em, _ in ranked_emails_with_src}
 
+    # Удосконалення №3 (v21.5):
+    # 1. Перевіряємо (c_rec.get('best_email') or c_rec.get('primary_phone')), щоб на сайтах без email (як eva.ua)
+    #    відновлювався кешований телефон +380 800 303 700!
+    # 2. Відстежуємо, чи був best_email взятий із кешу (not in live_email_set), щоб чесно додати суфікс _cached.
     prelim_best_type = classify_email_type(ranked_emails_with_src[0][0], brand_root) if ranked_emails_with_src else None
-    if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES) and cache_store is not None:
+    if (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES or not phone_map) and cache_store is not None:
         for c_key in (canonical_kv_key, evergreen_kv_key, input_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
-                if isinstance(c_rec, dict) and c_rec.get('best_email'):
-                    c_em = str(c_rec['best_email']).strip()
-                    c_src = str(c_rec.get('email_source_url') or clean_website_url)
-                    email_sources.setdefault(c_em, c_src)
-                    for extra_em in str(c_rec.get('all_emails') or '').split(';'):
-                        if extra_em.strip():
-                            email_sources.setdefault(extra_em.strip(), c_src)
+                if isinstance(c_rec, dict) and (c_rec.get('best_email') or c_rec.get('primary_phone')):
+                    if c_rec.get('best_email') and (not ranked_emails_with_src or prelim_best_type in LOW_VALUE_LIVE_EMAIL_TYPES):
+                        c_em = clean_escaped_email_prefix(str(c_rec['best_email']))
+                        c_src = str(c_rec.get('email_source_url') or clean_website_url)
+                        if c_em:
+                            email_sources.setdefault(c_em, c_src)
+                        for extra_em in str(c_rec.get('all_emails') or '').split(';'):
+                            clean_extra = clean_escaped_email_prefix(extra_em)
+                            if clean_extra:
+                                email_sources.setdefault(clean_extra, c_src)
+                        ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
                     if not phone_map and c_rec.get('primary_phone'):
                         clean_c_phone, _, _ = sanitize_cached_phones(
                             c_rec.get('primary_phone'),
@@ -916,7 +931,6 @@ async def process_domain(
                         )
                         if clean_c_phone:
                             phone_map[clean_c_phone] = (50, str(c_rec.get('phone_source_url') or clean_website_url))
-                    ranked_emails_with_src, had_marketplace_pollution = rank_and_clean_emails(email_sources, canonical_domain)
                     break
             except Exception:
                 pass
@@ -928,6 +942,12 @@ async def process_domain(
     email_source_type, email_source_note = classify_email_source_type_and_note(
         best_email, best_email_type, email_source_url, pages_with_urls
     )
+    if best_email and best_email not in live_email_set:
+        if email_source_type and not email_source_type.endswith('_cached'):
+            email_source_type = f'{email_source_type}_cached'
+        if email_source_note and 'cached' not in email_source_note.lower():
+            email_source_note = f'{email_source_note} (recovered from prior verified cache)'
+
     owner_role_hint = extract_named_email_owner_hint(best_email, best_email_type, pages_with_urls)
 
     email_domain = None
@@ -982,30 +1002,38 @@ async def process_domain(
         dm_source_type, decision_makers_found_str, decision_makers_json_str
     ) = await loop.run_in_executor(thread_pool, extract_decision_maker_deep, pages_with_urls)
 
+    live_dm_name = dm_name
+    dm_was_from_cache = False
+
     if cache_store is not None:
         for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
             try:
                 c_rec = await cache_store.get_value(c_key)
                 if isinstance(c_rec, dict) and (c_rec.get('decision_maker_name') or c_rec.get('decision_makers_found')):
                     c_dm_li = c_rec.get('decision_maker_linkedin_url') or dm_linkedin_url
+                    c_dm_src = c_rec.get('decision_maker_source_url') or dm_source_url or clean_website_url
                     c_dm_name, c_dm_role, c_dms_str = sanitize_cached_dms(
                         c_rec.get('decision_maker_name'), c_rec.get('decision_maker_role'),
-                        c_rec.get('decision_makers_found'), brand_root, c_dm_li
+                        c_rec.get('decision_makers_found'), brand_root, c_dm_li,
+                        fallback_source_url=c_dm_src,
                     )
                     if not c_dm_name and not c_dms_str:
                         continue
-                    c_dm_src = c_rec.get('decision_maker_source_url')
-                    c_dm_src_type = c_rec.get('decision_maker_source_type')
+                    c_dm_src_type = c_rec.get('decision_maker_source_type') or classify_dm_source_type(c_dm_src)
                     curr_dms_count = (decision_makers_found_str or '').count(';') + (1 if decision_makers_found_str else 0)
                     cached_dms_count = (c_dms_str or '').count(';') + (1 if c_dms_str else 0)
 
                     if c_dm_li and not dm_linkedin_url and c_dm_name:
+                        if not live_dm_name or live_dm_name.lower() != c_dm_name.lower():
+                            dm_was_from_cache = True
                         dm_name, dm_role, dm_linkedin_url = c_dm_name, c_dm_role, c_dm_li
                         dm_source_url, dm_source_type = c_dm_src, c_dm_src_type
                         if cached_dms_count >= curr_dms_count and c_dms_str:
                             decision_makers_found_str = c_dms_str
                         break
                     elif not dm_name or cached_dms_count > curr_dms_count:
+                        if not live_dm_name or (c_dm_name and live_dm_name.lower() != c_dm_name.lower()):
+                            dm_was_from_cache = True
                         decision_makers_found_str = c_dms_str or decision_makers_found_str
                         dm_name = c_dm_name or dm_name
                         dm_role = c_dm_role or dm_role
@@ -1030,19 +1058,24 @@ async def process_domain(
             dm_linkedin_url = serp_li
             dm_source_url = serp_li
             dm_source_type = 'serp_linkedin_xray'
+            dm_was_from_cache = False
             if decision_makers_found_str:
                 decision_makers_found_str = f'{serp_found_str}; {decision_makers_found_str}'
             else:
                 decision_makers_found_str = serp_found_str
 
+    dm_fallback_url = dm_source_url or clean_website_url
     dm_name, dm_role, decision_makers_found_str = sanitize_cached_dms(
-        dm_name, dm_role, decision_makers_found_str, brand_root, dm_linkedin_url
+        dm_name, dm_role, decision_makers_found_str, brand_root, dm_linkedin_url,
+        fallback_source_url=dm_fallback_url,
     )
     if not dm_name:
         dm_source_url = None
         dm_source_type = None
         dm_linkedin_url = None
-    decision_makers_json_str = build_decision_makers_json_from_summary(decision_makers_found_str, dm_linkedin_url)
+    decision_makers_json_str = build_decision_makers_json_from_summary(
+        decision_makers_found_str, dm_linkedin_url, dm_fallback_url
+    )
     if decision_makers_json_str:
         try:
             _parsed_dms = json.loads(decision_makers_json_str)
@@ -1051,6 +1084,9 @@ async def process_domain(
                 dm_source_type = _parsed_dms[0].get('source_type') or classify_dm_source_type(dm_source_url)
         except Exception:
             pass
+
+    if dm_name and dm_was_from_cache and dm_source_type and not dm_source_type.endswith('_cached'):
+        dm_source_type = f'{dm_source_type}_cached'
 
     gdpr_jurisdiction = derive_gdpr_jurisdiction(canonical_domain, primary_phone, country_hint, html)
     is_eu_gdpr = gdpr_jurisdiction in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
@@ -1083,10 +1119,10 @@ async def process_domain(
                 seeded_rec.get('sales_readiness_verdict'), seeded_rec.get('company_category', '')
             )
             seeded_rec['gdpr_jurisdiction'] = gdpr_jurisdiction
-            seeded_rec['legal_basis_for_processing'] = (
-                'legitimate_interest_b2b'
-                if (seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone'))
-                else None
+            seeded_rec['legal_basis_for_processing'] = derive_legal_basis_for_processing(
+                canonical_domain,
+                country_hint,
+                bool(seeded_rec.get('best_email') or seeded_rec.get('decision_maker_name') or seeded_rec.get('primary_phone')),
             )
             seeded_rec['data_subject_can_request_deletion'] = True
             seeded_rec['data_retention_policy_days'] = 365
@@ -1102,7 +1138,12 @@ async def process_domain(
     predicted_dm_email = None
     if dm_name and not verify_person_email_match(dm_name, best_email):
         dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
-        if dm_email_hyps and (not deliverability_check or 'domain_accepts_email' in deliverability_check):
+        is_mx_configured = bool(
+            not deliverability_check
+            or 'domain_mail_configured' in deliverability_check
+            or 'domain_accepts_email' in deliverability_check
+        )
+        if dm_email_hyps and is_mx_configured:
             async with semaphore:
                 verified_dm_em, verified_dm_note = await verify_predicted_emails_via_api(
                     client, dm_email_hyps, reoon_api_key=reoon_api_key, millionverifier_api_key=millionverifier_api_key
@@ -1154,7 +1195,7 @@ async def process_domain(
 
     sales_hook = build_sales_hook(
         canonical_domain, company_category, tech_info, dm_name, dm_role, dm_linkedin_url, best_email,
-        is_eu_gdpr=is_eu_gdpr, pw_used=pw_used_flag,
+        is_eu_gdpr=is_eu_gdpr, pw_used=pw_used_flag, best_email_type=best_email_type,
     )
 
     if best_email and deliverability_check and any(
@@ -1173,7 +1214,11 @@ async def process_domain(
     all_phones_list = [p for p, _ in sorted_phones_with_src]
     human_tier = derive_human_contact_tier(contact_quality_tier, company_category)
     actionability_cls = derive_sales_actionability_class(sales_readiness_verdict, company_category)
-    legal_basis = 'legitimate_interest_b2b' if (best_email or dm_name or primary_phone) else None
+    legal_basis = derive_legal_basis_for_processing(
+        canonical_domain,
+        country_hint,
+        bool(best_email or dm_name or primary_phone),
+    )
     pii_fields_str = derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url)
     dq_score = compute_data_quality_score(
         contact_quality_tier, len(detected_tech_list), dm_name, dm_linkedin_url,
