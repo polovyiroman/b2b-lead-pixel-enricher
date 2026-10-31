@@ -33,6 +33,7 @@ from .config import (
     LOW_PRIORITY_PREFIXES,
     MARKETING_EXEC_PREFIXES,
     NAME_BEFORE_ROLE_PATTERN,
+    NAME_REGEX_PART,
     NON_PERSON_TOKENS,
     PR_MEDIA_PREFIXES,
     PUBLIC_WEBMAIL_DOMAINS,
@@ -57,6 +58,8 @@ from .config import (
 
 _DNS_MX_CACHE: dict[str, str] = {}
 _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
+
+_STANDALONE_NAME_FINDER = re.compile(rf'\b{NAME_REGEX_PART}\b', re.UNICODE)
 
 GENERIC_SINGLE_WORD_LOCALS = {
     'ask', 'dclub', 'return', 'returns', 'club', 'bonus', 'loyalty', 'card',
@@ -109,11 +112,6 @@ def transliterate_ua_to_latin(text: str) -> str:
 
 
 def normalize_executive_role(raw_role: str | None) -> str | None:
-    """
-    P0-1 Fix (v21.4):
-    Очищує raw_role від URL/дужкових хвостів і суворо відхиляє будь-які не-керівні ролі
-    ('author', 'employee', 'member', 'editor', 'pharmacist' тощо), повертаючи None.
-    """
     if not raw_role:
         return None
     clean = re.sub(r'\s*\((?:source|джерело|from|http)[^)]*\)?.*$', '', str(raw_role), flags=re.I)
@@ -233,6 +231,14 @@ def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tup
 
 
 def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
+    """
+    Удосконалення №1 (v21.5):
+    1. Перевіряє LOW_PRIORITY_PREFIXES (зокрема 'arenda', 'orenda', 'rent', 'lease', 'immobilien')
+       ПЕРЕД перевіркою PUBLIC_WEBMAIL_DOMAINS, щоб 'apteka911.arenda@gmail.com' ставала 'legal_or_hr_inbox' (вага 2),
+       а не 'brand_webmail_general_inbox' (вага 50).
+    2. Якщо локальна частина корпоративної пошти дорівнює назві бренду (напр. 'apteka911@apteka911.com.ua'),
+       повертає 'general_office_inbox' (вага 60 + 20 бонус домену = 80).
+    """
     if not email or '@' not in email:
         return None
     clean_em = clean_escaped_email_prefix(email)
@@ -243,6 +249,9 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     norm_local = re.sub(r'[._+\-]', '', local)
     b_low = (brand_root or '').lower().strip()
 
+    if _matches_prefix_safely(local, tokens, LOW_PRIORITY_PREFIXES):
+        return 'legal_or_hr_inbox'
+
     if dom in PUBLIC_WEBMAIL_DOMAINS:
         if any(s in tokens or s in norm_local for s in ('support', 'help', 'service', 'order', 'orders', 'shop')):
             return 'brand_webmail_support_inbox'
@@ -250,8 +259,6 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
             return 'brand_webmail_general_inbox'
         return 'brand_webmail_general_inbox'
 
-    if _matches_prefix_safely(local, tokens, LOW_PRIORITY_PREFIXES):
-        return 'legal_or_hr_inbox'
     if _matches_prefix_safely(local, tokens, INFLUENCER_PREFIXES):
         return 'influencer_gifting_inbox'
     if _matches_prefix_safely(local, tokens, MARKETING_EXEC_PREFIXES):
@@ -269,6 +276,10 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if local in REGIONAL_BRANCH_LOCALS or any(t in REGIONAL_BRANCH_LOCALS for t in tokens):
         return 'regional_branch_inbox'
     if _matches_prefix_safely(local, tokens, GENERAL_OFFICE_PREFIXES):
+        return 'general_office_inbox'
+
+    # Якщо локальна частина збігається з назвою бренду (напр. apteka911@apteka911.com.ua) -> general_office_inbox
+    if b_low and len(b_low) >= 3 and (local == b_low or norm_local == b_low):
         return 'general_office_inbox'
 
     if '-' not in local and ('_' in local or '.' in local):
@@ -359,7 +370,7 @@ async def verify_predicted_emails_via_api(
                     data = resp.json()
                     st = str(data.get('status') or '').lower()
                     if st in ('safe', 'valid', 'deliverable'):
-                        return cand, f'verified_deliverable_via_reoon ({st})'
+                        return cand, f'mailbox_verified_deliverable (Reoon: {st})'
             except Exception:
                 pass
         if mv_key:
@@ -370,7 +381,7 @@ async def verify_predicted_emails_via_api(
                     data = resp.json()
                     res_code = str(data.get('result') or '').lower()
                     if res_code in ('ok', 'valid', 'deliverable'):
-                        return cand, f'verified_deliverable_via_millionverifier ({res_code})'
+                        return cand, f'mailbox_verified_deliverable (MillionVerifier: {res_code})'
             except Exception:
                 pass
 
@@ -417,6 +428,11 @@ def rank_and_clean_emails(
     email_sources: dict[str, str],
     canonical_domain: str
 ) -> tuple[list[tuple[str, str]], bool]:
+    """
+    Удосконалення №1 (v21.5):
+    Додає +20 балів бонусу за власний корпоративний домен компанії (не PUBLIC_WEBMAIL_DOMAINS),
+    щоб офіційні корпоративні адреси завжди перемагали безкоштовні Gmail/ukr.net скриньки того ж рівня.
+    """
     brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
     type_weights = {
         'marketing_or_exec_role': 100,
@@ -447,6 +463,9 @@ def rank_and_clean_emails(
             continue
         em_type = classify_email_type(em, brand_root) or 'department_or_general_inbox'
         score = type_weights.get(em_type, 10)
+        em_dom = em.split('@', 1)[1].lower()
+        if em_dom not in PUBLIC_WEBMAIL_DOMAINS and em_type != 'legal_or_hr_inbox':
+            score += 20
         if em not in cleaned or score > cleaned[em][0]:
             cleaned[em] = (score, src_url)
 
@@ -524,11 +543,16 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None = None
 ) -> str | None:
+    """
+    Удосконалення №5 (v21.5):
+    Замінено оманливий префікс 'domain_accepts_email' на чесний інженерний статус:
+    'domain_mail_configured ({provider}; MX_found; {spf_tag}; mailbox_unverified)'.
+    """
     if not email or '@' not in email:
         return None
     dom = email.split('@', 1)[1].lower().strip()
     if dom in PUBLIC_WEBMAIL_DOMAINS:
-        return f'public_webmail_provider ({dom}; MX_assumed_valid)'
+        return f'public_webmail_provider ({dom}; MX_assumed_valid; mailbox_unverified)'
 
     if dom in _DNS_MX_CACHE:
         return _DNS_MX_CACHE[dom]
@@ -565,7 +589,7 @@ async def verify_email_deliverability_deep(
         spf_present = any('v=spf1' in str(a.get('data', '')).lower() for a in txt_ans)
 
         spf_tag = 'SPF_present' if spf_present else 'SPF_unverified'
-        res = f'domain_accepts_email ({provider}; MX_found; {spf_tag})'
+        res = f'domain_mail_configured ({provider}; MX_found; {spf_tag}; mailbox_unverified)'
         _DNS_MX_CACHE[dom] = res
         return res
 
@@ -783,7 +807,8 @@ def is_marketing_or_digital_role(role_str: str | None) -> bool:
 
 def build_decision_makers_json_from_summary(
     dms_found_str: str | None,
-    primary_linkedin_url: str | None = None
+    primary_linkedin_url: str | None = None,
+    fallback_source_url: str | None = None,
 ) -> str | None:
     if not dms_found_str:
         return None
@@ -792,10 +817,12 @@ def build_decision_makers_json_from_summary(
         chunk = chunk.strip()
         if not chunk:
             continue
-        m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.+?)\]$', chunk)
+        m = re.match(r'^(.+?)\s*\((.+?)\)\s*\[(.*?)\]$', chunk)
         if not m:
             continue
         name, role, src_url = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        if not src_url and fallback_source_url:
+            src_url = fallback_source_url
         norm_role = normalize_executive_role(role)
         if not norm_role:
             continue
@@ -807,8 +834,8 @@ def build_decision_makers_json_from_summary(
         items.append({
             'name': name,
             'role': norm_role,
-            'source_url': src_url,
-            'source_type': classify_dm_source_type(src_url),
+            'source_url': src_url or None,
+            'source_type': classify_dm_source_type(src_url) if src_url else None,
             'linkedin_url': li_match,
         })
     return json.dumps(items, ensure_ascii=False) if items else None
@@ -858,8 +885,6 @@ def extract_decision_maker_deep(
                         for node in (graph if isinstance(graph, list) else [obj]):
                             if not isinstance(node, dict):
                                 continue
-                            # P0-1 Fix (v21.4): Суворо тільки ('founder', 'founders') у JSON-LD!
-                            # Ключі 'employee', 'employees', 'author', 'member' повністю заборонені.
                             for key_role in ('founder', 'founders'):
                                 val = node.get(key_role)
                                 p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
@@ -884,29 +909,46 @@ def extract_decision_maker_deep(
                 except Exception:
                     pass
 
+        # Удосконалення №4 (v21.5): Витягуємо не лише перше ім'я після Geschäftsführer: / Vertreten durch:,
+        # а й усіх співкерівників, перелічених через кому (напр. Bastian Siebers, Alexandra Szarmach, Henry Brodski на flaconi.de)
         for m in VERTRETEN_DURCH_PATTERN.finditer(page_text):
-            raw_n = m.group(1)
             full_match_low = m.group(0).lower()
-            cand_name = strip_role_tokens_from_name(raw_n)
-            if not is_valid_person_name(cand_name, brand_root):
-                continue
             if 'aufsichtsrat' in full_match_low:
                 role_label = 'Chairman of the Supervisory Board'
             elif 'vorstand' in full_match_low:
                 role_label = 'Executive Board / CEO (Vorstand)'
             else:
                 role_label = 'Managing Director / CEO (Geschäftsführer)'
-            sc = _dm_role_priority_weight(role_label) + page_bonus + 12
-            k_low = cand_name.lower()
-            if k_low not in candidates or sc > candidates[k_low]['score']:
-                candidates[k_low] = {
-                    'name': cand_name,
-                    'role': role_label,
-                    'url': page_url,
-                    'is_legal': is_legal_doc,
-                    'src_type': src_type,
-                    'score': sc,
-                }
+
+            base_sc = _dm_role_priority_weight(role_label) + page_bonus + 12
+
+            raw_first = m.group(1)
+            first_cand = strip_role_tokens_from_name(raw_first)
+            extracted_co_execs = []
+            if is_valid_person_name(first_cand, brand_root):
+                extracted_co_execs.append(first_cand)
+
+            # Перевіряємо хвіст одразу після першого імені на наявність переліку через кому або 'und'
+            tail_window = page_text[m.end():min(len(page_text), m.end() + 140)]
+            tail_clause = re.split(r'[.;\n|•]|\b(?:Register|Handelsregister|Amtsgericht|USt|Sitz|Kontakt|Telefon|E-Mail)\b', tail_window)[0]
+            if tail_clause.lstrip().startswith((',', 'und ', '&')):
+                for nm_m in _STANDALONE_NAME_FINDER.finditer(tail_clause):
+                    co_cand = strip_role_tokens_from_name(nm_m.group(1))
+                    if is_valid_person_name(co_cand, brand_root) and co_cand not in extracted_co_execs:
+                        extracted_co_execs.append(co_cand)
+
+            for idx_exec, exec_name in enumerate(extracted_co_execs[:4]):
+                sc = base_sc - idx_exec
+                k_low = exec_name.lower()
+                if k_low not in candidates or sc > candidates[k_low]['score']:
+                    candidates[k_low] = {
+                        'name': exec_name,
+                        'role': role_label,
+                        'url': page_url,
+                        'is_legal': is_legal_doc,
+                        'src_type': src_type,
+                        'score': sc,
+                    }
 
         for pattern, name_grp, role_grp in (
             (NAME_BEFORE_ROLE_PATTERN, 1, 2),
@@ -974,7 +1016,7 @@ def extract_decision_maker_deep(
     dms_found_str = '; '.join(
         f"{c['name']} ({c['role']}) [{c['url']}]" for c in sorted_cands[:5]
     )
-    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, best['li_url'])
+    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, best['li_url'], best['url'])
 
     return (
         best['name'],
