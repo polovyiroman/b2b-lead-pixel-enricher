@@ -243,13 +243,6 @@ def compute_data_quality_score(
     is_manual_seed: bool = False,
     is_same_person_email: bool = False,
 ) -> int:
-    """
-    P0-3 & P0-7 Fix (v21.4):
-    1. Якщо знайдено чужу іменну пошту (Different from Listed Executive, як на esputnik.com),
-       бонус +15 за незв'язаного ЛПР НЕ сумується поверх бонусу +34 за чужу пошту!
-    2. Якщо на сайті реально знайдено хоча б 1 технологію (як на shafa.ua) або валідний контакт,
-       скор ніколи не падає в 0 через штраф -15 за partial_gtm (мінімальний поріг 12 балів).
-    """
     if company_category == 'Non-Profit / Education / Institution':
         return 10
 
@@ -314,16 +307,35 @@ def build_sales_hook(
     best_email: str | None,
     is_eu_gdpr: bool = False,
     pw_used: bool = False,
+    best_email_type: str | None = None,
 ) -> str:
     """
-    P0-4 & P0-5 Fix (v21.4 — Evidence-Based Sales Hooks):
-    Використовує виключно верифіковані факти конфігурації без перебільшень про бюджети чи гарантований дубль хітів.
+    Удосконалення №2 (v21.5):
+    Усуває розсинхрон між decision_maker_name та власником best_email у sales_hook (напр. на netpeak.net та esputnik.com).
+    Якщо best_email є іменною поштою іншої людини (не dm_name), чітко розділяє Named Contact та Listed Executive!
     """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
         return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
+
+    brand_token = canonical_domain.split('.')[0].lower() if canonical_domain else ''
+    em_type = best_email_type or classify_email_type(best_email, brand_token)
+    is_unmatched_named_inbox = bool(
+        best_email
+        and em_type == 'personal_or_named_inbox'
+        and dm_name
+        and not verify_person_email_match(dm_name, best_email)
+    )
+
     if company_category == 'B2B Agency / Marketing Media':
-        dm_part = f' (Exec: {dm_name}, {dm_role})' if dm_name else ''
+        if is_unmatched_named_inbox:
+            dm_part = f' (Named Contact: {best_email} | Listed {dm_role or "Executive"}: {dm_name})'
+        elif dm_name:
+            dm_part = f' (Exec: {dm_name}, {dm_role})'
+        elif best_email:
+            dm_part = f' (Contact: {best_email})'
+        else:
+            dm_part = ''
         return (
             f'{brand} — B2B Agency{dm_part}. Partner Hook: '
             f'"Are you open to white-label analytics/sGTM implementation or lead-data partnership for your e-com clients?"'
@@ -343,7 +355,13 @@ def build_sales_hook(
     dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
     dup_runtime_confirmed = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
 
-    dm_intro = f'{dm_name} ({dm_role})' if dm_name else 'Marketing Lead'
+    if is_unmatched_named_inbox:
+        dm_intro = f'Marketing Lead (via named contact {best_email}; listed {dm_role or "Exec"}: {dm_name})'
+    elif dm_name:
+        dm_intro = f'{dm_name} ({dm_role})'
+    else:
+        dm_intro = 'Marketing Lead'
+
     li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
@@ -526,8 +544,6 @@ def evaluate_qualification_v180(
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
     dm_is_direct_mkt_buyer = is_marketing_or_digital_role(dm_role)
-    # P0-2: На маркетплейсах (epicentrk.ua, rozetka.com.ua) Founder/Co-Founder у парі з комерційним b2b@ —
-    # це не прямий покупець GTM/GA4 (Tier B замість Tier A-).
     is_mp_founder_with_vendor_b2b = (
         is_mp_platform
         and not dm_is_direct_mkt_buyer
@@ -535,9 +551,9 @@ def evaluate_qualification_v180(
     )
 
     source_extra_note = ''
-    if dm_source_is_legal and dm_source_type != 'impressum_page':
+    if dm_source_is_legal and dm_source_type not in ('impressum_page', 'impressum_page_cached'):
         source_extra_note = ' DM identified from legal/terms document — verify active operational role via LinkedIn before outbound.'
-    elif dm_source_type in ('product_or_service_page', 'blog_or_press_page'):
+    elif dm_source_type in ('product_or_service_page', 'blog_or_press_page', 'product_or_service_page_cached', 'blog_or_press_page_cached'):
         source_extra_note = f' DM identified on {dm_source_type} — verify active role via LinkedIn.'
 
     if is_agency:
@@ -679,10 +695,6 @@ def evaluate_qualification_v180(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # P0-2 & P0-6 Fix (v21.4):
-    # 1. На маркетплейсі (epicentrk.ua) Founder + b2b@ мапиться у Partnership-Ready (а не Sales-Ready Tier 1.5).
-    # 2. Коли not all_signals (як на flaconi.de), але є partners@flaconi.de або офісний контакт,
-    #    вердикт мапиться у partnership або gatekeeper, а НЕ у tech_only!
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -929,11 +941,12 @@ def build_manual_seed_record(
         best_email,
         is_eu_gdpr=is_eu_gdpr,
         pw_used=False,
+        best_email_type=best_email_type,
     )
 
     deliv_str = seed.get(
         'email_deliverability_check',
-        'domain_accepts_email (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
+        'domain_mail_configured (Google Workspace; MX_found; SPF_present; verified_manual_seed)'
     )
     raw_all_emails = seed.get('all_emails') or best_email or ''
     seed_emails_list = [e.strip() for e in raw_all_emails.split(';') if e.strip()]
@@ -949,7 +962,7 @@ def build_manual_seed_record(
     dms_found_str = seed.get('decision_makers_found') or (
         f'{dm_name} ({dm_role}) [{dm_src}]' if dm_name else None
     )
-    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, seed.get('decision_maker_linkedin_url'))
+    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, seed.get('decision_maker_linkedin_url'), dm_src)
 
     dq_score = compute_data_quality_score(
         contact_quality_tier,
