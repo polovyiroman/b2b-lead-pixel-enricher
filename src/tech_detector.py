@@ -1,3 +1,4 @@
+from collections import Counter
 import json
 import re
 from .config import (
@@ -34,6 +35,7 @@ SHORT_SUMMARY_LABELS = {
 }
 
 _PW_NET_REQ_REGEX = re.compile(r'<!--\s*pw_net_req:\s*(.+?)\s*-->', re.I)
+_NET_COLLECT_TID_REGEX = re.compile(r'/g/collect\?[^"\'\s<>]*?(?:^|[?&])tid=(G-[A-Z0-9]{6,12})\b', re.I)
 
 ESP_RETENTION_SIGNATURES = (
     'static.klaviyo.com',
@@ -73,6 +75,8 @@ def extract_code_snippet(source_text: str, match_str: str, max_len: int = 80) ->
 
 def _is_valid_cached_sgtm(rec: dict) -> bool:
     ev_str = str(rec.get('technology_evidence') or '')
+    if 'doubleclick.net' in ev_str.lower() and not SGTM_CUSTOM_LOADER_REGEX.search(ev_str):
+        return False
     return bool(
         SGTM_CUSTOM_LOADER_REGEX.search(ev_str)
         or SGTM_FIRST_PARTY_COLLECT_REGEX.search(ev_str)
@@ -92,7 +96,7 @@ def cap_ga4_ids_and_confidence(
     capped_str = '; '.join(ids_list[:MAX_DISPLAY_GA4_IDS])
     conf = raw_confidence
     if total_count > MAX_DISPLAY_GA4_IDS:
-        conf = f'High (multiplexed {total_count}-property)'
+        conf = f'High ({total_count} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
     return capped_str, total_count, conf
 
 
@@ -143,11 +147,10 @@ def detect_broken_attribution_red_flags(
     pw_used: bool = False,
 ) -> list[str]:
     """
-    Killer Feature #3: Детектор 4 технічних проблем втрати рекламного трафіку (Red Flags):
-    1. AdBlocker Signal Loss: Активні платні пікселі (Meta / Google Ads / TikTok) без Server-Side GTM (sGTM).
-    2. EU Consent Mode v2 Risk: Домен у ЄС з активним Google Ads та CMP-банером/Playwright, але без сигналів gcs/gcd.
-    3. Duplicate GA4 Tagging: Один і той самий G-XXXX ID зашитий одночасно в HTML сторінки та всередині GTM-контейнера.
-    4. Abandoned Cart Retention Leak: E-commerce з платним трафіком без жодної ESP/Retention-системи (Klaviyo/HubSpot/SendPulse/eSputnik).
+    P0-4 & P0-5 Fix (v21.4 — Evidence-Based Audit Hypotheses):
+    Розрізняє підтверджені у рантаймі мережеві хіти (duplicate_runtime_hits_confirmed)
+    від статичної підозри в конфігурації (duplicate_configuration_suspected)
+    і прибирає недоведені твердження про "20-30% втрат" або "активні рекламні бюджети".
     """
     if tech_info.get('tech_scan_completeness') not in ('full', 'partial_cached'):
         return []
@@ -160,6 +163,7 @@ def detect_broken_attribution_red_flags(
     has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
     has_consent_banner = bool(tech_info.get('has_cookie_banner'))
     dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
+    dup_runtime_confirmed = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
     has_esp = bool(
         tech_info.get('has_klaviyo')
         or tech_info.get('has_hubspot')
@@ -168,14 +172,17 @@ def detect_broken_attribution_red_flags(
 
     paid_count = sum(1 for x in (has_meta, has_gads, has_tiktok) if x)
 
-    # Red Flag 3: Duplicate GA4 Tagging (найбільш конкретний технічний баг — ставимо першим)
     if dup_ga4_ids:
         dup_str = ', '.join(dup_ga4_ids[:2])
-        flags.append(
-            f'Duplicate GA4 Tagging ({dup_str} hardcoded in HTML and duplicated inside GTM container — risks double pageview/event counting)'
-        )
+        if dup_runtime_confirmed:
+            flags.append(
+                f'Duplicate GA4 Tagging [duplicate_runtime_hits_confirmed] ({dup_str} present in both HTML and GTM with multiple network hits observed)'
+            )
+        else:
+            flags.append(
+                f'Duplicate GA4 Tagging [duplicate_configuration_suspected] ({dup_str} present in both page HTML and GTM container — verify runtime firing triggers)'
+            )
 
-    # Red Flag 2: EU Consent Mode v2 Risk
     if (
         is_eu_gdpr
         and has_gads
@@ -184,19 +191,17 @@ def detect_broken_attribution_red_flags(
         and (pw_used or has_consent_banner)
     ):
         flags.append(
-            'EU Consent Mode v2 Gap (Google Ads active in EEA jurisdiction without gcs/gcd consent signals observed)'
+            'EU Consent Mode v2 Gap (Google Ads tag configured in EEA jurisdiction without observable gcs/gcd consent signals)'
         )
 
-    # Red Flag 1: AdBlocker / ITP Signal Loss
     if paid_count >= 2 and not has_sgtm:
         flags.append(
-            'Client-Side AdBlocker & ITP Loss (Multi-pixel paid traffic running without Server-Side GTM — estimated 20-30% attribution loss)'
+            'Client-Side Tracking Architecture (Multi-pixel ad tags configured without observable first-party sGTM collector — validate ITP/CAPI signal recovery)'
         )
 
-    # Red Flag 4: Abandoned Cart Retention Leak
     if company_category == 'E-commerce / Retail Brand' and paid_count >= 1 and not has_esp:
         flags.append(
-            'E-commerce Retention Gap (Paid acquisition active without observable ESP/Klaviyo/CRM cart-recovery pixel)'
+            'E-commerce Retention Stack Hypothesis (Ad pixels configured without observable client-side ESP/Klaviyo/CRM retention script)'
         )
 
     return flags
@@ -276,7 +281,6 @@ def detect_tech_with_evidence(
             cm_parts.append(f'gcd={gcd_match.group(1)[:16]}')
         evidence_items.append(f"Google Consent Mode v2 signals ({', '.join(cm_parts)}) @ {page_url}")
 
-    # Для детекції Duplicate GA4 Tagging розділяємо ID, знайдені прямо в статичному HTML, та ID всередині GTM-контейнера
     html_direct_ga4 = {m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html_without_pw_comments)}
     html_direct_ga4.update(m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(html_without_pw_comments))
 
@@ -287,6 +291,9 @@ def detect_tech_with_evidence(
 
     gtm_macro_ga4 = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)} if gtm_js else set()
     duplicate_ga4_ids = sorted(html_direct_ga4 & gtm_macro_ga4)
+
+    net_tid_counts = Counter(m.upper() for m in _NET_COLLECT_TID_REGEX.findall(pw_net_combined))
+    duplicate_ga4_runtime_confirmed = any( net_tid_counts.get(gid, 0) >= 2 for gid in duplicate_ga4_ids )
 
     all_ga4_set = sorted(high_conf_ga4 | gtm_macro_ga4)
     total_ga4_count = len(all_ga4_set)
@@ -309,7 +316,9 @@ def detect_tech_with_evidence(
     if all_ga4_set:
         found_tech.append('Google Analytics (GA4)')
         if total_ga4_count > MAX_DISPLAY_GA4_IDS:
-            ga4_confidence = f'High (multiplexed {total_ga4_count}-property)'
+            ga4_confidence = (
+                f'High ({total_ga4_count} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
+            )
         elif high_conf_ga4 or total_ga4_count >= 2:
             ga4_confidence = 'High'
         else:
@@ -335,6 +344,9 @@ def detect_tech_with_evidence(
             ga4_ev_entry['total_ids_count'] = total_ga4_count
         if duplicate_ga4_ids:
             ga4_ev_entry['duplicate_html_and_gtm_ids'] = duplicate_ga4_ids[:5]
+            ga4_ev_entry['duplicate_status'] = (
+                'duplicate_runtime_hits_confirmed' if duplicate_ga4_runtime_confirmed else 'duplicate_configuration_suspected'
+            )
         evidence_json_map['Google Analytics (GA4)'] = ga4_ev_entry
     elif has_ga4_endpoint_only:
         found_tech.append('Google Analytics (GA4)')
@@ -412,9 +424,10 @@ def detect_tech_with_evidence(
                 evidence_items.append(f'{cms_name} (CMS): "{sig}" in page HTML ("{snip}")')
                 summary_items.append(cms_name)
                 evidence_json_map[cms_name] = {
-                    'source': 'live_html',
+                    'source': src_code if 'src_code' in locals() else 'live_html',
                     'signature': sig,
                 }
+                evidence_json_map[cms_name]['source'] = 'live_html'
                 break
 
     if 'WooCommerce' in detected_cms_list and 'WordPress' not in detected_cms_list:
@@ -448,6 +461,7 @@ def detect_tech_with_evidence(
         'has_sgtm': has_sgtm,
         'has_consent_mode_v2_signals': has_consent_mode_v2_signals,
         'duplicate_ga4_ids': duplicate_ga4_ids,
+        'duplicate_ga4_runtime_confirmed': duplicate_ga4_runtime_confirmed,
         'all_ga4_ids': '; '.join(capped_ga4_list) if capped_ga4_list else None,
         'all_ga4_ids_count': total_ga4_count if total_ga4_count > 0 else None,
         'ga4_detection_confidence': ga4_confidence,
