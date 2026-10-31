@@ -1,51 +1,141 @@
 {
-    "title": "B2B Lead & Ad Pixel Enricher Input",
-    "type": "object",
-    "schemaVersion": 1,
-    "properties": {
-        "domains": {
-            "title": "Domains or URLs",
-            "type": "array",
-            "description": "Paste company domains (e.g., example.com) or URLs. Duplicates and subpaths are automatically normalized to unique root domains.",
-            "editor": "stringList",
-            "prefill": ["apify.com", "shopify.com"]
-        },
-        "scanContactPages": {
-            "title": "Scan Contact & About Pages",
-            "type": "boolean",
-            "description": "Automatically visit /contact, /impressum, or /about pages to find additional emails and phone numbers.",
-            "default": true
-        },
-        "unpackGtmContainers": {
-            "title": "Unpack Google Tag Manager (GTM) Containers",
-            "type": "boolean",
-            "description": "Downloads raw GTM container scripts to detect Meta, TikTok, LinkedIn, and Google Ads pixels injected via GTM without needing a headless browser.",
-            "default": true
-        },
-        "defaultPhoneRegion": {
-            "title": "Default Country Code for Local Phones",
-            "type": "string",
-            "description": "2-letter ISO country code (e.g., US, GB, DE, UA, PL) used to validate local phone numbers written without a '+' country prefix.",
-            "editor": "textfield",
-            "default": "US"
-        },
-        "maxConcurrency": {
-            "title": "Max Concurrency",
-            "type": "integer",
-            "description": "Number of websites processed simultaneously.",
-            "default": 15,
-            "minimum": 1,
-            "maximum": 50
-        },
-        "proxyConfiguration": {
-            "title": "Proxy Configuration",
-            "type": "object",
-            "description": "Optional proxy settings to bypass rate limits or Cloudflare blocks on large lists.",
-            "editor": "proxy",
-            "default": {
-                "useApifyProxy": false
-            }
-        }
+  "title": "B2B Lead & MarTech Pixel Enricher (v21.6)",
+  "description": "Deep MarTech stack audit (GTM macro unpacking, sGTM, GA4 duplicate detection, EU Consent Mode v2), B2B contact classification, Decision-Maker discovery, and GDPR/UWG §7 compliance.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "domains": {
+      "sectionCaption": "1. Target Domains & Output Format",
+      "sectionDescription": "Provide target company domains or URLs and select whether you want the full 96-column engineering dataset or the 21-column SDR/CRM compact view.",
+      "title": "Target Domains / URLs",
+      "type": "array",
+      "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de').",
+      "editor": "stringList",
+      "prefill": [
+        "intertop.ua",
+        "notino.de",
+        "yakaboo.ua",
+        "netpeak.net"
+      ]
     },
-    "required": ["domains"]
+    "outputView": {
+      "title": "Output Dataset View",
+      "type": "string",
+      "description": "Choose 'full_audit' for all 96 technical & compliance columns, or 'sdr_compact' for a clean 21-column CRM-ready table (includes pain_point_detected and predicted_dm_email).",
+      "editor": "select",
+      "default": "full_audit",
+      "enum": [
+        "full_audit",
+        "sdr_compact"
+      ],
+      "enumTitles": [
+        "Full Engineering & Compliance Audit (96 Columns)",
+        "SDR / CRM Compact Outbound View (21 Columns)"
+      ]
+    },
+    "defaultPhoneRegion": {
+      "title": "Default Phone Region Fallback",
+      "type": "string",
+      "description": "ISO 2-letter country code used when a domain TLD is generic (.com, .io, .store) and language hints are ambiguous.",
+      "editor": "textfield",
+      "default": "US"
+    },
+    "serperApiKey": {
+      "sectionCaption": "2. Deep DM & Email Verification Keys (Optional — Recommended for 9/10 Outbound Readiness)",
+      "sectionDescription": "Connect Serper.dev (Google SERP X-Ray) to locate CMO / Head of Marketing LinkedIn profiles on e-commerce sites, and Reoon / MillionVerifier to validate predicted DM emails to 'mailbox_verified_deliverable'.",
+      "title": "Serper.dev API Key (LinkedIn CMO X-Ray)",
+      "type": "string",
+      "description": "Optional API key from serper.dev. Automatically finds CMO / Head of Digital / Marketing Director on LinkedIn when the website only lists legal CEOs or no executives.",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "reoonApiKey": {
+      "title": "Reoon Email Verifier API Key",
+      "type": "string",
+      "description": "Optional API key from reoon.com. Verifies generated DM email hypotheses (e.g., i.shevkoplyas@sendpulse.ua) in real time and promotes safe addresses to best_email.",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "millionVerifierApiKey": {
+      "title": "MillionVerifier API Key",
+      "type": "string",
+      "description": "Optional API key from millionverifier.com (alternative to Reoon for live SMTP/API verification of predicted DM emails).",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "forceFreshScan": {
+      "sectionCaption": "3. Cache Freshness, Anti-Bot WAF & Webhook Integration",
+      "sectionDescription": "Control cache TTL (prevent stale 73-day snapshots), force aggressive Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
+      "title": "Force 100% Fresh Live Scan (Ignore Cache)",
+      "type": "boolean",
+      "description": "If enabled, completely bypasses prior cached snapshots in Key-Value Store and performs a strictly live scan today.",
+      "editor": "checkbox",
+      "default": false
+    },
+    "maxCacheAgeDays": {
+      "title": "Maximum Cache Age (Days)",
+      "type": "integer",
+      "description": "Maximum allowed age (in days) for fallback cache snapshots. Set to 0 to disable cache reads, or 14-30 to prevent stale 70+ day snapshots.",
+      "default": 30,
+      "minimum": 0,
+      "maximum": 180
+    },
+    "bypassHopelessWaf": {
+      "title": "Force Playwright on Strict WAF Domains (Bypass Hopeless List)",
+      "type": "boolean",
+      "description": "If enabled, forces Playwright browser rendering even on known strict DataDome/Cloudflare domains (coolblue.nl, zalando.de, otto.de, grammarly.com). Recommended when using Residential proxies.",
+      "editor": "checkbox",
+      "default": false
+    },
+    "webhookUrl": {
+      "title": "Outbound Webhook URL (n8n / Make / Clay / CRM / Slack)",
+      "type": "string",
+      "description": "Optional HTTPS URL. When the run finishes, the Actor automatically sends a JSON POST payload containing run telemetry and enriched lead records.",
+      "editor": "textfield"
+    },
+    "scanContactPages": {
+      "sectionCaption": "4. Performance & Proxy Configuration",
+      "sectionDescription": "Fine-tune subpage crawling, GTM container unpacking, concurrency, and Apify Proxy settings.",
+      "title": "Crawl Contact, About & Impressum Subpages",
+      "type": "boolean",
+      "description": "Automatically discovers and scans /contact, /about, /team, /b2b, and /impressum pages for executive names and B2B emails.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "unpackGtmContainers": {
+      "title": "Unpack Raw GTM Container JS (gtm.js)",
+      "type": "boolean",
+      "description": "Downloads and inspects raw Google Tag Manager container code to detect hidden GA4 measurement IDs, ad pixels, and duplicate tagging.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "maxConcurrency": {
+      "title": "Max HTTP Concurrency",
+      "type": "integer",
+      "description": "Maximum number of parallel fast HTTP workers (curl_cffi).",
+      "default": 30,
+      "minimum": 5,
+      "maximum": 100
+    },
+    "maxBrowserConcurrency": {
+      "title": "Max Playwright Browser Concurrency",
+      "type": "integer",
+      "description": "Maximum number of parallel headless browser contexts for JS rendering.",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 10
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Apify Proxy settings. Residential proxies are automatically used for WAF escalation if available on your account.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true
+      }
+    }
+  },
+  "required": [
+    "domains"
+  ]
 }
