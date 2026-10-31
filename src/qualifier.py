@@ -11,6 +11,7 @@ from .contacts import (
     build_decision_makers_json_from_summary,
     classify_dm_source_type,
     classify_email_type,
+    is_marketing_or_digital_role,
     verify_person_email_match,
     verify_person_linkedin_match,
 )
@@ -242,11 +243,20 @@ def compute_data_quality_score(
     is_manual_seed: bool = False,
     is_same_person_email: bool = False,
 ) -> int:
+    """
+    P0-3 & P0-7 Fix (v21.4):
+    1. Якщо знайдено чужу іменну пошту (Different from Listed Executive, як на esputnik.com),
+       бонус +15 за незв'язаного ЛПР НЕ сумується поверх бонусу +34 за чужу пошту!
+    2. Якщо на сайті реально знайдено хоча б 1 технологію (як на shafa.ua) або валідний контакт,
+       скор ніколи не падає в 0 через штраф -15 за partial_gtm (мінімальний поріг 12 балів).
+    """
     if company_category == 'Non-Profit / Education / Institution':
         return 10
 
     score = 0
     t_str = contact_quality_tier or ''
+    is_unmatched_staff_email = ('Different from Listed Executive' in t_str or 'Listed Executive is' in t_str)
+
     if is_same_person_email:
         score += 65
     elif 'Tier A-' in t_str or 'Agency Tier A' in t_str:
@@ -262,7 +272,7 @@ def compute_data_quality_score(
     elif 'Tier D' in t_str:
         score += 6
 
-    if dm_name:
+    if dm_name and not is_unmatched_staff_email:
         score += 15
     if dm_linkedin_url:
         score += 10
@@ -282,7 +292,9 @@ def compute_data_quality_score(
         else:
             score -= 15
 
-    score = max(0, min(100, score))
+    has_any_signal_or_contact = (techs_count >= 1) or ('Tier F' not in t_str and bool(t_str))
+    floor_score = 12 if has_any_signal_or_contact else 0
+    score = max(floor_score, min(100, score))
 
     if company_category == 'B2B Agency / Marketing Media':
         return min(40, score)
@@ -303,6 +315,10 @@ def build_sales_hook(
     is_eu_gdpr: bool = False,
     pw_used: bool = False,
 ) -> str:
+    """
+    P0-4 & P0-5 Fix (v21.4 — Evidence-Based Sales Hooks):
+    Використовує виключно верифіковані факти конфігурації без перебільшень про бюджети чи гарантований дубль хітів.
+    """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
         return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
@@ -325,6 +341,7 @@ def build_sales_hook(
     has_consent = bool(tech_info.get('has_cookie_banner'))
     has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
     dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
+    dup_runtime_confirmed = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
 
     dm_intro = f'{dm_name} ({dm_role})' if dm_name else 'Marketing Lead'
     li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
@@ -333,11 +350,12 @@ def build_sales_hook(
 
     if dup_ga4_ids:
         dup_id = dup_ga4_ids[0]
+        dup_tag = 'duplicate_runtime_hits_confirmed' if dup_runtime_confirmed else 'duplicate_configuration_suspected'
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str} [Red Flag: Duplicate GA4 Tagging ({dup_id} in both HTML & GTM)]. "
-            f"Opening Hook: \"Noticed {brand}'s GA4 property ({dup_id}) is hardcoded directly in the page HTML "
-            f"and simultaneously firing inside your GTM container — are you seeing inflated pageviews/sessions or double-counted conversions in GA4?\""
+            f"Stack: {stack_str} [Red Flag: Duplicate GA4 Tagging ({dup_id} in both HTML & GTM — {dup_tag})]. "
+            f"Opening Hook: \"Noticed {brand}'s GA4 property ({dup_id}) is present both in the page HTML "
+            f"and inside your GTM container — have you verified whether GTM firing triggers are deduplicating pageviews and conversions?\""
         )
 
     cm_v2_gap_note = ''
@@ -357,17 +375,17 @@ def build_sales_hook(
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
             f"Stack: {stack_str} (Server-Side GTM verified){cm_v2_gap_note}. "
-            f"Opening Hook: \"Saw {brand} running {paid_str} with Server-Side GTM already in place — "
-            f"how are you currently benchmarking CAPI event match quality and incremental ROAS across channels?\""
+            f"Opening Hook: \"Saw {brand} has {paid_str} tags configured alongside Server-Side GTM — "
+            f"how are you currently benchmarking CAPI event match quality and attribution across channels?\""
         )
 
     if (has_meta or has_tiktok) and not has_gads:
         social_ch = 'Meta & TikTok' if (has_meta and has_tiktok) else ('Meta Pixel' if has_meta else 'TikTok Pixel')
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str}. Gap: Paid social ({social_ch}) active, but zero Google Ads Conversion tags detected. "
-            f"Opening Hook: \"Saw {brand} scaling paid social ({social_ch}) — are you intentionally holding off on "
-            f"Google Shopping/PMax capture, or routing search attribution server-side?\""
+            f"Stack: {stack_str}. Observation: Paid social tags ({social_ch}) configured in HTML/GTM, without observable Google Ads Conversion tags. "
+            f"Opening Hook: \"Saw {brand} has {social_ch} tracking configured — are you routing Google Ads/PMax attribution "
+            f"through a separate server-side setup or focusing paid acquisition on social?\""
         )
 
     if paid_channels:
@@ -376,14 +394,14 @@ def build_sales_hook(
             return (
                 f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
                 f"Stack: {stack_str}{cm_v2_gap_note}. "
-                f"Opening Hook: \"Noticed {brand} is running active {paid_str} tags in the EU market without "
-                f"Google Consent Mode v2 (gcs/gcd) signals firing — have you audited EEA conversion modeling loss yet?\""
+                f"Opening Hook: \"Noticed {brand} has {paid_str} tags configured in the EU market without observable "
+                f"Google Consent Mode v2 (gcs/gcd) parameters — have you audited EEA conversion modeling yet?\""
             )
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str}. Active multi-channel paid acquisition ({paid_str}) detected. "
-            f"Opening Hook: \"Saw {brand} running active {paid_str} campaigns alongside GA4 — "
-            f"how are you currently benchmarking cross-channel attribution and server-side signal recovery across your funnel?\""
+            f"Stack: {stack_str}. Multi-platform ad tracking tags ({paid_str}) configured on site (current campaign spend unverified). "
+            f"Opening Hook: \"Saw {brand} has {paid_str} tracking configured alongside GA4 — "
+            f"how are you currently validating cross-channel attribution and server-side signal recovery across your funnel?\""
         )
 
     if has_gtm or has_ga4:
@@ -391,14 +409,14 @@ def build_sales_hook(
             return (
                 f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
                 f"Stack: {stack_str} (strict CMP consent banner active). "
-                f"Opening Hook: \"With {brand}'s strict EU cookie banner gating ad pixels prior to consent, "
-                f"have you benchmarked how much paid attribution is dropping before Consent Mode v2 modeling kicks in?\""
+                f"Opening Hook: \"With {brand}'s EU cookie banner gating tracking scripts prior to consent, "
+                f"have you benchmarked how much attribution is dropping before Consent Mode v2 modeling kicks in?\""
             )
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str} (analytics active, zero paid ad pixels in HTML). "
-            f"Opening Hook: \"Noticed {brand} has GA4/GTM configured without Meta or Google Ads remarketing pixels — "
-            f"is paid acquisition handled via a separate performance agency or server-side container?\""
+            f"Stack: {stack_str} (analytics active, zero paid ad pixels in static HTML). "
+            f"Opening Hook: \"Noticed {brand} has GA4/GTM configured without visible Meta or Google Ads remarketing tags — "
+            f"is paid acquisition handled via a server-side container or consent-gated trigger?\""
         )
 
     return (
@@ -424,6 +442,7 @@ def evaluate_qualification_v180(
     had_marketplace_pollution: bool = False,
     pw_status_str: str = 'not_needed',
     predicted_dm_email: str | None = None,
+    is_mp_platform: bool = False,
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
     detected_list = tech_info.get('detected_technologies_list', [])
     ad_tags = []
@@ -506,6 +525,14 @@ def evaluate_qualification_v180(
 
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
+    dm_is_direct_mkt_buyer = is_marketing_or_digital_role(dm_role)
+    # P0-2: На маркетплейсах (epicentrk.ua, rozetka.com.ua) Founder/Co-Founder у парі з комерційним b2b@ —
+    # це не прямий покупець GTM/GA4 (Tier B замість Tier A-).
+    is_mp_founder_with_vendor_b2b = (
+        is_mp_platform
+        and not dm_is_direct_mkt_buyer
+        and best_email_type == 'b2b_partnerships'
+    )
 
     source_extra_note = ''
     if dm_source_is_legal and dm_source_type != 'impressum_page':
@@ -546,6 +573,15 @@ def evaluate_qualification_v180(
         contact_quality = f'Tier A- (Decision-Maker Found: {dm_name} + Direct Marketing Role Inbox: {best_email})'
         enrichment_status = 'decision_maker_found_plus_marketing_role_inbox'
         confidence_warning = f'Note: Executive identified on site and paired with dedicated marketing@ department inbox.{source_extra_note}'
+    elif dm_name and is_mp_founder_with_vendor_b2b:
+        contact_quality = (
+            f'Tier B (Marketplace Founder/Executive {dm_name} + Vendor/B2B Desk {best_email} — Locate CMO for MarTech)'
+        )
+        enrichment_status = 'marketplace_founder_and_vendor_b2b_desk_needs_cmo'
+        confidence_warning = (
+            f'Note: {dm_name} ({dm_role}) is corporate founder/board level and {best_email} handles commercial/vendor inquiries; '
+            f'locate operational CMO / Head of Digital via LinkedIn before pitching analytics.{source_extra_note}'
+        )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and len(all_signals) >= 1:
         contact_quality = (
             f'Tier A- (Decision-Maker Found: {dm_name} + Commercial B2B/Sales Channel: {best_email})'
@@ -643,6 +679,10 @@ def evaluate_qualification_v180(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
+    # P0-2 & P0-6 Fix (v21.4):
+    # 1. На маркетплейсі (epicentrk.ua) Founder + b2b@ мапиться у Partnership-Ready (а не Sales-Ready Tier 1.5).
+    # 2. Коли not all_signals (як на flaconi.de), але є partners@flaconi.de або офісний контакт,
+    #    вердикт мапиться у partnership або gatekeeper, а НЕ у tech_only!
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -659,15 +699,23 @@ def evaluate_qualification_v180(
             readiness_verdict = f'Contact-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
+    elif dm_name and is_mp_founder_with_vendor_b2b:
+        readiness_verdict = (
+            f'Partnership-Ready Only (Marketplace Founder {dm_name} + Commercial B2B Desk — Locate CMO/Head of Digital for MarTech Pitch)'
+        )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and all_signals:
         readiness_verdict = f'Sales-Ready Tier 1.5 (Verified Decision-Maker {dm_name} + Commercial B2B/Sales Channel)'
     elif best_email_type == 'marketing_or_exec_role' and all_signals:
         readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif not all_signals:
-        if dm_name:
-            readiness_verdict = f'Tech-Unverified + DM Known ({dm_name} Found; Tracking Gated by Consent or Absent — Verify Manually)'
+        if best_email_type in ('b2b_partnerships', 'marketing_or_exec_role'):
+            dm_part = f' + {dm_name}' if dm_name else ''
+            readiness_verdict = f'Partnership-Ready{dm_part} (B2B/Marketing Channel Found; Tech Stack Unverified — Check Manually)'
+        elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox', 'personal_or_named_inbox') or dm_name:
+            dm_part = f' + {dm_name} Known' if dm_name else ''
+            readiness_verdict = f'Gatekeeper-Ready{dm_part} (Contact Found; Tracking Gated by Consent or Absent — Verify Manually)'
         else:
-            readiness_verdict = 'Tech-Unverified (No Tracking Signals Detected in Static HTML — Manual Check Needed)'
+            readiness_verdict = 'Unverified (Support/Non-Sales Contact Only & No Tech Signals Detected in Static HTML)'
     elif best_email_type == 'b2b_partnerships':
         readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
     elif enrichment_status == 'owner_identified_paired_with_brand_webmail':
@@ -688,12 +736,12 @@ def evaluate_qualification_v180(
         opportunity = 'Non-commercial / Institutional organization — disqualify from standard B2B sales'
     elif len(ad_tags) >= 2:
         opportunity = (
-            f"Hypothesis for discovery audit: company uses multi-channel tracking ({', '.join(ad_tags)}); "
+            f"Hypothesis for discovery audit: multi-channel ad tracking tags ({', '.join(ad_tags)}) configured; "
             "offer complimentary tracking/attribution review or CRO benchmark to verify if optimization is needed"
         )
     elif len(ad_tags) == 1:
         opportunity = (
-            f"Hypothesis for discovery audit: single ad network ({ad_tags[0]}) visible; "
+            f"Hypothesis for discovery audit: single ad network tag ({ad_tags[0]}) visible; "
             "verify paid channel mix and explore cross-channel acquisition or tracking review"
         )
     else:
@@ -724,6 +772,11 @@ def evaluate_qualification_v180(
         next_action = (
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url}"
             f"{stack_ref_clause}{pred_email_clause}"
+        )
+    elif dm_name and is_mp_founder_with_vendor_b2b:
+        next_action = (
+            f"Locate operational CMO / Head of Digital via decision_maker_search_query on LinkedIn before pitching analytics "
+            f"(listed DM {dm_name} is {dm_role}, and {best_email} is a commercial/vendor B2B desk){phone_note}"
         )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         next_action = (
@@ -811,6 +864,7 @@ def build_manual_seed_record(
     dm_src = seed.get('decision_maker_source_url')
     dm_src_type = seed.get('decision_maker_source_type') or classify_dm_source_type(dm_src)
     li_url = seed.get('linkedin_url')
+    is_mp = bool(seed.get('marketplace_platform', canonical_domain in KNOWN_MARKETPLACE_DOMAINS))
 
     seed_tech_list = [x.strip() for x in (seed.get('detected_technologies') or '').split(';') if x.strip()]
     seed_tech_set = set(seed_tech_list)
@@ -861,7 +915,8 @@ def build_manual_seed_record(
         dm_src_type,
         li_url,
         False,
-        'not_attempted_manual_seed'
+        'not_attempted_manual_seed',
+        is_mp_platform=False,
     )
 
     sales_hook = build_sales_hook(
@@ -925,7 +980,7 @@ def build_manual_seed_record(
         'sales_readiness_verdict': sales_readiness_verdict,
         'company_category': cat,
         'category_confidence': cat_conf,
-        'marketplace_platform': bool(seed.get('marketplace_platform', canonical_domain in KNOWN_MARKETPLACE_DOMAINS)),
+        'marketplace_platform': is_mp,
         'marketplace_platform_pollution_detected': False,
         'icp_fit_tier': icp_fit_tier,
         'technical_signal_strength': technical_signal_strength,
