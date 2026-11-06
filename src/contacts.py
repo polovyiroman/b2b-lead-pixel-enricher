@@ -1,26 +1,33 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
-from urllib.parse import urlparse
+import secrets
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote, urlparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 try:
     import phonenumbers
+    from phonenumbers import PhoneNumberType
     _PHONENUMBERS_AVAILABLE = True
 except ImportError:
     _PHONENUMBERS_AVAILABLE = False
 
 from .config import (
+    ATS_CNAME_SIGNATURES,
     B2B_PARTNERSHIP_PREFIXES,
     B2B_PHONE_KEYWORDS,
     CITY_NAMES_BLACKLIST,
     CORPORATE_ENTITY_TOKENS,
     DEPARTMENT_OR_ADMISSIONS_PREFIXES,
     DEPARTMENT_PREFIX_BLACKLIST,
+    DKIM_ESP_SELECTORS,
     DM_LEGAL_SOURCE_FLAG,
     DM_SOURCE_BLACKLIST,
+    DNS_TXT_TECH_SIGNATURES,
     FOP_OWNER_PATTERN,
     FOREIGN_TESTIMONIAL_NAMES_BLACKLIST,
     GENERAL_OFFICE_PREFIXES,
@@ -32,6 +39,7 @@ from .config import (
     JUNK_EXTENSIONS,
     LOW_PRIORITY_PREFIXES,
     MARKETING_EXEC_PREFIXES,
+    MX_SEG_FIREWALL_SIGNATURES,
     NAME_BEFORE_ROLE_PATTERN,
     NAME_REGEX_PART,
     NON_PERSON_TOKENS,
@@ -50,6 +58,8 @@ from .config import (
     SUPPORT_PREFIXES,
     TELEGRAM_PLACEHOLDER_SLUGS,
     TESTIMONIAL_TEXT_MARKERS,
+    TOXIC_COMPLIANCE_LOCAL_PARTS,
+    UA_POPULAR_NAME_ALIASES,
     UA_TO_LATIN,
     UI_ACTION_WORDS_BLACKLIST,
     VERTRETEN_DURCH_PATTERN,
@@ -60,6 +70,32 @@ _DNS_MX_CACHE: dict[str, str] = {}
 _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
 
 _STANDALONE_NAME_FINDER = re.compile(rf'\b{NAME_REGEX_PART}\b', re.UNICODE)
+
+WIKIDATA_SEMAPHORE = asyncio.Semaphore(4)
+WP_AVATAR_HASH_RE = re.compile(r"/avatar/([a-f0-9]{64}|[a-f0-9]{32})\b", re.IGNORECASE)
+
+ACADEMIC_PREFIX_TITLES_RE = re.compile(
+    r"^(?:(?:prof|dr|mag|dipl\s*-\s*(?:ing|kfm|vw|inf|jur)|ing|mba|ll\.?\s*m|ph\.?\s*d|"
+    r"(?:rer\.?\s*(?:nat|pol|soc|oec)|med|iur|jur|h\.?\s*c|mult|univ)\.|"
+    r"fh|пан|пані|mr|mrs|ms|mx)[\.\s,()/-]+)+",
+    re.IGNORECASE
+)
+ACADEMIC_SUFFIX_TITLES_RE = re.compile(
+    r"[\s,/()-]+(?:mba|ph\.?\s*d|ll\.?\s*m|m\.?\s*sc|b\.?\s*sc|m\.?\s*a|b\.?\s*a|"
+    r"cfa|cpa|esq|jr\.?|sr\.?|ii|iii|iv|\(fh\))$",
+    re.IGNORECASE
+)
+
+FAX_CONTEXT_RE = re.compile(
+    r"(?:telefax|fax|факс|faks|télécopie)\s*[:.\-/]?\s*[\+\d\s()/.-]{6,22}",
+    re.IGNORECASE
+)
+
+GENERIC_DNS_HOSTMASTERS = (
+    "cloudflare.com", "awsdns", "googledomains.com", "google.com",
+    "registrar-servers.com", "ovh.net", "hetzner.com", "godaddy.com",
+    "domaincontrol.com", "namecheap.com", "azure-dns"
+)
 
 GENERIC_SINGLE_WORD_LOCALS = {
     'ask', 'dclub', 'return', 'returns', 'club', 'bonus', 'loyalty', 'card',
@@ -87,6 +123,636 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
     'спеціаліст', 'консультант', 'співробітник',
 }
 
+
+# ==============================================================================
+# v23.1 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
+# ==============================================================================
+
+def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
+    if not raw_full_name:
+        return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
+    clean = raw_full_name.strip()
+    for _ in range(3):
+        clean = ACADEMIC_PREFIX_TITLES_RE.sub("", clean).strip()
+        clean = ACADEMIC_SUFFIX_TITLES_RE.sub("", clean).strip()
+
+    if "," in clean:
+        parts_comma = [p.strip() for p in clean.split(",", 1) if p.strip()]
+        if len(parts_comma) == 2 and " " not in parts_comma[0]:
+            clean = f"{parts_comma[1]} {parts_comma[0]}"
+
+    tokens = [t for t in clean.split() if t]
+    if not tokens:
+        return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
+    if len(tokens) == 1:
+        return {"dm_clean_full_name": tokens[0], "dm_first_name": tokens[0], "dm_last_name": ""}
+    return {
+        "dm_clean_full_name": " ".join(tokens),
+        "dm_first_name": tokens[0],
+        "dm_last_name": " ".join(tokens[1:]),
+    }
+
+
+def parse_schema_org_employees_v23(emp_node: Any) -> Optional[int]:
+    if emp_node is None:
+        return None
+    if isinstance(emp_node, (int, float)) and emp_node > 0:
+        return int(emp_node)
+    if isinstance(emp_node, str):
+        clean_num = re.sub(r"['’`,\u00a0\u202f\s]", "", emp_node)
+        clean_num = re.sub(r"(?<=\d)\.(?=\d{3}(?:\b|\.))", "", clean_num)
+        nums = [int(n) for n in re.findall(r"\d+", clean_num) if int(n) > 0]
+        return nums[0] if nums else None
+    if isinstance(emp_node, dict):
+        val = emp_node.get("value")
+        if val is not None:
+            parsed = parse_schema_org_employees_v23(val)
+            if parsed:
+                return parsed
+        min_v = parse_schema_org_employees_v23(emp_node.get("minValue"))
+        max_v = parse_schema_org_employees_v23(emp_node.get("maxValue"))
+        return min_v or max_v
+    return None
+
+
+def build_wikidata_holding_sparql_v23_1(domain: str, extra_san_domains: List[str] | None = None) -> str:
+    """
+    Використовує B-Tree індекс VALUES ?website, піднімається по wdt:P749 (без інвестфондів P127)
+    і коректно прив'язує ?org до ?parentOrg через IF(!BOUND(?itemCeo) && BOUND(?parentCeo), ...).
+    """
+    domains_to_check = [domain] + (extra_san_domains[:2] if extra_san_domains else [])
+    uri_literals = []
+    for d in dict.fromkeys(domains_to_check):
+        clean = d.lower().strip("/").removeprefix("www.")
+        for proto in ("https://", "http://"):
+            for prefix in ("", "www."):
+                for suffix in ("", "/"):
+                    uri_literals.append(f"<{proto}{prefix}{clean}{suffix}>")
+
+    values_clause = " ".join(uri_literals)
+    return f"""
+    SELECT ?org ?orgLabel ?ceo ?ceoLabel ?execScope ?founder ?founderLabel ?lei ?euVat ?employees WHERE {{
+      VALUES ?website {{ {values_clause} }}
+      ?item wdt:P856 ?website .
+      OPTIONAL {{
+        ?item p:P169 ?itemCeoStmt .
+        ?itemCeoStmt ps:P169 ?itemCeo .
+        FILTER NOT EXISTS {{ ?itemCeoStmt pq:P582 ?endTime1 . }}
+      }}
+      OPTIONAL {{
+        ?item wdt:P749 ?parentOrg .
+        OPTIONAL {{
+          ?parentOrg p:P169 ?parentCeoStmt .
+          ?parentCeoStmt ps:P169 ?parentCeo .
+          FILTER NOT EXISTS {{ ?parentCeoStmt pq:P582 ?endTime2 . }}
+        }}
+        OPTIONAL {{ ?parentOrg wdt:P1278 ?parentLei . }}
+        OPTIONAL {{ ?parentOrg wdt:P3608 ?parentVat . }}
+        OPTIONAL {{ ?parentOrg wdt:P1128 ?parentEmp . }}
+        OPTIONAL {{ ?parentOrg wdt:P112 ?parentFounder . }}
+      }}
+      OPTIONAL {{ ?item wdt:P1278 ?itemLei . }}
+      OPTIONAL {{ ?item wdt:P3608 ?itemVat . }}
+      OPTIONAL {{ ?item wdt:P1128 ?itemEmp . }}
+      OPTIONAL {{ ?item wdt:P112 ?itemFounder . }}
+      BIND(COALESCE(?itemCeo, ?parentCeo) AS ?ceo)
+      BIND(IF(BOUND(?itemCeo), "target_entity", IF(BOUND(?parentCeo), "parent_holding", "none")) AS ?execScope)
+      BIND(COALESCE(?itemFounder, ?parentFounder) AS ?founder)
+      BIND(COALESCE(?itemLei, ?parentLei) AS ?lei)
+      BIND(COALESCE(?itemVat, ?parentVat) AS ?euVat)
+      BIND(COALESCE(?itemEmp, ?parentEmp) AS ?employees)
+      BIND(IF(!BOUND(?itemCeo) && BOUND(?parentCeo), ?parentOrg, ?item) AS ?org)
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,de,uk,pl,fr,nl". }}
+    }}
+    LIMIT 5
+    """
+
+
+async def query_wikidata_holding_and_ceo(
+    http_client: Any,
+    domain: str,
+    extra_san_domains: List[str] | None = None
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "wikidata_current_ceo": None,
+        "decision_maker_scope": "none",
+        "wikidata_founders": [],
+        "wikidata_org_label": None,
+        "wikidata_lei": None,
+        "wikidata_eu_vat": None,
+        "wikidata_employees": None,
+    }
+    sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
+    headers = {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "ApifyB2BLeadEnricherBot/23.1 (https://apify.com; support@apify.com)",
+    }
+    async with WIKIDATA_SEMAPHORE:
+        try:
+            resp = await http_client.get(
+                "https://query.wikidata.org/sparql",
+                params={"query": sparql, "format": "json"},
+                headers=headers,
+                timeout=2.2
+            )
+            if resp.status_code == 200:
+                bindings = (resp.json().get("results") or {}).get("bindings") or []
+                founders_set: Set[str] = set()
+                for b in bindings:
+                    if not out["wikidata_current_ceo"] and b.get("ceoLabel", {}).get("value"):
+                        val = b["ceoLabel"]["value"]
+                        if not re.match(r"^Q\d+$", val):
+                            out["wikidata_current_ceo"] = val
+                            out["decision_maker_scope"] = b.get("execScope", {}).get("value", "target_entity")
+                    f_val = b.get("founderLabel", {}).get("value")
+                    if f_val and not re.match(r"^Q\d+$", f_val):
+                        founders_set.add(f_val)
+                    if not out["wikidata_org_label"] and b.get("orgLabel", {}).get("value"):
+                        out["wikidata_org_label"] = b["orgLabel"]["value"]
+                    if not out["wikidata_lei"] and b.get("lei", {}).get("value"):
+                        out["wikidata_lei"] = b["lei"]["value"]
+                    if not out["wikidata_eu_vat"] and b.get("euVat", {}).get("value"):
+                        out["wikidata_eu_vat"] = b["euVat"]["value"]
+                    if not out["wikidata_employees"] and b.get("employees", {}).get("value"):
+                        out["wikidata_employees"] = parse_schema_org_employees_v23(b["employees"]["value"])
+                out["wikidata_founders"] = sorted(founders_set)[:4]
+                if not out["wikidata_current_ceo"] and out["wikidata_founders"]:
+                    out["wikidata_current_ceo"] = out["wikidata_founders"][0]
+                    out["decision_maker_scope"] = "founder_fallback"
+        except Exception:
+            pass
+    return out
+
+
+def generate_phonetic_token_variants_v23(
+    raw_token: str,
+    translit_func: Optional[Callable[[str], str]] = None
+) -> List[str]:
+    if not raw_token:
+        return []
+    t = raw_token.strip().lower()
+    ascii_pre = (
+        t.replace("ä", "a").replace("ö", "o").replace("ü", "u").replace("ß", "ss")
+        .replace("ł", "l").replace("ń", "n").replace("ś", "s").replace("ź", "z")
+        .replace("ż", "z").replace("ć", "c").replace("ą", "a").replace("ę", "e")
+    )
+    din_pre = (
+        t.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss").replace("ł", "l")
+    )
+    active_translit = translit_func or transliterate_ua_to_latin
+    variants: Set[str] = set()
+    for branch in (t, ascii_pre, din_pre):
+        lat = active_translit(branch).lower() if branch == t else branch
+        clean_v = re.sub(r"[^a-z0-9]", "", lat)
+        if clean_v:
+            variants.add(clean_v)
+            if clean_v in UA_POPULAR_NAME_ALIASES:
+                variants.update(UA_POPULAR_NAME_ALIASES[clean_v])
+    return sorted(variants)
+
+
+def crack_wp_user_email_dual_hash_v23_1(
+    full_name: str,
+    slug: str,
+    domain: str,
+    avatar_urls: Dict[str, str],
+    translit_func: Optional[Callable[[str], str]] = None
+) -> Optional[str]:
+    """
+    Двохешевий дешифратор (MD5 32 символи + SHA-256 64 символи для WordPress 6.8+).
+    Використовується для математичного визначення корпоративного шаблону пошт домену.
+    """
+    if not domain or not avatar_urls:
+        return None
+    target_hash = None
+    for url in avatar_urls.values():
+        m = WP_AVATAR_HASH_RE.search(str(url))
+        if m:
+            target_hash = m.group(1).lower()
+            break
+    if not target_hash:
+        return None
+
+    hash_func = hashlib.sha256 if len(target_hash) == 64 else hashlib.md5
+    clean_dom = domain.lower().strip().removeprefix("www.")
+    candidates: List[str] = []
+    if slug:
+        s_clean = re.sub(r"[^a-z0-9._-]", "", slug.lower())
+        if s_clean:
+            candidates.append(f"{s_clean}@{clean_dom}")
+
+    raw_parts = [p for p in (full_name or "").strip().split() if p]
+    if len(raw_parts) >= 2:
+        first_vars = generate_phonetic_token_variants_v23(raw_parts[0], translit_func)
+        last_vars = generate_phonetic_token_variants_v23(raw_parts[-1], translit_func)
+        for f in first_vars:
+            candidates.append(f"{f}@{clean_dom}")
+            for l in last_vars:
+                candidates.extend([
+                    f"{f}.{l}@{clean_dom}",
+                    f"{f[0]}.{l}@{clean_dom}",
+                    f"{f[0]}{l}@{clean_dom}",
+                    f"{f}_{l}@{clean_dom}",
+                    f"{f}-{l}@{clean_dom}",
+                    f"{l}.{f}@{clean_dom}",
+                    f"{l}@{clean_dom}",
+                ])
+    elif len(raw_parts) == 1:
+        for f in generate_phonetic_token_variants_v23(raw_parts[0], translit_func):
+            candidates.append(f"{f}@{clean_dom}")
+
+    for cand in dict.fromkeys(candidates):
+        if hash_func(cand.encode("utf-8")).hexdigest() == target_hash:
+            return cand
+    return None
+
+
+async def verify_m365_candidates_safe(
+    http_session: Any,
+    domain: str,
+    candidate_emails: List[str]
+) -> Dict[str, Any]:
+    endpoint = "https://login.microsoftonline.com/common/GetCredentialType?mkt=en-US"
+    out: Dict[str, Any] = {
+        "verified_email": None,
+        "verification_status": "not_checked",
+        "tenant_type": None,
+        "detected_federated_idp": None,
+    }
+
+    async def _probe(email_addr: str) -> Optional[Dict[str, Any]]:
+        payload = {
+            "Username": email_addr,
+            "isOtherIdpSupported": True,
+            "checkPhones": False,
+            "isRemoteNGCSupported": True,
+            "isCookieBannerShown": False,
+            "isFidoSupported": True,
+            "originalRequest": "",
+            "flowToken": ""
+        }
+        try:
+            resp = await http_session.post(endpoint, json=payload, timeout=2.5)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            return None
+        return None
+
+    canary_data = await _probe(f"canary_probe_{secrets.token_hex(5)}@{domain}")
+    if not canary_data:
+        out["verification_status"] = "m365_unreachable"
+        return out
+
+    ests_props = canary_data.get("EstsProperties") or {}
+    domain_type = ests_props.get("DomainType")
+    throttle_status = canary_data.get("ThrottleStatus", 0)
+    canary_exists = canary_data.get("IfExistsResult", -1)
+    out["tenant_type"] = domain_type
+
+    if domain_type == 4:
+        fed_url = (canary_data.get("Credentials") or {}).get("FederationRedirectUrl") or ""
+        if "okta.com" in fed_url:
+            out["detected_federated_idp"] = "Okta SSO"
+        elif "pingidentity" in fed_url:
+            out["detected_federated_idp"] = "PingIdentity"
+        elif "duosecurity" in fed_url:
+            out["detected_federated_idp"] = "Cisco Duo"
+        else:
+            out["detected_federated_idp"] = "Enterprise Federated ADFS/IdP"
+        out["verification_status"] = "skipped_federated_idp"
+        return out
+
+    if domain_type != 3 or throttle_status != 0 or canary_exists != 1:
+        out["verification_status"] = "skipped_catch_all_or_non_managed"
+        return out
+
+    for candidate in candidate_emails[:4]:
+        res = await _probe(candidate)
+        if not res:
+            continue
+        if res.get("ThrottleStatus", 0) != 0:
+            out["verification_status"] = "aborted_m365_throttled"
+            break
+        if res.get("IfExistsResult") in (0, 5, 6):
+            out["verified_email"] = candidate
+            out["verification_status"] = "m365_matched"
+            return out
+
+    out["verification_status"] = "no_candidate_matched_m365"
+    return out
+
+
+async def verify_candidates_via_gravatar_two_step(
+    http_session: Any,
+    candidate_emails: List[str]
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "verified_email": None,
+        "verification_status": "no_gravatar_match",
+        "profile_display_name": None,
+    }
+    for email in candidate_emails[:4]:
+        clean_email = email.strip().lower()
+        if not clean_email or "@" not in clean_email:
+            continue
+        md5_hash = hashlib.md5(clean_email.encode("utf-8")).hexdigest()
+        try:
+            head_resp = await http_session.head(f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.8)
+            if head_resp.status_code == 200:
+                result["verified_email"] = clean_email
+                result["verification_status"] = "identity_verified_gravatar_profile"
+                try:
+                    j_resp = await http_session.get(f"https://en.gravatar.com/{md5_hash}.json", timeout=1.8)
+                    if j_resp.status_code == 200:
+                        entries = j_resp.json().get("entry") or []
+                        if entries and isinstance(entries[0], dict):
+                            result["profile_display_name"] = entries[0].get("displayName")
+                except Exception:
+                    pass
+                return result
+        except Exception:
+            continue
+    return result
+
+
+async def verify_ceo_email_cascade_port443_v23_1(
+    http_client: Any,
+    domain: str,
+    candidate_emails: List[str],
+    mx_records_str: str,
+    has_seg_gateway: bool = False
+) -> Dict[str, Any]:
+    if not candidate_emails:
+        return {
+            "verified_email": None,
+            "verification_status": "no_candidates",
+            "email_verification_confidence": "NONE",
+            "detected_federated_idp": None,
+        }
+
+    mx_low = (mx_records_str or "").lower()
+    is_m365_mx = "outlook.com" in mx_low or "microsoft" in mx_low or has_seg_gateway
+    is_google_mx = "google.com" in mx_low or "googlemail.com" in mx_low
+    fed_idp = None
+
+    if not is_google_mx:
+        m365_res = await verify_m365_candidates_safe(http_client, domain, candidate_emails)
+        fed_idp = m365_res.get("detected_federated_idp")
+        if m365_res.get("verified_email"):
+            if is_m365_mx:
+                return {
+                    "verified_email": m365_res["verified_email"],
+                    "verification_status": "mailbox_verified_m365_active_directory",
+                    "email_verification_confidence": "HIGH_IDENTITY_AND_MX",
+                    "detected_federated_idp": fed_idp,
+                }
+            return {
+                "verified_email": m365_res["verified_email"],
+                "verification_status": "identity_verified_m365_external_mx",
+                "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+                "detected_federated_idp": fed_idp,
+            }
+
+    grav_res = await verify_candidates_via_gravatar_two_step(http_client, candidate_emails)
+    if grav_res.get("verified_email"):
+        return {
+            "verified_email": grav_res["verified_email"],
+            "verification_status": "identity_verified_gravatar_profile",
+            "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+            "detected_federated_idp": fed_idp,
+        }
+
+    for cand in candidate_emails[:2]:
+        try:
+            pgp_url = f"https://keys.openpgp.org/vks/v1/by-email/{quote(cand.strip().lower())}"
+            resp = await http_client.get(pgp_url, timeout=1.8)
+            if resp.status_code == 200:
+                return {
+                    "verified_email": cand.strip().lower(),
+                    "verification_status": "identity_verified_openpgp_key",
+                    "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+                    "detected_federated_idp": fed_idp,
+                }
+        except Exception:
+            continue
+
+    return {
+        "verified_email": None,
+        "verification_status": "mailbox_unverified",
+        "email_verification_confidence": "PATTERN_ESTIMATED",
+        "detected_federated_idp": fed_idp,
+    }
+
+
+def _clean_doh_strings(doh_tuple: Any) -> List[str]:
+    if not isinstance(doh_tuple, (tuple, list)) or len(doh_tuple) < 2:
+        return []
+    ok, records = doh_tuple[0], doh_tuple[1]
+    if not ok or not isinstance(records, list):
+        return []
+    cleaned: List[str] = []
+    for rec in records:
+        if isinstance(rec, dict):
+            raw = str(rec.get("data") or "")
+            norm = re.sub(r'"\s*"', "", raw).strip('"').strip().rstrip(".")
+            if norm:
+                cleaned.append(norm)
+    return cleaned
+
+
+def resolve_soa_rname_safe(
+    rname_raw: str,
+    etld_func: Callable[[str], tuple[str, str]]
+) -> Optional[str]:
+    if not rname_raw:
+        return None
+    clean = rname_raw.strip().rstrip(".").lower()
+    if not clean or "." not in clean or any(g in clean for g in GENERIC_DNS_HOSTMASTERS):
+        return None
+
+    if r"\." in clean:
+        parts = re.split(r"(?<!\\)\.", clean, maxsplit=1)
+        if len(parts) == 2:
+            local = parts[0].replace(r"\.", ".")
+            host_reg, _ = etld_func(parts[1])
+            return f"{local}@{host_reg or parts[1]}"
+
+    reg_dom, _ = etld_func(clean)
+    if not reg_dom or not clean.endswith(reg_dom) or clean == reg_dom:
+        return None
+    prefix = clean[: -(len(reg_dom) + 1)].strip(".")
+    if not prefix:
+        return None
+
+    standard_roles = {
+        "hostmaster", "postmaster", "dns", "dnsadmin", "dns-admin",
+        "noc", "domains", "domainadmin", "admin", "root", "tech", "abuse"
+    }
+    first_label = prefix.split(".")[0]
+    if first_label in standard_roles:
+        return f"{first_label}@{reg_dom}"
+    return f"{prefix}@{reg_dom}"
+
+
+async def run_unified_dns_intelligence_v23(
+    http_client: Any,
+    domain: str,
+    query_doh_func: Callable[[Any, str, str], Any],
+    etld_func: Callable[[str], tuple[str, str]],
+    probe_dkim: bool = True
+) -> Dict[str, Any]:
+    tasks: Dict[str, Any] = {
+        "txt": query_doh_func(http_client, domain, "TXT"),
+        "mx": query_doh_func(http_client, domain, "MX"),
+        "dmarc": query_doh_func(http_client, f"_dmarc.{domain}", "TXT"),
+        "bimi": query_doh_func(http_client, f"default._bimi.{domain}", "TXT"),
+        "soa": query_doh_func(http_client, domain, "SOA"),
+        "jobs_cname": query_doh_func(http_client, f"jobs.{domain}", "CNAME"),
+        "careers_cname": query_doh_func(http_client, f"careers.{domain}", "CNAME"),
+    }
+    if probe_dkim:
+        for sel in DKIM_ESP_SELECTORS:
+            tasks[sel] = query_doh_func(http_client, f"{sel}.{domain}", "CNAME")
+
+    keys = list(tasks.keys())
+    raw_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    res_map = dict(zip(keys, raw_results))
+
+    shadow_tech: Set[str] = set()
+    txt_joined = " ".join(_clean_doh_strings(res_map.get("txt"))).lower()
+    mx_joined = " ".join(_clean_doh_strings(res_map.get("mx"))).lower()
+
+    for sig, tech_name in DNS_TXT_TECH_SIGNATURES.items():
+        if sig in txt_joined:
+            shadow_tech.add(tech_name)
+    for sel, (marker, esp_name) in DKIM_ESP_SELECTORS.items():
+        for cname_val in _clean_doh_strings(res_map.get(sel)):
+            if marker in cname_val.lower():
+                shadow_tech.add(esp_name)
+
+    seg_gateway = None
+    combined_mail = f"{mx_joined} {txt_joined}"
+    for seg_sig, seg_name in MX_SEG_FIREWALL_SIGNATURES.items():
+        if seg_sig in combined_mail:
+            seg_gateway = seg_name
+            break
+
+    dmarc_policy = "none_or_missing"
+    dmarc_rua_domains: Set[str] = set()
+    curr_reg, _ = etld_func(domain)
+    for dm_str in _clean_doh_strings(res_map.get("dmarc")):
+        dm_low = dm_str.lower()
+        if "v=dmarc1" in dm_low:
+            m_pol = re.search(r"\bp\s*=\s*(reject|quarantine|none)\b", dm_low)
+            if m_pol:
+                dmarc_policy = m_pol.group(1)
+            for mail_match in re.findall(r"mailto:[a-z0-9._%+-]+@([a-z0-9.-]+\.[a-z]{2,})", dm_low):
+                rua_reg, _ = etld_func(mail_match)
+                if rua_reg and rua_reg != curr_reg:
+                    dmarc_rua_domains.add(rua_reg)
+
+    detected_ats = None
+    ats_cname_target = None
+    for ck in ("jobs_cname", "careers_cname"):
+        for c_val in _clean_doh_strings(res_map.get(ck)):
+            c_low = c_val.lower()
+            for ats_sig, ats_name in ATS_CNAME_SIGNATURES.items():
+                if ats_sig in c_low:
+                    detected_ats = ats_name
+                    ats_cname_target = c_low
+                    shadow_tech.add(ats_name)
+                    break
+
+    bimi_logo = None
+    bimi_vmc = None
+    for b_str in _clean_doh_strings(res_map.get("bimi")):
+        if "v=bimi1" in b_str.lower():
+            for part in b_str.split(";"):
+                p = part.strip()
+                if p.lower().startswith("l="):
+                    bimi_logo = p[2:].strip()
+                elif p.lower().startswith("a="):
+                    bimi_vmc = p[2:].strip()
+
+    soa_email = None
+    last_dns_change = None
+    for soa_str in _clean_doh_strings(res_map.get("soa")):
+        parts = soa_str.split()
+        if len(parts) >= 3:
+            soa_email = resolve_soa_rname_safe(parts[1], etld_func)
+            serial = parts[2].strip()
+            if len(serial) == 10 and serial.isdigit() and serial.startswith(("202", "201")):
+                y, m, d = serial[:4], serial[4:6], serial[6:8]
+                if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+                    last_dns_change = f"{y}-{m}-{d}"
+            break
+
+    return {
+        "dns_shadow_tech": sorted(shadow_tech),
+        "mx_records_raw": mx_joined,
+        "email_security_gateway": seg_gateway,
+        "plain_text_outreach_required": bool(seg_gateway),
+        "dmarc_policy": dmarc_policy,
+        "dmarc_parent_or_vendor_domains": sorted(dmarc_rua_domains)[:5],
+        "detected_ats_provider": detected_ats,
+        "ats_cname_target": ats_cname_target,
+        "bimi_logo_url": bimi_logo,
+        "has_enterprise_vmc_seal": bool(bimi_vmc and bimi_vmc.lower().endswith(".pem")),
+        "soa_admin_email": soa_email,
+        "last_dns_change_date": last_dns_change,
+    }
+
+
+def filter_poisoned_and_compliance_emails(
+    candidate_emails: List[str],
+    poisoned_honeypot_set: Set[str]
+) -> Tuple[List[str], Optional[str]]:
+    safe_emails: List[str] = []
+    dpo_email: Optional[str] = None
+    for email in (candidate_emails or []):
+        e_low = email.strip().lower()
+        if "@" not in e_low or e_low in poisoned_honeypot_set:
+            continue
+        local_part = e_low.split("@", 1)[0]
+        if local_part in TOXIC_COMPLIANCE_LOCAL_PARTS or any(
+            local_part.startswith(f"{t}.") or local_part.startswith(f"{t}-") or local_part.startswith(f"{t}_")
+            for t in ("datenschutz", "dpo", "privacy", "widerruf", "gdpr", "abuse")
+        ):
+            if not dpo_email:
+                dpo_email = e_low
+            continue
+        safe_emails.append(email)
+    return safe_emails, dpo_email
+
+
+def normalize_whatsapp_number_safe(raw_digits: str, default_region: str = "UA") -> Optional[str]:
+    if not raw_digits:
+        return None
+    clean_digits = re.sub(r"\D", "", raw_digits)
+    if len(clean_digits) < 8 or len(clean_digits) > 15:
+        return None
+    if _PHONENUMBERS_AVAILABLE:
+        if not clean_digits.startswith("0"):
+            try:
+                parsed = phonenumbers.parse(f"+{clean_digits}", None)
+                if phonenumbers.is_valid_number(parsed):
+                    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+            except Exception:
+                pass
+        if default_region:
+            try:
+                parsed_loc = phonenumbers.parse(clean_digits, default_region.upper())
+                if phonenumbers.is_valid_number(parsed_loc):
+                    return phonenumbers.format_number(parsed_loc, phonenumbers.PhoneNumberFormat.E164)
+            except Exception:
+                pass
+    return None
+
+
+# ==============================================================================
+# Core Contact Classification & Extraction Functions
+# ==============================================================================
 
 def clean_escaped_email_prefix(raw_email: str | None) -> str:
     if not raw_email:
@@ -133,7 +799,8 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
 def strip_role_tokens_from_name(raw_name: str) -> str:
     if not raw_name:
         return ''
-    cleaned = re.sub(r'^(?:Dr\.|Prof\.|Mag\.|Dipl\.-Ing\.|Ing\.|Mr\.|Mrs\.|Ms\.)\s+', '', raw_name.strip(), flags=re.I)
+    cleaned = ACADEMIC_PREFIX_TITLES_RE.sub('', raw_name.strip())
+    cleaned = ACADEMIC_SUFFIX_TITLES_RE.sub('', cleaned.strip())
     tokens = [t.strip(' ,—–-:|()•.') for t in cleaned.split() if t.strip(' ,—–-:|()•.')]
     kept: list[str] = []
     for tok in tokens:
@@ -193,16 +860,19 @@ def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
     local = clean_escaped_email_prefix(email).split('@', 1)[0].lower()
     if local in NON_PERSON_TOKENS or local in GENERIC_SINGLE_WORD_LOCALS:
         return False
-    parts = [transliterate_ua_to_latin(p) for p in dm_name.split() if len(p) >= 2]
-    if len(parts) < 2:
+    raw_tokens = [p for p in dm_name.split() if len(p) >= 2]
+    if len(raw_tokens) < 2:
         return False
-    first_n, last_n = re.sub(r'[^a-z]', '', parts[0]), re.sub(r'[^a-z]', '', parts[-1])
+    first_variants = generate_phonetic_token_variants_v23(raw_tokens[0], transliterate_ua_to_latin)
+    last_variants = generate_phonetic_token_variants_v23(raw_tokens[-1], transliterate_ua_to_latin)
     norm_local = re.sub(r'[^a-z]', '', local)
-    if len(first_n) >= 3 and len(last_n) >= 3:
-        if first_n in norm_local and last_n in norm_local:
-            return True
-        if norm_local == f'{first_n[0]}{last_n}' or norm_local == f'{last_n}{first_n[0]}':
-            return True
+    for first_n in first_variants:
+        for last_n in last_variants:
+            if len(first_n) >= 3 and len(last_n) >= 3:
+                if first_n in norm_local and last_n in norm_local:
+                    return True
+                if norm_local == f'{first_n[0]}{last_n}' or norm_local == f'{last_n}{first_n[0]}':
+                    return True
     return False
 
 
@@ -211,11 +881,16 @@ def verify_person_linkedin_match(dm_name: str | None, linkedin_url: str | None) 
         return False
     slug = linkedin_url.lower().split('linkedin.com/in/', 1)[1].split('/')[0].split('?')[0]
     slug_clean = re.sub(r'[^a-z]', '', slug)
-    parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2]
-    parts = [p for p in parts if len(p) >= 3]
-    if len(parts) < 2:
+    raw_tokens = [p for p in dm_name.split() if len(p) >= 2]
+    if len(raw_tokens) < 2:
         return False
-    return parts[0] in slug_clean and parts[-1] in slug_clean
+    first_variants = generate_phonetic_token_variants_v23(raw_tokens[0], transliterate_ua_to_latin)
+    last_variants = generate_phonetic_token_variants_v23(raw_tokens[-1], transliterate_ua_to_latin)
+    return any(
+        len(f) >= 3 and len(l) >= 3 and f in slug_clean and l in slug_clean
+        for f in first_variants
+        for l in last_variants
+    )
 
 
 def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tuple[str, ...]) -> bool:
@@ -231,14 +906,6 @@ def _matches_prefix_safely(local_part: str, tokens: list[str], prefix_tuple: tup
 
 
 def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
-    """
-    Удосконалення №1 (v21.5):
-    1. Перевіряє LOW_PRIORITY_PREFIXES (зокрема 'arenda', 'orenda', 'rent', 'lease', 'immobilien')
-       ПЕРЕД перевіркою PUBLIC_WEBMAIL_DOMAINS, щоб 'apteka911.arenda@gmail.com' ставала 'legal_or_hr_inbox' (вага 2),
-       а не 'brand_webmail_general_inbox' (вага 50).
-    2. Якщо локальна частина корпоративної пошти дорівнює назві бренду (напр. 'apteka911@apteka911.com.ua'),
-       повертає 'general_office_inbox' (вага 60 + 20 бонус домену = 80).
-    """
     if not email or '@' not in email:
         return None
     clean_em = clean_escaped_email_prefix(email)
@@ -278,7 +945,6 @@ def classify_email_type(email: str | None, brand_root: str = '') -> str | None:
     if _matches_prefix_safely(local, tokens, GENERAL_OFFICE_PREFIXES):
         return 'general_office_inbox'
 
-    # Якщо локальна частина збігається з назвою бренду (напр. apteka911@apteka911.com.ua) -> general_office_inbox
     if b_low and len(b_low) >= 3 and (local == b_low or norm_local == b_low):
         return 'general_office_inbox'
 
@@ -313,10 +979,11 @@ def generate_dm_email_pattern_candidates(
         return []
 
     brand_root = dom.split('.')[0]
-    if not is_valid_person_name(dm_name, brand_root):
+    cleaned_exec = split_clean_executive_name(dm_name).get("dm_clean_full_name") or dm_name
+    if not is_valid_person_name(cleaned_exec, brand_root):
         return []
 
-    raw_parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in dm_name.split() if len(p) >= 2]
+    raw_parts = [re.sub(r'[^a-z]', '', transliterate_ua_to_latin(p)) for p in cleaned_exec.split() if len(p) >= 2]
     parts = [p for p in raw_parts if len(p) >= 2]
     if len(parts) < 2:
         return []
@@ -428,11 +1095,6 @@ def rank_and_clean_emails(
     email_sources: dict[str, str],
     canonical_domain: str
 ) -> tuple[list[tuple[str, str]], bool]:
-    """
-    Удосконалення №1 (v21.5):
-    Додає +20 балів бонусу за власний корпоративний домен компанії (не PUBLIC_WEBMAIL_DOMAINS),
-    щоб офіційні корпоративні адреси завжди перемагали безкоштовні Gmail/ukr.net скриньки того ж рівня.
-    """
     brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
     type_weights = {
         'marketing_or_exec_role': 100,
@@ -543,11 +1205,6 @@ async def verify_email_deliverability_deep(
     email: str | None,
     source_url: str | None = None
 ) -> str | None:
-    """
-    Удосконалення №5 (v21.5):
-    Замінено оманливий префікс 'domain_accepts_email' на чесний інженерний статус:
-    'domain_mail_configured ({provider}; MX_found; {spf_tag}; mailbox_unverified)'.
-    """
     if not email or '@' not in email:
         return None
     dom = email.split('@', 1)[1].lower().strip()
@@ -608,12 +1265,21 @@ def extract_valid_phones(
     raw_tel_links: list[tuple[str, str]],
     default_region: str = 'US'
 ) -> list[tuple[str, int]]:
+    """
+    Системний інваріант #5 (v23.1 Complete):
+    Локальні телефонні номери країни домену (+380 на .ua, +49 на .de) зберігають найвищий пріоритет (+35),
+    а факсові номери попередньо вирізаються через FAX_CONTEXT_RE.
+    """
     target_region = (default_region or 'US').upper().strip()
     expected_prefix = REGION_DIALING_PREFIX_MAP.get(target_region, '+1')
     candidates: dict[str, int] = {}
+    clean_text = FAX_CONTEXT_RE.sub(' ', text or '')
 
     def _add_validated_candidate(raw_str: str, ctx: str, base_score: int) -> None:
         if not raw_str:
+            return
+        ctx_low = (ctx or '').lower()
+        if any(fx in ctx_low for fx in ('telefax', 'fax:', 'факс')):
             return
         cleaned_raw = raw_str.strip()
         if _PHONENUMBERS_AVAILABLE:
@@ -646,7 +1312,6 @@ def extract_valid_phones(
         if num_region == target_region or e164_str.startswith(expected_prefix):
             score += 35
 
-        ctx_low = (ctx or '').lower()
         if any(k in ctx_low for k in B2B_PHONE_KEYWORDS):
             score += 30
         elif any(k in ctx_low for k in RETAIL_PHONE_KEYWORDS):
@@ -660,7 +1325,7 @@ def extract_valid_phones(
 
     if _PHONENUMBERS_AVAILABLE:
         try:
-            for m in phonenumbers.PhoneNumberMatcher(text[:120000], target_region):
+            for m in phonenumbers.PhoneNumberMatcher(clean_text[:120000], target_region):
                 num_obj = m.number
                 if not phonenumbers.is_valid_number(num_obj):
                     continue
@@ -677,8 +1342,8 @@ def extract_valid_phones(
                 if n_reg == target_region or e164_s.startswith(expected_prefix):
                     sc += 35
                 w_start = max(0, m.start - 50)
-                w_end = min(len(text), m.end + 50)
-                ctx_w = text[w_start:w_end].lower()
+                w_end = min(len(clean_text), m.end + 50)
+                ctx_w = clean_text[w_start:w_end].lower()
                 if any(k in ctx_w for k in B2B_PHONE_KEYWORDS):
                     sc += 30
                 elif any(k in ctx_w for k in RETAIL_PHONE_KEYWORDS):
@@ -688,10 +1353,10 @@ def extract_valid_phones(
         except Exception:
             pass
     else:
-        for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', text[:120000]):
+        for m in re.finditer(r'(?:\+\d{1,3}[\s\-()]*)?(?:\(\d{2,4}\)[\s\-]*|\d{2,4}[\s\-]+)\d{2,4}[\s\-]+\d{2,4}(?:[\s\-]+\d{2,4})?', clean_text[:120000]):
             w_start = max(0, m.start() - 50)
-            w_end = min(len(text), m.end() + 50)
-            _add_validated_candidate(m.group(0), text[w_start:w_end], 25)
+            w_end = min(len(clean_text), m.end() + 50)
+            _add_validated_candidate(m.group(0), clean_text[w_start:w_end], 25)
 
     ranked = sorted(candidates.items(), key=lambda x: (-x[1], x[0]))
     return ranked[:3]
@@ -765,6 +1430,8 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
     if not source_url:
         return None
     u_low = source_url.lower()
+    if 'wikidata.org' in u_low:
+        return 'wikidata_sparql'
     if 'linkedin.com/in/' in u_low:
         return 'serp_linkedin_xray'
     path = urlparse(source_url).path.lower()
@@ -909,8 +1576,6 @@ def extract_decision_maker_deep(
                 except Exception:
                     pass
 
-        # Удосконалення №4 (v21.5): Витягуємо не лише перше ім'я після Geschäftsführer: / Vertreten durch:,
-        # а й усіх співкерівників, перелічених через кому (напр. Bastian Siebers, Alexandra Szarmach, Henry Brodski на flaconi.de)
         for m in VERTRETEN_DURCH_PATTERN.finditer(page_text):
             full_match_low = m.group(0).lower()
             if 'aufsichtsrat' in full_match_low:
@@ -928,7 +1593,6 @@ def extract_decision_maker_deep(
             if is_valid_person_name(first_cand, brand_root):
                 extracted_co_execs.append(first_cand)
 
-            # Перевіряємо хвіст одразу після першого імені на наявність переліку через кому або 'und'
             tail_window = page_text[m.end():min(len(page_text), m.end() + 140)]
             tail_clause = re.split(r'[.;\n|•]|\b(?:Register|Handelsregister|Amtsgericht|USt|Sitz|Kontakt|Telefon|E-Mail)\b', tail_window)[0]
             if tail_clause.lstrip().startswith((',', 'und ', '&')):
