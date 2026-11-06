@@ -1,0 +1,58 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "B2B Lead & MarTech Pixel Enricher Standby API",
+    "description": "Real-time synchronous HTTP API for single-domain MarTech & B2B contact enrichment (v23.1 Complete).",
+    "version": "23.1.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Readiness & Health Probe",
+        "responses": {
+          "200": {
+            "description": "Container is ready to accept enrichment requests."
+          }
+        }
+      }
+    },
+    "/enrich": {
+      "get": {
+        "summary": "Enrich a single B2B domain in real time",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "required": true,
+            "description": "Target company domain or URL (e.g., 'intertop.ua' or 'notino.de').",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scanMode",
+            "in": "query",
+            "required": false,
+            "description": "Execution mode: 'fast_http_only' (default for Standby) or 'full_audit'.",
+            "schema": {
+              "type": "string",
+              "default": "fast_http_only",
+              "enum": [
+                "fast_http_only",
+                "full_audit"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Enriched B2B lead and MarTech audit JSON object."
+          },
+          "400": {
+            "description": "Missing domain parameter or SSRF-blocked target host."
+          }
+        }
+      }
+    }
+  }
+}
