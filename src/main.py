@@ -3,10 +3,19 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import os
 import re
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 from urllib.parse import urlparse
 from apify import Actor
 from curl_cffi.requests import AsyncSession
+
+try:
+    from aiohttp import web
+    _AIOHTTP_AVAILABLE = True
+except ImportError:
+    web = None
+    _AIOHTTP_AVAILABLE = False
 
 from .config import (
     CACHE_SCHEMA_VERSION,
@@ -14,6 +23,8 @@ from .config import (
     DM_SOURCE_BLACKLIST,
     EVERGREEN_MAX_AGE_DAYS,
     GTM_ID_REGEX,
+    INFRA_SAN_DENYLIST,
+    KNOWN_DOMAIN_REDIRECT_ALIASES,
     KNOWN_MARKETPLACE_DOMAINS,
     MIN_COMPATIBLE_CACHE_SCHEMA,
     PUBLIC_WEBMAIL_DOMAINS,
@@ -32,9 +43,15 @@ from .contacts import (
     extract_decision_maker_deep,
     extract_named_email_owner_hint,
     fetch_dm_via_serp_fallback,
+    filter_poisoned_and_compliance_emails,
     generate_dm_email_pattern_candidates,
     is_marketing_or_digital_role,
+    query_doh_json,
+    query_wikidata_holding_and_ceo,
     rank_and_clean_emails,
+    run_unified_dns_intelligence_v23,
+    split_clean_executive_name,
+    verify_ceo_email_cascade_port443_v23_1,
     verify_email_deliverability_deep,
     verify_person_email_match,
     verify_predicted_emails_via_api,
@@ -46,6 +63,7 @@ from .domain_helpers import (
     build_compliance_note,
     build_safe_cache_payload,
     build_timeout_stub,
+    check_hostname_ssrf_and_dns_async,
     compute_google_ads_confidence,
     contact_link_priority,
     derive_gdpr_jurisdiction,
@@ -55,6 +73,7 @@ from .domain_helpers import (
     derive_sales_actionability_class,
     detect_country_hint,
     domain_weight,
+    extract_etld_plus_one,
     guess_region_from_domain,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
@@ -71,10 +90,16 @@ from .qualifier import (
     build_linkedin_xray_query,
     build_manual_seed_record,
     build_sales_hook,
+    calculate_saas_spend_range_usd,
     classify_company_category,
+    compute_account_change_triggers_v23,
     compute_data_quality_score,
+    detect_ma_rebrand_and_insolvency_v23,
     evaluate_qualification_v180,
+    fetch_rdap_domain_maturity_v23,
     is_marketplace_platform,
+    resolve_prospect_timezone_and_locale_v23,
+    verify_eu_entity_vies_and_gleif,
 )
 from .regression_gate import run_startup_regression_gate
 from .scraper import (
@@ -84,9 +109,12 @@ from .scraper import (
     configure_pw,
     discover_links_from_sitemap,
     extract_semantic_contact_links_from_html,
+    extract_tls_x509_der_intel,
     fetch_gtm_scripts,
     fetch_html_playwright_fallback,
     fetch_html_safely,
+    fetch_store_and_well_known_bundle,
+    fetch_waf_bypass_or_wayback_legal,
     get_clean_canonical_domain,
     is_allowed_by_robots,
     is_dynamic_hopeless_waf,
@@ -100,8 +128,12 @@ from .scraper import (
 from .tech_detector import (
     build_evidence_json_from_cached_record,
     build_summary_from_cached_record,
+    decode_apple_pay_merchant_association_safe,
     detect_broken_attribution_red_flags,
     detect_tech_with_evidence,
+    extract_shopify_pim_and_logistics_signals,
+    fetch_google_ads_transparency_intel_v23_1,
+    fetch_public_ats_hiring_intel,
 )
 
 SDR_COMPACT_COLUMNS = (
@@ -136,6 +168,101 @@ LOW_VALUE_LIVE_EMAIL_TYPES = {
 }
 
 
+# ==============================================================================
+# v23.1 Complete: Адаптивний OSINT Budget Runner, Дедуплікатор Холдингів та Standby Server
+# ==============================================================================
+
+async def run_osint_tasks_with_time_budget(
+    named_coros: Dict[str, Coroutine[Any, Any, Any]],
+    budget_seconds: float = 3.0
+) -> Dict[str, Any]:
+    if not named_coros:
+        return {}
+    task_map = {name: asyncio.create_task(coro) for name, coro in named_coros.items()}
+    results: Dict[str, Any] = {name: None for name in named_coros}
+    pending = set(task_map.values())
+    try:
+        done, pending = await asyncio.wait(
+            task_map.values(),
+            timeout=budget_seconds,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for name, task in task_map.items():
+            if task in done and not task.cancelled() and task.exception() is None:
+                results[name] = task.result()
+    finally:
+        for p_task in pending:
+            if not p_task.done():
+                p_task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return results
+
+
+class SafeBatchHoldingDeduplicator:
+    def __init__(self) -> None:
+        self._seen_keys: Dict[str, str] = {}
+
+    def check_and_register(self, record: Dict[str, Any], brand_root: str) -> str:
+        domain = str(record.get("canonical_domain") or "")
+        email = str(record.get("best_email") or "").strip().lower()
+        dm_name = str(record.get("decision_maker_name") or "").strip().lower()
+        myshopify = str(record.get("myshopify_canonical_domain") or "").strip().lower()
+
+        lookup_keys = []
+        if email and "@" in email and not email.startswith(("info@", "contact@", "support@", "hello@", "office@")):
+            lookup_keys.append(f"email:{email}")
+        if dm_name and len(dm_name) >= 5 and brand_root:
+            lookup_keys.append(f"dm:{dm_name}:{brand_root.lower()}")
+        if myshopify:
+            lookup_keys.append(f"shop:{myshopify}")
+
+        for k in lookup_keys:
+            if k in self._seen_keys and self._seen_keys[k] != domain:
+                return f"HOLDING_DUPLICATE_SKIP_OUTREACH (primary: {self._seen_keys[k]})"
+        for k in lookup_keys:
+            self._seen_keys.setdefault(k, domain)
+        return "PRIMARY_OUTREACH_TARGET"
+
+
+async def start_standby_http_server(enrich_single_domain_func: Callable[[str, str], Any]) -> None:
+    if not _AIOHTTP_AVAILABLE or web is None:
+        raise RuntimeError("aiohttp is required for Standby HTTP Server mode")
+    port = int(os.environ.get("ACTOR_WEB_SERVER_PORT") or os.environ.get("APIFY_CONTAINER_PORT") or "8080")
+
+    async def handle_request(request: web.Request) -> web.Response:
+        if request.headers.get("x-apify-container-server-readiness-probe"):
+            return web.json_response({"status": "ready", "version": "23.1"}, status=200)
+
+        domain = (request.query.get("domain") or "").strip()
+        if not domain:
+            if request.path == "/":
+                return web.json_response({"status": "ready", "version": "23.1"}, status=200)
+            return web.json_response({"error": "Missing required query parameter: domain"}, status=400)
+
+        reg_dom, _ = extract_etld_plus_one(domain)
+        is_allowed, reason = await check_hostname_ssrf_and_dns_async(reg_dom)
+        if not is_allowed and reason == "ssrf_blocked":
+            return web.json_response({"error": "Blocked private or non-public target host"}, status=400)
+
+        scan_mode = (request.query.get("scanMode") or "fast_http_only").strip()
+        record = await enrich_single_domain_func(domain, scan_mode)
+        return web.json_response(record, status=200)
+
+    app = web.Application()
+    app.router.add_get("/", handle_request)
+    app.router.add_get("/enrich", handle_request)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    await asyncio.Event().wait()
+
+
+# ==============================================================================
+# Core Formatting, Cache Helpers & Domain Pipeline
+# ==============================================================================
+
 def format_record_for_output_view(record: dict, output_view: str = 'full_audit') -> dict:
     if (output_view or 'full_audit').lower().strip() == 'sdr_compact':
         compact = {col: record.get(col) for col in SDR_COMPACT_COLUMNS}
@@ -151,10 +278,6 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
 
 
 def _is_cache_record_fresh(c_rec: dict | None, max_cache_age_days: int) -> bool:
-    """
-    v21.6: Перевіряє, чи дозволено читання з кешу (max_cache_age_days > 0)
-    і чи вік кешованого снепшота не перевищує встановлений ліміт (за замовчуванням 30 днів).
-    """
     if not isinstance(c_rec, dict) or max_cache_age_days <= 0:
         return False
     prev_time = c_rec.get('last_checked_at')
@@ -172,10 +295,6 @@ async def _send_completion_webhook(
     run_telemetry: dict,
     records: list[dict],
 ) -> None:
-    """
-    v21.6: Нативний вбудований POST-вебхук для автоматичної доставки збагачених лідів
-    у n8n, Make, Clay.com, HubSpot, Pipedrive або Slack без сторонніх конекторів.
-    """
     if not webhook_url or not isinstance(webhook_url, str):
         return
     clean_wh = webhook_url.strip()
@@ -188,7 +307,7 @@ async def _send_completion_webhook(
 
     payload = {
         'event': 'b2b_lead_pixel_enricher.run_completed',
-        'version': '21.6',
+        'version': '23.1',
         'summary': run_telemetry,
         'records_count': len(records),
         'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
@@ -220,6 +339,125 @@ async def _get_playwright_proxy_url(proxy_config, domain_key: str) -> str | None
         return None
 
 
+def _build_early_abort_record(
+    domain_key: str,
+    canonical_domain: str,
+    aliases_str: str,
+    clean_website_url: str,
+    fail_status: str,
+    short_err_msg: str,
+    checked_at: str,
+    pw_status_str: str = 'skipped_dns_or_unreachable',
+) -> dict:
+    cat, cat_conf = classify_company_category(domain_key, '', '', [])
+    c_hint = detect_country_hint(canonical_domain, '', '', None, '')
+    blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
+    blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+    verdict = (
+        'Disqualified (SSRF / Non-Public Target Blocked)'
+        if fail_status == 'ssrf_blocked'
+        else 'Unverified (Domain Unreachable / DNS Error)'
+    )
+    return {
+        'input_domain': domain_key,
+        'canonical_domain': canonical_domain,
+        'aliases': aliases_str,
+        'input_was_redirected': False,
+        'redirect_chain': None,
+        'website_url': clean_website_url,
+        'final_redirect_url': clean_website_url,
+        'status': fail_status,
+        'cached_snapshot_source': f'none (live_{fail_status})',
+        'cached_snapshot_age_days': None,
+        'error_message': short_err_msg,
+        'data_quality_score': 0,
+        'sales_readiness_verdict': verdict,
+        'sales_actionability_class': derive_sales_actionability_class(verdict, cat),
+        'company_category': cat,
+        'category_confidence': cat_conf,
+        'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
+        'marketplace_platform_pollution_detected': False,
+        'icp_fit_tier': 'Unverified (Site Unreachable)',
+        'technical_signal_strength': None,
+        'tech_scan_completeness': 'partial_blocked',
+        'tech_rescan_needed': (fail_status != 'ssrf_blocked'),
+        'contact_quality_tier': 'Tier F (Site Unreachable)',
+        'contact_quality_tier_human': 'No Contact',
+        'contact_enrichment_status': fail_status,
+        'data_confidence_warning': f'Domain pre-check failed ({fail_status}: {short_err_msg}).',
+        'gdpr_eu_domain': blocked_is_eu,
+        'gdpr_jurisdiction': blocked_jur,
+        'legal_basis_for_processing': None,
+        'data_subject_can_request_deletion': True,
+        'data_retention_policy_days': 365,
+        'personal_data_fields_in_record': f'none ({fail_status})',
+        'compliance_note': build_compliance_note(canonical_domain, c_hint),
+        'playwright_available': is_playwright_available(),
+        'playwright_used': False,
+        'playwright_status': pw_status_str,
+        'playwright_attempts_count': 0,
+        'playwright_paths_attempted': None,
+        'page_title': f'[Site {fail_status}: {short_err_msg}]',
+        'meta_description': None,
+        'best_email': None,
+        'email_domain': None,
+        'best_email_type': None,
+        'email_source_type': None,
+        'email_source_note': None,
+        'named_email_owner_role_hint': None,
+        'email_deliverability_check': None,
+        'all_emails_deliverability': None,
+        'all_emails_classification': None,
+        'email_source_url': None,
+        'primary_phone': None,
+        'e164_phone': None,
+        'phone_availability': 'site_blocked',
+        'phone_source_url': None,
+        'decision_maker_name': None,
+        'decision_maker_role': None,
+        'decision_maker_source_url': None,
+        'decision_maker_source_type': None,
+        'decision_makers_found': None,
+        'decision_makers_json': None,
+        'decision_maker_linkedin_url': None,
+        'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat, c_hint),
+        'linkedin_url': None,
+        'instagram_url': None,
+        'facebook_url': None,
+        'telegram_url': None,
+        'tiktok_url': None,
+        'youtube_url': None,
+        'social_source_url': None,
+        'detected_signals': None,
+        'detected_cms': None,
+        'consent_mode_likely': None,
+        'ga4_detection_confidence': None,
+        'has_google_ads_confidence': 'unknown',
+        'sales_hook': None,
+        'sales_opportunity': f'Scan {fail_status} ({short_err_msg}) — cannot verify stack without access',
+        'next_best_action': 'Verify domain spelling / DNS status or use decision_maker_search_query on LinkedIn',
+        'technology_evidence_summary': None,
+        'technology_evidence': None,
+        'technology_evidence_json': None,
+        'has_meta_pixel': None,
+        'has_tiktok_pixel': None,
+        'has_google_ads': None,
+        'has_linkedin_pixel': None,
+        'has_pinterest_tag': None,
+        'has_hubspot': None,
+        'has_klaviyo': None,
+        'has_ga4': None,
+        'has_gtm': None,
+        'has_sgtm': None,
+        'all_ga4_ids': None,
+        'all_ga4_ids_count': None,
+        'detected_technologies': None,
+        'all_emails': None,
+        'all_phones': None,
+        'last_checked_at': checked_at,
+    }
+
+
 async def process_domain(
     client: AsyncSession,
     domain_key: str,
@@ -238,15 +476,39 @@ async def process_domain(
     millionverifier_api_key: str | None = None,
     max_cache_age_days: int = 30,
     bypass_hopeless_waf: bool = False,
+    scan_mode: str = 'full_audit',
+    enable_deep_osint: bool = False,
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
     pw_used_flag = False
-    pw_status_str = 'not_needed' if is_playwright_available() else 'disabled'
+    is_fast_http_only = (scan_mode or '').lower().strip() == 'fast_http_only'
+    pw_status_str = 'disabled_fast_mode' if is_fast_http_only else ('not_needed' if is_playwright_available() else 'disabled')
     pw_attempts_count = 0
     pw_attempted_paths: list[str] = []
     pw_had_timeout_or_block = False
     allow_cache_reads = (cache_store is not None and max_cache_age_days > 0)
+
+    # Фаза 4 (v23.1): Неблокуючий сокет-префільтр SSRF vs DNS (NXDOMAIN) за 0 мс до запуску HTTP/Playwright
+    reg_input_dom, _ = extract_etld_plus_one(domain_key)
+    check_host = reg_input_dom or domain_key
+    is_host_allowed, host_reason = await check_hostname_ssrf_and_dns_async(check_host, timeout=1.5)
+    if not is_host_allowed:
+        aliases_str_early = '; '.join(initial_aliases) if initial_aliases else domain_key
+        if host_reason == 'ssrf_blocked':
+            Actor.log.warning(f'[SSRF BLOCKED] {domain_key} rejected by socket pre-filter')
+            return _build_early_abort_record(
+                domain_key, domain_key, aliases_str_early, f'https://{domain_key}/',
+                'ssrf_blocked', 'Blocked private or non-public target IP/host', checked_at,
+                pw_status_str='skipped_ssrf_blocked'
+            )
+        if host_reason == 'dns_error' and domain_key not in manual_seeds:
+            Actor.log.info(f'[DNS ERROR FAST-ABORT] {domain_key} NXDOMAIN; skipping HTTP and Playwright')
+            return _build_early_abort_record(
+                domain_key, domain_key, aliases_str_early, f'https://{domain_key}/',
+                'dns_error', 'Domain does not resolve in DNS (NXDOMAIN)', checked_at,
+                pw_status_str='skipped_dns_or_unreachable'
+            )
 
     async with semaphore:
         status, html, final_url, err_msg = await fetch_html_safely(
@@ -255,21 +517,36 @@ async def process_domain(
 
     short_err_msg = truncate_error_msg(err_msg)
     canonical_domain = get_clean_canonical_domain(final_url, domain_key)
-    brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
+    _, brand_root = extract_etld_plus_one(canonical_domain)
+    if not brand_root:
+        brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
+
+    prelim_fail_class = classify_failure_status(status, err_msg) if (status == 0 or status >= 400) else 'ok'
+    is_non_recoverable_net_err = (status == 0 and prelim_fail_class in ('dns_error', 'unreachable', 'ssl_error'))
+
     is_pw_hopeless = (
-        not bypass_hopeless_waf
-        and (
-            canonical_domain in KNOWN_PW_HOPELESS
-            or domain_key in KNOWN_PW_HOPELESS
-            or is_dynamic_hopeless_waf(err_msg)
+        is_fast_http_only
+        or is_non_recoverable_net_err
+        or (
+            not bypass_hopeless_waf
+            and (
+                canonical_domain in KNOWN_PW_HOPELESS
+                or domain_key in KNOWN_PW_HOPELESS
+                or is_dynamic_hopeless_waf(err_msg)
+            )
         )
     )
 
     if (status == 0 or status in (403, 429, 503)) and is_playwright_available():
         if is_pw_hopeless:
-            pw_status_str = 'skipped_hopeless_waf'
+            if is_non_recoverable_net_err:
+                pw_status_str = f'skipped_{prelim_fail_class}'
+            elif is_fast_http_only:
+                pw_status_str = 'skipped_fast_http_only'
+            else:
+                pw_status_str = 'skipped_hopeless_waf'
             pw_had_timeout_or_block = True
-            Actor.log.info(f'[PW SKIP] {canonical_domain} is hopeless WAF ({short_err_msg}); skipping Playwright rescue')
+            Actor.log.info(f'[PW SKIP] {canonical_domain} ({pw_status_str}: {short_err_msg}); skipping Playwright rescue')
         else:
             rescue_url = clean_url_port(root_url) or root_url
             pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
@@ -304,6 +581,7 @@ async def process_domain(
                 pw_used_flag = True
                 pw_status_str = 'rendered'
                 canonical_domain = get_clean_canonical_domain(final_url, domain_key)
+                _, brand_root = extract_etld_plus_one(canonical_domain)
                 if pw_rescue_inc and len(pw_rescue_html) < 15_000:
                     pw_had_timeout_or_block = True
             else:
@@ -336,6 +614,20 @@ async def process_domain(
     else:
         was_redirected = False
         redirect_chain_str = None
+
+    # Якщо сайт заблокований WAF, перед поверненням помилки пробуємо Lateral SAN / Wayback Machine CDX bypass (v23.1)
+    if (status == 0 or status >= 400 or not html) and not is_non_recoverable_net_err and enable_deep_osint:
+        try:
+            tls_pre = await extract_tls_x509_der_intel(canonical_domain, timeout=1.8)
+            wb_html, wb_src = await fetch_waf_bypass_or_wayback_legal(
+                client, canonical_domain, tls_pre.get('prioritized_bypass_hosts') or []
+            )
+            if wb_html and len(wb_html) > 600:
+                Actor.log.info(f'[WAF BYPASS RECOVERY] {canonical_domain} recovered via {wb_src}')
+                html = wb_html
+                status = 200
+        except Exception:
+            pass
 
     if status == 0 or status >= 400 or not html:
         fail_status = classify_failure_status(status, err_msg)
@@ -628,117 +920,22 @@ async def process_domain(
                 except Exception:
                     pass
 
-        cat, cat_conf = classify_company_category(domain_key, '', '', [])
-        c_hint = detect_country_hint(canonical_domain, '', '', None, '')
-        blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
-        blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-        blocked_verdict = 'Unverified (Scan Blocked by WAF)'
-        return {
-            'input_domain': domain_key,
-            'canonical_domain': canonical_domain,
-            'aliases': aliases_str,
-            'input_was_redirected': was_redirected,
-            'redirect_chain': redirect_chain_str,
-            'website_url': clean_website_url,
-            'final_redirect_url': normalized_final_redirect,
-            'status': fail_status,
-            'cached_snapshot_source': 'none (live_blocked)',
-            'cached_snapshot_age_days': None,
-            'error_message': short_err_msg,
-            'data_quality_score': 0,
-            'sales_readiness_verdict': blocked_verdict,
-            'sales_actionability_class': derive_sales_actionability_class(blocked_verdict, cat),
-            'company_category': cat,
-            'category_confidence': cat_conf,
-            'marketplace_platform': canonical_domain in KNOWN_MARKETPLACE_DOMAINS,
-            'marketplace_platform_pollution_detected': False,
-            'icp_fit_tier': 'Unverified (Site Blocked / Unreachable)',
-            'technical_signal_strength': None,
-            'tech_scan_completeness': 'partial_blocked',
-            'tech_rescan_needed': True,
-            'contact_quality_tier': 'Tier F (Site Blocked)',
-            'contact_quality_tier_human': 'No Contact',
-            'contact_enrichment_status': 'scan_blocked_by_waf',
-            'data_confidence_warning': 'Site blocked by WAF/Cloudflare and no prior cached snapshot available.',
-            'gdpr_eu_domain': blocked_is_eu,
-            'gdpr_jurisdiction': blocked_jur,
-            'legal_basis_for_processing': None,
-            'data_subject_can_request_deletion': True,
-            'data_retention_policy_days': 365,
-            'personal_data_fields_in_record': 'none (site_blocked)',
-            'compliance_note': build_compliance_note(canonical_domain, c_hint),
-            'playwright_available': is_playwright_available(),
-            'playwright_used': False,
-            'playwright_status': pw_status_str if (pw_attempts_count > 0 or is_pw_hopeless) else 'not_attempted_site_blocked',
-            'playwright_attempts_count': pw_attempts_count,
-            'playwright_paths_attempted': '; '.join(pw_attempted_paths) if pw_attempted_paths else None,
-            'page_title': f'[Site blocked: {short_err_msg}]',
-            'meta_description': None,
-            'best_email': None,
-            'email_domain': None,
-            'best_email_type': None,
-            'email_source_type': None,
-            'email_source_note': None,
-            'named_email_owner_role_hint': None,
-            'email_deliverability_check': None,
-            'all_emails_deliverability': None,
-            'all_emails_classification': None,
-            'email_source_url': None,
-            'primary_phone': None,
-            'e164_phone': None,
-            'phone_availability': 'site_blocked',
-            'phone_source_url': None,
-            'decision_maker_name': None,
-            'decision_maker_role': None,
-            'decision_maker_source_url': None,
-            'decision_maker_source_type': None,
-            'decision_makers_found': None,
-            'decision_makers_json': None,
-            'decision_maker_linkedin_url': None,
-            'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat, c_hint),
-            'linkedin_url': None,
-            'instagram_url': None,
-            'facebook_url': None,
-            'telegram_url': None,
-            'tiktok_url': None,
-            'youtube_url': None,
-            'social_source_url': None,
-            'detected_signals': None,
-            'detected_cms': None,
-            'consent_mode_likely': None,
-            'ga4_detection_confidence': None,
-            'has_google_ads_confidence': 'unknown',
-            'sales_hook': None,
-            'sales_opportunity': f'Scan {fail_status} ({short_err_msg}) — cannot verify stack without access',
-            'next_best_action': 'Retry with residential proxy or run decision_maker_search_query on LinkedIn',
-            'technology_evidence_summary': None,
-            'technology_evidence': None,
-            'technology_evidence_json': None,
-            'has_meta_pixel': None,
-            'has_tiktok_pixel': None,
-            'has_google_ads': None,
-            'has_linkedin_pixel': None,
-            'has_pinterest_tag': None,
-            'has_hubspot': None,
-            'has_klaviyo': None,
-            'has_ga4': None,
-            'has_gtm': None,
-            'has_sgtm': None,
-            'all_ga4_ids': None,
-            'all_ga4_ids_count': None,
-            'detected_technologies': None,
-            'all_emails': None,
-            'all_phones': None,
-            'last_checked_at': checked_at
-        }
+        return _build_early_abort_record(
+            domain_key, canonical_domain, aliases_str, clean_website_url,
+            fail_status, short_err_msg, checked_at,
+            pw_status_str=pw_status_str if (pw_attempts_count > 0 or is_pw_hopeless) else 'not_attempted_site_blocked'
+        )
 
     effective_region = resolve_effective_phone_region(canonical_domain, default_region, html)
     is_pw_hopeless = (
-        not bypass_hopeless_waf
-        and (
-            canonical_domain in KNOWN_PW_HOPELESS
-            or domain_key in KNOWN_PW_HOPELESS
-            or is_dynamic_hopeless_waf(err_msg)
+        is_fast_http_only
+        or (
+            not bypass_hopeless_waf
+            and (
+                canonical_domain in KNOWN_PW_HOPELESS
+                or domain_key in KNOWN_PW_HOPELESS
+                or is_dynamic_hopeless_waf(err_msg)
+            )
         )
     )
 
@@ -844,10 +1041,10 @@ async def process_domain(
         not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all
     ):
         if is_pw_hopeless:
-            pw_status_str = 'skipped_hopeless_waf'
+            pw_status_str = 'skipped_fast_http_only' if is_fast_http_only else 'skipped_hopeless_waf'
             if not (tech_info['has_ga4'] and tech_info['has_gtm']):
                 pw_had_timeout_or_block = True
-            Actor.log.info(f'[PW SKIP] {canonical_domain} is in KNOWN_PW_HOPELESS; skipping Playwright fallback')
+            Actor.log.info(f'[PW SKIP] {canonical_domain} ({pw_status_str}); skipping Playwright fallback')
         else:
             pw_proxy = await _get_playwright_proxy_url(proxy_config, canonical_domain)
             pw_locale = pw_locale_for_region(effective_region)
@@ -930,6 +1127,38 @@ async def process_domain(
     if pw_had_timeout_or_block and not (tech_info['has_ga4'] and tech_info['has_gtm']):
         scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
         tech_info['tech_scan_completeness'] = scan_comp_flag
+
+    # Двохвильовий OSINT DAG (v23.1 Complete) — опціональний розширений збір з жорстким бюджетом часу
+    osint_wave1: dict = {}
+    osint_wave2: dict = {}
+    if enable_deep_osint:
+        w1_budget = 2.2 if is_fast_http_only else 3.2
+        osint_wave1 = await run_osint_tasks_with_time_budget(
+            {
+                'tls': extract_tls_x509_der_intel(canonical_domain, timeout=1.8),
+                'dns_intel': run_unified_dns_intelligence_v23(
+                    client, canonical_domain, query_doh_json, extract_etld_plus_one, probe_dkim=(not is_fast_http_only)
+                ),
+                'well_known': fetch_store_and_well_known_bundle(client, canonical_domain, html),
+                'ads_rpc': fetch_google_ads_transparency_intel_v23_1(
+                    client, canonical_domain, extract_etld_plus_one, INFRA_SAN_DENYLIST
+                ),
+                'rdap': fetch_rdap_domain_maturity_v23(client, canonical_domain),
+            },
+            budget_seconds=w1_budget,
+        )
+        dns_intel_res = osint_wave1.get('dns_intel') or {}
+        for sh_tech in dns_intel_res.get('dns_shadow_tech') or []:
+            if sh_tech in ('Klaviyo', 'HubSpot') and sh_tech not in tech_info['detected_technologies_list']:
+                tech_info['detected_technologies_list'].append(sh_tech)
+                tech_info['has_esp_retention'] = True
+
+        wk_res = osint_wave1.get('well_known') or {}
+        if wk_res.get('apple_pay_raw'):
+            ap_dec = decode_apple_pay_merchant_association_safe(wk_res['apple_pay_raw'])
+            for gw in ap_dec.get('psp_gateways') or []:
+                if gw not in (tech_info.get('payment_gateways') or []):
+                    tech_info.setdefault('payment_gateways', []).append(gw)
 
     cache_tech_recovered = False
     cache_sources_count = 0
@@ -1035,6 +1264,10 @@ async def process_domain(
     selected_email_pairs = (non_legal_pairs or ranked_emails_with_src)[:5]
     all_emails_list = [em for em, _ in selected_email_pairs]
 
+    _, compliance_dpo_email = filter_poisoned_and_compliance_emails(
+        [em for em, _ in ranked_emails_with_src], set()
+    )
+
     top3_pairs = selected_email_pairs[:3]
     if top3_pairs:
         async with semaphore:
@@ -1114,6 +1347,29 @@ async def process_domain(
 
     country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
     dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
+
+    # Хвиля 2 OSINT (Wikidata SPARQL CEO fallback, VIES/GLEIF, ATS Jobs)
+    if enable_deep_osint:
+        tls_res = osint_wave1.get('tls') or {}
+        dns_res = osint_wave1.get('dns_intel') or {}
+        w2_tasks: dict = {}
+        if not dm_name:
+            w2_tasks['wikidata'] = query_wikidata_holding_and_ceo(
+                client, canonical_domain, tls_res.get('corporate_sans') or []
+            )
+        if dns_res.get('detected_ats_provider') == 'Greenhouse':
+            w2_tasks['ats'] = fetch_public_ats_hiring_intel(client, 'Greenhouse', brand_root)
+        if w2_tasks:
+            osint_wave2 = await run_osint_tasks_with_time_budget(
+                w2_tasks, budget_seconds=(1.8 if is_fast_http_only else 2.5)
+            )
+            wd_res = osint_wave2.get('wikidata') or {}
+            if not dm_name and wd_res.get('wikidata_current_ceo'):
+                dm_name = wd_res['wikidata_current_ceo']
+                dm_role = 'Chief Executive Officer (CEO)' if wd_res.get('decision_maker_scope') != 'founder_fallback' else 'Founder'
+                dm_source_url = 'https://www.wikidata.org/'
+                dm_source_type = 'wikidata_sparql'
+                decision_makers_found_str = f'{dm_name} ({dm_role}) [https://www.wikidata.org/]'
 
     if not dm_name or (not is_marketing_or_digital_role(dm_role) and not dm_linkedin_url):
         async with semaphore:
@@ -1216,6 +1472,18 @@ async def process_domain(
                 verified_dm_em, verified_dm_note = await verify_predicted_emails_via_api(
                     client, dm_email_hyps, reoon_api_key=reoon_api_key, millionverifier_api_key=millionverifier_api_key
                 )
+            if not verified_dm_em and enable_deep_osint:
+                dns_res = osint_wave1.get('dns_intel') or {}
+                p443_res = await verify_ceo_email_cascade_port443_v23_1(
+                    client,
+                    canonical_domain,
+                    dm_email_hyps,
+                    dns_res.get('mx_records_raw') or (deliverability_check or ''),
+                    bool(dns_res.get('email_security_gateway')),
+                )
+                if p443_res.get('verified_email') and p443_res.get('email_verification_confidence') == 'HIGH_IDENTITY_AND_MX':
+                    verified_dm_em = p443_res['verified_email']
+                    verified_dm_note = p443_res['verification_status']
             if verified_dm_em:
                 best_email = verified_dm_em
                 best_email_type = 'personal_or_named_inbox'
@@ -1295,6 +1563,7 @@ async def process_domain(
         is_same_person_email=verify_person_email_match(dm_name, best_email)
     )
 
+    # Системний інваріант #3: Поле detected_technologies завжди зберігається як плоский рядок із роздільником "; "
     result_record = {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -1394,6 +1663,9 @@ async def process_domain(
         'last_checked_at': checked_at
     }
 
+    if compliance_dpo_email and not result_record.get('best_email'):
+        result_record['email_source_note'] = f'Compliance/DPO address isolated ({compliance_dpo_email}); excluded from cold sales'
+
     if cache_store is not None and final_status in ('success', 'no_contacts_found'):
         cache_payload = build_safe_cache_payload(result_record, prior_cached_for_safe_write)
         try:
@@ -1437,6 +1709,8 @@ async def main() -> None:
         max_concurrency = max(30, int(actor_input.get('maxConcurrency', 30)))
         proxy_settings = actor_input.get('proxyConfiguration')
         output_view = str(actor_input.get('outputView') or 'full_audit').strip()
+        scan_mode = str(actor_input.get('scanMode') or 'full_audit').strip()
+        enable_deep_osint = bool(actor_input.get('enableDeepOsint', False))
         serper_api_key = actor_input.get('serperApiKey') or actor_input.get('serper_api_key')
         reoon_api_key = actor_input.get('reoonApiKey') or actor_input.get('reoon_api_key')
         millionverifier_api_key = actor_input.get('millionVerifierApiKey') or actor_input.get('millionverifier_api_key')
@@ -1453,11 +1727,6 @@ async def main() -> None:
             for k, v in user_seeds.items():
                 if isinstance(v, dict):
                     manual_seeds[k.lower().strip().replace('www.', '')] = v
-
-        prepared_domains = sorted(prepare_domains(raw_domains), key=domain_weight)
-        if not prepared_domains:
-            Actor.log.warning('No valid domains provided in input!')
-            return
 
         cache_store = None
         try:
@@ -1484,11 +1753,40 @@ async def main() -> None:
             res_cfg = None
         configure_pw(escalation_proxy=res_cfg, max_concurrent=actor_input.get('maxBrowserConcurrency', 3))
 
-        total_domains = len(prepared_domains)
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
+
+        if os.environ.get('APIFY_META_ORIGIN') == 'STANDBY' and not raw_domains:
+            async def _enrich_single_standby(dom: str, mode: str) -> dict:
+                prep = prepare_domains([dom])
+                if not prep:
+                    return {'error': 'Invalid domain', 'input_domain': dom}
+                d_key, r_url, aliases = prep[0]
+                async with AsyncSession(impersonate='chrome', allow_redirects=True, proxy=primary_proxy_url) as st_client:
+                    return await process_domain(
+                        st_client, d_key, r_url, aliases,
+                        scan_contacts, unpack_gtm, default_region, proxy_config,
+                        cache_store, manual_seeds, thread_pool, semaphore,
+                        serper_api_key=serper_api_key,
+                        reoon_api_key=reoon_api_key,
+                        millionverifier_api_key=millionverifier_api_key,
+                        max_cache_age_days=max_cache_age_days,
+                        bypass_hopeless_waf=bypass_hopeless_waf,
+                        scan_mode=mode,
+                        enable_deep_osint=enable_deep_osint,
+                    )
+            await start_standby_http_server(_enrich_single_standby)
+            return
+
+        prepared_domains = sorted(prepare_domains(raw_domains), key=domain_weight)
+        if not prepared_domains:
+            Actor.log.warning('No valid domains provided in input!')
+            return
+
+        total_domains = len(prepared_domains)
         pushed_canonical_set: set[str] = set()
         pushed_formatted_records: list[dict] = []
+        holding_deduplicator = SafeBatchHoldingDeduplicator()
         metrics_counter = Counter()
 
         try:
@@ -1504,6 +1802,8 @@ async def main() -> None:
                             millionverifier_api_key=millionverifier_api_key,
                             max_cache_age_days=max_cache_age_days,
                             bypass_hopeless_waf=bypass_hopeless_waf,
+                            scan_mode=scan_mode,
+                            enable_deep_osint=enable_deep_osint,
                         ),
                         domain_key, initial_aliases,
                     )
@@ -1517,6 +1817,15 @@ async def main() -> None:
                         metrics_counter['deduped_canonical_aliases'] += 1
                         continue
                     pushed_canonical_set.add(cd)
+
+                    _, b_root = extract_etld_plus_one(cd)
+                    holding_status = holding_deduplicator.check_and_register(result, b_root or '')
+                    if holding_status.startswith('HOLDING_DUPLICATE_SKIP_OUTREACH'):
+                        prev_warn = result.get('data_confidence_warning') or ''
+                        result['data_confidence_warning'] = (
+                            f'{prev_warn} | {holding_status}' if (prev_warn and prev_warn != 'None') else holding_status
+                        )
+
                     formatted_rec = format_record_for_output_view(result, output_view)
                     pushed_formatted_records.append(formatted_rec)
                     await Actor.push_data(formatted_rec)
@@ -1546,6 +1855,7 @@ async def main() -> None:
                     'playwright_rendered_count': metrics_counter['playwright_rendered'],
                     'no_contacts_count': metrics_counter['status_no_contacts_found'],
                     'blocked_count': metrics_counter['status_blocked'],
+                    'dns_error_count': metrics_counter['status_dns_error'],
                     'timeout_unfinished_count': metrics_counter['status_run_timeout_unfinished'],
                     'max_cache_age_days': max_cache_age_days,
                     'bypass_hopeless_waf': bypass_hopeless_waf,
