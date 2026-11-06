@@ -1,12 +1,12 @@
 {
-  "title": "B2B Lead & MarTech Pixel Enricher (v21.6)",
-  "description": "Deep MarTech stack audit (GTM macro unpacking, sGTM, GA4 duplicate detection, EU Consent Mode v2), B2B contact classification, Decision-Maker discovery, and GDPR/UWG §7 compliance.",
+  "title": "B2B Lead & MarTech Pixel Enricher (v23.1 Complete)",
+  "description": "Deep MarTech stack audit (GTM macro unpacking, sGTM, GA4 duplicate detection, EU Consent Mode v2), 2-Wave OSINT DAG (X.509, DNS/DKIM/DMARC, Wikidata, Google Ads RPC), B2B contact classification, and GDPR/UWG §7 compliance.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "domains": {
-      "sectionCaption": "1. Target Domains & Output Format",
-      "sectionDescription": "Provide target company domains or URLs and select whether you want the full 96-column engineering dataset or the 21-column SDR/CRM compact view.",
+      "sectionCaption": "1. Target Domains, Scan Mode & Output Format",
+      "sectionDescription": "Provide target company domains or URLs, select the scan speed/depth mode, and choose between the full engineering dataset or the 21-column SDR compact view.",
       "title": "Target Domains / URLs",
       "type": "array",
       "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de').",
@@ -16,6 +16,21 @@
         "notino.de",
         "yakaboo.ua",
         "netpeak.net"
+      ]
+    },
+    "scanMode": {
+      "title": "Scan Execution Mode",
+      "type": "string",
+      "description": "Choose 'full_audit' to allow Playwright headless browser fallback when needed, or 'fast_http_only' for sub-second browserless HTTP/TLS/DNS execution (ideal for large batches and Standby API).",
+      "editor": "select",
+      "default": "full_audit",
+      "enum": [
+        "full_audit",
+        "fast_http_only"
+      ],
+      "enumTitles": [
+        "Full Audit (HTTP + Playwright Browser Fallback)",
+        "Fast HTTP Only (Browserless Sub-Second Mode)"
       ]
     },
     "outputView": {
@@ -33,6 +48,13 @@
         "SDR / CRM Compact Outbound View (21 Columns)"
       ]
     },
+    "enableDeepOsint": {
+      "title": "Enable 2-Wave Deep OSINT DAG (X.509, DNS/DKIM, Wikidata, Ads RPC, Port-443)",
+      "type": "boolean",
+      "description": "Runs time-budgeted browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SOA, Apple Pay PSPs, Google Ads Transparency RPC, Wikidata CEO fallback, and Port-443 M365/Gravatar verification.",
+      "editor": "checkbox",
+      "default": false
+    },
     "defaultPhoneRegion": {
       "title": "Default Phone Region Fallback",
       "type": "string",
@@ -41,8 +63,8 @@
       "default": "US"
     },
     "serperApiKey": {
-      "sectionCaption": "2. Deep DM & Email Verification Keys (Optional — Recommended for 9/10 Outbound Readiness)",
-      "sectionDescription": "Connect Serper.dev (Google SERP X-Ray) to locate CMO / Head of Marketing LinkedIn profiles on e-commerce sites, and Reoon / MillionVerifier to validate predicted DM emails to 'mailbox_verified_deliverable'.",
+      "sectionCaption": "2. External Enrichment & Email Verifier Keys (Optional)",
+      "sectionDescription": "Connect Serper.dev (Google SERP X-Ray) to locate CMO / Head of Marketing LinkedIn profiles, and Reoon / MillionVerifier to validate predicted DM emails to 'mailbox_verified_deliverable'.",
       "title": "Serper.dev API Key (LinkedIn CMO X-Ray)",
       "type": "string",
       "description": "Optional API key from serper.dev. Automatically finds CMO / Head of Digital / Marketing Director on LinkedIn when the website only lists legal CEOs or no executives.",
@@ -52,7 +74,7 @@
     "reoonApiKey": {
       "title": "Reoon Email Verifier API Key",
       "type": "string",
-      "description": "Optional API key from reoon.com. Verifies generated DM email hypotheses (e.g., i.shevkoplyas@sendpulse.ua) in real time and promotes safe addresses to best_email.",
+      "description": "Optional API key from reoon.com. Verifies generated DM email hypotheses in real time and promotes safe addresses to best_email.",
       "editor": "textfield",
       "isSecret": true
     },
@@ -65,7 +87,7 @@
     },
     "forceFreshScan": {
       "sectionCaption": "3. Cache Freshness, Anti-Bot WAF & Webhook Integration",
-      "sectionDescription": "Control cache TTL (prevent stale 73-day snapshots), force aggressive Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
+      "sectionDescription": "Control cache TTL, force Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
       "title": "Force 100% Fresh Live Scan (Ignore Cache)",
       "type": "boolean",
       "description": "If enabled, completely bypasses prior cached snapshots in Key-Value Store and performs a strictly live scan today.",
@@ -75,7 +97,7 @@
     "maxCacheAgeDays": {
       "title": "Maximum Cache Age (Days)",
       "type": "integer",
-      "description": "Maximum allowed age (in days) for fallback cache snapshots. Set to 0 to disable cache reads, or 14-30 to prevent stale 70+ day snapshots.",
+      "description": "Maximum allowed age (in days) for fallback cache snapshots. Set to 0 to disable cache reads.",
       "default": 30,
       "minimum": 0,
       "maximum": 180
@@ -83,7 +105,7 @@
     "bypassHopelessWaf": {
       "title": "Force Playwright on Strict WAF Domains (Bypass Hopeless List)",
       "type": "boolean",
-      "description": "If enabled, forces Playwright browser rendering even on known strict DataDome/Cloudflare domains (coolblue.nl, zalando.de, otto.de, grammarly.com). Recommended when using Residential proxies.",
+      "description": "If enabled, forces Playwright browser rendering even on known strict DataDome/Cloudflare domains (coolblue.nl, zalando.de, otto.de, grammarly.com).",
       "editor": "checkbox",
       "default": false
     },
@@ -135,7 +157,5 @@
       }
     }
   },
-  "required": [
-    "domains"
-  ]
+  "required": []
 }
