@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 28
+CACHE_SCHEMA_VERSION = 29
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 5
@@ -499,7 +499,7 @@ UA_TO_LATIN = {
     'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
     'ñ': 'n', 'ò': 'o', 'ô': 'o', 'õ': 'o', 'ø': 'o',
     'ú': 'u', 'ù': 'u', 'û': 'u', 'ÿ': 'y',
-    'ă': 'a', 'î': 'i', 'ș': 's', 'ț': 't', 'ş': 's', 'ţ': 't', 'ğ': 'g', 'ı': 'i',
+    'ă': 'a', 'ș': 's', 'ț': 't', 'ş': 's', 'ţ': 't', 'ğ': 'g', 'ı': 'i',
     '\'': '', '’': ''
 }
 
@@ -616,8 +616,6 @@ PR_MEDIA_PREFIXES = (
     'events', 'insight', 'insights', 'research', 'presse', 'medien', 'redaktion',
     'stampa', 'prensa', 'prasa', 'pers'
 )
-# Удосконалення №1 (v21.5): Додано префікси оренди нерухомості та відмов від замовлень
-# ('arenda', 'orenda', 'rent', 'lease', 'leasing', 'realestate', 'immobilien', 'property', 'premises', 'revocation', 'widerruf', 'cancellation', 'storno')
 LOW_PRIORITY_PREFIXES = (
     'privacy', 'privacyrequest', 'legal', 'notices', 'notice', 'legalnotices',
     'datenschutz', 'data', 'datarequest', 'dataprotection', 'dpo', 'compliance',
@@ -888,3 +886,231 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
         return max(0, delta.days)
     except Exception:
         return None
+
+
+# ==============================================================================
+# v23.1 Complete: Константні структури даних (Фаза 1)
+# ==============================================================================
+
+MULTI_PART_TLDS: set[str] = {
+    "com.ua", "in.ua", "org.ua", "net.ua", "lviv.ua", "kyiv.ua", "kiev.ua",
+    "dp.ua", "kharkiv.ua", "kharkov.ua", "odesa.ua", "odessa.ua", "pp.ua",
+    "co.ua", "biz.ua", "zp.ua", "vn.ua", "poltava.ua", "cv.ua", "if.ua",
+    "lutsk.ua", "rv.ua", "sumy.ua", "te.ua", "uz.ua", "zhitomir.ua", "zt.ua",
+    "mk.ua", "kr.ua", "ks.ua", "km.ua", "cn.ua", "ck.ua", "co.uk", "org.uk",
+    "ac.uk", "gov.uk", "me.uk", "net.uk", "com.de", "co.at", "or.at",
+    "com.pl", "net.pl", "org.pl", "waw.pl", "com.br", "com.au", "net.au",
+    "org.au", "co.nz", "co.jp", "or.jp", "co.kr", "co.il", "co.za",
+    "com.tr", "com.mx", "com.ar", "com.co", "com.sg", "com.hk", "co.in"
+}
+
+INFRA_SAN_DENYLIST: tuple[str, ...] = (
+    "cloudflare.com", "cloudflaressl.com", "akamaized.net", "akamai.net",
+    "akamaihd.net", "fastly.net", "fastlylb.net", "myshopify.com",
+    "shopify.com", "amazonaws.com", "cloudfront.net", "azureedge.net",
+    "azurewebsites.net", "incapsula.com", "impervadns.net", "sucuri.net",
+    "wpengine.com", "kinsta.cloud", "vercel.app", "netlify.app",
+    "github.io", "googleusercontent.com", "1e100.net", "letsencrypt.org",
+    "digicert.com", "sectigo.com"
+)
+
+PARKING_AND_BROKER_DENYLIST: tuple[str, ...] = (
+    "dan.com", "sedo.com", "afternic.com", "hugedomains.com", "bodis.com",
+    "parkingcrew.net", "above.com", "sav.com", "squadhelp.com", "atom.com",
+    "brandbucket.com", "godaddy.com", "namecheap.com", "epik.com", "dynadot.com"
+)
+
+TRUSTED_CA_ISSUER_MARKERS: tuple[str, ...] = (
+    "digicert", "sectigo", "comodo", "globalsign", "entrust", "godaddy",
+    "let's encrypt", "letsencrypt", "internet security research group",
+    "google trust services", "amazon", "cloudflare", "microsoft", "apple",
+    "certum", "swisssign", "quovadis", "t-systems", "deutsche telekom",
+    "harica", "buypass", "actalis", "zerossl", "geotrust", "thawte", "rapidssl"
+)
+
+CSP_STRICT_SIGNATURES: dict[str, str] = {
+    "klaviyo.com": "Klaviyo",
+    "intercom.io": "Intercom",
+    "intercomcdn.com": "Intercom",
+    "hs-scripts.com": "HubSpot",
+    "hubspot.com": "HubSpot",
+    "stripe.com": "Stripe",
+    "adyen.com": "Adyen",
+    "klarna.com": "Klarna",
+    "klarnaservices.com": "Klarna",
+    "billie.io": "Billie",
+    "mondu.ai": "Mondu",
+    "hokodo.co": "Hokodo",
+    "two.inc": "Two",
+    "mollie.com": "Mollie",
+    "braintreegateway.com": "Braintree",
+    "checkout.com": "Checkout.com",
+    "gorgias.chat": "Gorgias",
+    "zendesk.com": "Zendesk",
+    "zdassets.com": "Zendesk",
+    "dynamicyield.com": "Dynamic Yield",
+    "optimizely.com": "Optimizely",
+    "visualwebsiteoptimizer.com": "VWO",
+    "hotjar.com": "Hotjar",
+    "clarity.ms": "Microsoft Clarity",
+    "sentry.io": "Sentry",
+    "datadoghq.com": "Datadog",
+    "nr-data.net": "New Relic",
+    "bugsnag.com": "Bugsnag",
+    "segment.com": "Segment",
+    "braze.com": "Braze",
+    "algolia.net": "Algolia",
+    "algolianet.com": "Algolia",
+    "criteo.com": "Criteo",
+    "tiktok.com": "TikTok Pixel",
+    "snapchat.com": "Snapchat Pixel",
+    "pinterest.com": "Pinterest Tag",
+    "pinimg.com": "Pinterest Tag",
+    "global-e.com": "Global-e",
+}
+
+DKIM_ESP_SELECTORS: dict[str, tuple[str, str]] = {
+    "kl._domainkey": ("klaviyo.com", "Klaviyo"),
+    "hs1._domainkey": ("hubspotemail.net", "HubSpot"),
+    "s1._domainkey": ("sendgrid.net", "SendGrid"),
+    "k1._domainkey": ("mcsv.net", "Mailchimp"),
+    "pm._domainkey": ("postmarkapp.com", "Postmark"),
+    "zendesk1._domainkey": ("zendesk.com", "Zendesk"),
+}
+
+DNS_TXT_TECH_SIGNATURES: dict[str, str] = {
+    "spf.protection.outlook.com": "Microsoft 365",
+    "_spf.google.com": "Google Workspace",
+    "hubspot-developer-verification": "HubSpot",
+    "spf.hubspot.com": "HubSpot",
+    "_spf.salesforce.com": "Salesforce",
+    "mail.zendesk.com": "Zendesk",
+    "klaviyo-site-verification": "Klaviyo",
+    "servers.mcsv.net": "Mailchimp",
+    "sendgrid.net": "SendGrid",
+    "amazonses.com": "Amazon SES",
+    "sendpulse.com": "SendPulse",
+}
+
+MX_SEG_FIREWALL_SIGNATURES: dict[str, str] = {
+    "hornetsecurity.com": "Hornetsecurity",
+    "antispameurope.com": "Hornetsecurity",
+    "mimecast.com": "Mimecast",
+    "pphosted.com": "Proofpoint",
+    "ppe-hosted.com": "Proofpoint Essentials",
+    "barracudanetworks.com": "Barracuda SEG",
+    "iphmx.com": "Cisco IronPort",
+    "sophos.com": "Sophos Email Security",
+}
+
+ATS_CNAME_SIGNATURES: dict[str, str] = {
+    "personio.de": "Personio",
+    "personio.com": "Personio",
+    "greenhouse.io": "Greenhouse",
+    "lever.co": "Lever",
+    "ashbyhq.com": "Ashby",
+    "workable.com": "Workable",
+    "smartrecruiters.com": "SmartRecruiters",
+    "teamtailor.com": "Teamtailor",
+    "bamboohr.com": "BambooHR",
+}
+
+LOGISTICS_AND_RETURNS_SIGNATURES: dict[str, tuple[str, str]] = {
+    "novaposhta.ua": ("Nova Poshta", "carrier"),
+    "nova-poshta": ("Nova Poshta", "carrier"),
+    "inpost.pl": ("InPost", "carrier"),
+    "inpost.co.uk": ("InPost", "carrier"),
+    "paczkomat": ("InPost", "carrier"),
+    "dhl.com": ("DHL", "carrier"),
+    "dhl.de": ("DHL", "carrier"),
+    "dpd.com": ("DPD", "carrier"),
+    "dpd.de": ("DPD", "carrier"),
+    "gls-group": ("GLS", "carrier"),
+    "myhermes.de": ("Hermes", "carrier"),
+    "evri.com": ("Evri", "carrier"),
+    "sendcloud.sc": ("Sendcloud", "3pl_orchestrator"),
+    "sendcloud.com": ("Sendcloud", "3pl_orchestrator"),
+    "shipstation.com": ("ShipStation", "3pl_orchestrator"),
+    "shipbob.com": ("ShipBob", "3pl_orchestrator"),
+    "loopreturns.com": ("Loop Returns", "returns_portal"),
+    "returngo.ai": ("ReturnGO", "returns_portal"),
+    "narvar.com": ("Narvar", "returns_portal"),
+    "parcellab.com": ("parcelLab", "returns_portal"),
+    "aftership.com": ("AfterShip", "returns_portal"),
+}
+
+SAFE_DEMO_SCHEDULER_PATTERNS: dict[str, tuple[str, ...]] = {
+    "Calendly": ("calendly.com/", "assets.calendly.com"),
+    "Chili Piper": ("chilipiper.com/",),
+    "HubSpot Meetings": ("meetings.hubspot.com/", "hubspot.com/meetings/"),
+    "SavvyCal": ("savvycal.com/",),
+    "Cal.com": ("://cal.com/", "://app.cal.com/", ".cal.com/embed", "data-cal-link="),
+}
+
+EAA_ACCESSIBILITY_WIDGETS: dict[str, str] = {
+    "userway.org": "UserWay",
+    "accessibe.com": "accessiBe",
+    "audioeye.com": "AudioEye",
+    "eye-able.com": "Eye-Able",
+    "equalweb.com": "EqualWeb",
+}
+
+ENTERPRISE_PIM_ERP_CMS_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "Contentful": ("images.ctfassets.net",),
+    "Storyblok": ("a.storyblok.com",),
+    "Sanity": ("cdn.sanity.io",),
+    "Builder.io": ("cdn.builder.io",),
+    "Prismic": ("prismic.io",),
+    "Akeneo PIM": ("akeneo.com",),
+    "Pimcore": ("pimcore",),
+    "Salsify PIM": ("salsify.com",),
+    "Oracle NetSuite": ("netsuite.com",),
+    "Odoo ERP": (".odoo.com", "://odoo.com", "/web/static/src/"),
+}
+
+SAAS_PRICING_RANGE_USD: dict[str, tuple[int, int]] = {
+    "Shopify Plus": (2300, 4500),
+    "Salesforce": (1200, 3500),
+    "Dynamic Yield": (2000, 5000),
+    "Optimizely": (1500, 4000),
+    "HubSpot": (800, 2400),
+    "Braze": (1500, 4000),
+    "Algolia": (500, 1800),
+    "Datadog": (400, 1500),
+    "Personio": (350, 1200),
+    "Greenhouse": (500, 1500),
+    "Gorgias": (300, 900),
+    "Zendesk": (300, 1000),
+    "Klaviyo": (150, 700),
+    "VWO": (400, 1200),
+    "Loop Returns": (300, 800),
+    "Sendcloud": (150, 500),
+    "Server-Side GTM (sGTM)": (100, 400),
+}
+
+TOXIC_COMPLIANCE_LOCAL_PARTS: set[str] = {
+    "datenschutz", "dpo", "privacy", "gdpr", "dsgvo", "dataprotection",
+    "widerruf", "revocation", "cancellation", "retoure", "returns",
+    "compliance", "legal", "rechtsabteilung", "abuse", "security",
+    "copyright", "dmca", "ombudsman", "arbitration", "whistleblower"
+}
+
+UA_POPULAR_NAME_ALIASES: dict[str, list[str]] = {
+    "oleksandr": ["alexandr", "alexander", "alex", "olexandr"],
+    "oleksii": ["alexey", "aleksei", "alex"],
+    "yuliia": ["julia", "yulia", "iuliia"],
+    "yevhen": ["evgen", "eugene", "yevgen", "evgeniy"],
+    "yevhenii": ["evgeniy", "eugene", "evgen"],
+    "dmytro": ["dmitry", "dmitriy", "dima"],
+    "serhii": ["sergey", "sergii", "sergei"],
+    "andrii": ["andrey", "andriy", "andrew"],
+    "nataliia": ["natalia", "natalya", "natasha"],
+    "kateryna": ["ekaterina", "kate", "katerina"],
+    "volodymyr": ["vladimir", "vlad"],
+    "mykola": ["nikolay", "nick"],
+    "urii": ["yuri", "yuriy", "yurii"],
+    "yurii": ["yuri", "yuriy"],
+    "tetiana": ["tatiana", "tatyana", "tanya"],
+    "victoriia": ["victoria", "viktoriia", "vika"],
+    "viktoriia": ["victoria", "viktoria", "vika"],
+}
