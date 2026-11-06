@@ -1,7 +1,10 @@
+import asyncio
 from datetime import datetime, timezone
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from urllib.parse import urlparse
 
@@ -11,6 +14,7 @@ from .config import (
     KNOWN_JURISDICTION_HINTS,
     KNOWN_MARKETPLACE_DOMAINS,
     MAX_DISPLAY_GA4_IDS,
+    MULTI_PART_TLDS,
     SGTM_CUSTOM_LOADER_REGEX,
     SGTM_FIRST_PARTY_COLLECT_REGEX,
     compute_snapshot_age_days,
@@ -81,7 +85,6 @@ KNOWN_POISONED_CACHE_RECOVERY: dict[str, dict] = {
     }
 }
 
-# Удосконалення №6 (v21.5): Додано явну позначку [Actor Retention Policy: 365d]
 COMPLIANCE_DEFAULT_NOTE = (
     '[Actor Retention Policy: 365d] Enriched for legitimate B2B interest from public site data; '
     'jurisdiction hint reflects operational/market HQ (verify registered legal entity for DPA); '
@@ -134,16 +137,94 @@ PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN = 3
 MIN_VALID_RESCUE_HTML_BYTES = 2500
 
 
+# ==============================================================================
+# v23.1 Complete: Канонізація eTLD+1 та Anti-SSRF / DNS пре-фільтр (Фаза 1)
+# ==============================================================================
+
+def extract_etld_plus_one(host_or_url: str) -> tuple[str, str]:
+    """
+    Виділяє (registrable_domain, brand_root) строго перед TLD без зсуву вліво на службові слова.
+    Приклади:
+      'https://www.zalando.de/shoes' -> ('zalando.de', 'zalando')
+      'corporate.eva.com.ua'         -> ('eva.com.ua', 'eva')
+      'https://www.shop.com'         -> ('shop.com', 'shop')
+    """
+    if not host_or_url:
+        return "", ""
+    raw = host_or_url.strip().lower()
+    hostname = (urlparse(raw).hostname or "") if "://" in raw else raw.split("/")[0].split(":")[0]
+    hostname = hostname.strip(".")
+    while hostname.startswith("*.") or hostname.startswith("*. "):
+        hostname = hostname[2:].strip()
+
+    parts = [p for p in hostname.split(".") if p]
+    if len(parts) < 2:
+        return hostname, hostname
+
+    last_two = f"{parts[-2]}.{parts[-1]}"
+    if last_two in MULTI_PART_TLDS and len(parts) >= 3:
+        return f"{parts[-3]}.{last_two}", parts[-3]
+    return last_two, parts[-2]
+
+
+async def check_hostname_ssrf_and_dns_async(hostname: str, timeout: float = 1.5) -> tuple[bool, str]:
+    """
+    Повертає кортеж (is_allowed, status_reason):
+      - (True, "ok")            -> публічний живий хост
+      - (False, "ssrf_blocked") -> приватна IP-адреса, localhost або хмарна метадата (169.254.169.254)
+      - (False, "dns_error")    -> домен не існує в DNS (NXDOMAIN, як helpkrunch.com)
+    """
+    if not hostname:
+        return False, "empty_host"
+    clean = hostname.strip().lower().rstrip(".")
+    if clean in ("localhost", "0.0.0.0", "broadcasthost") or clean.endswith(
+        (".local", ".internal", ".arpa", ".lan", ".localhost", ".home", ".corp", ".intranet")
+    ):
+        return False, "ssrf_blocked"
+
+    try:
+        ip_lit = ipaddress.ip_address(clean)
+        if (
+            ip_lit.is_private
+            or ip_lit.is_loopback
+            or ip_lit.is_link_local
+            or ip_lit.is_multicast
+            or ip_lit.is_reserved
+            or ip_lit.is_unspecified
+        ):
+            return False, "ssrf_blocked"
+        return True, "ok"
+    except ValueError:
+        pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        addr_info = await asyncio.wait_for(loop.getaddrinfo(clean, None), timeout=timeout)
+        if not addr_info:
+            return False, "dns_error"
+        for item in addr_info:
+            ip_obj = ipaddress.ip_address(item[4][0])
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                return False, "ssrf_blocked"
+        return True, "ok"
+    except (socket.gaierror, asyncio.TimeoutError):
+        return False, "dns_error"
+    except Exception:
+        return False, "dns_error"
+
+
 def derive_legal_basis_for_processing(
     canonical_domain: str,
     country_hint: str,
     has_contact_or_dm: bool,
 ) -> str | None:
-    """
-    Удосконалення №6 (v21.5):
-    Для Німеччини (DE / .de) прямо зазначає обмеження UWG §7 (cold_email_prohibited_without_consent; use_linkedin_or_phone),
-    а для інших юрисдикцій — corporate_outreach_allowed_with_opt_out.
-    """
     if not has_contact_or_dm:
         return None
     dom_low = (canonical_domain or '').lower()
@@ -221,9 +302,11 @@ def build_compliance_note(canonical_domain: str, country_hint: str) -> str:
 
 
 def has_verified_sgtm_in_cache(c_rec: dict) -> bool:
+    ev_str = str(c_rec.get('technology_evidence') or '')
+    if 'sgtm_fpid_cookie_verified' in ev_str:
+        return True
     if not c_rec.get('has_sgtm'):
         return False
-    ev_str = str(c_rec.get('technology_evidence') or '')
     if 'doubleclick.net' in ev_str.lower() and not SGTM_CUSTOM_LOADER_REGEX.search(ev_str):
         return False
     return bool(
@@ -500,11 +583,6 @@ def sanitize_cached_dms(
     primary_li_url: str | None = None,
     fallback_source_url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
-    """
-    Удосконалення №3 (v21.5):
-    Заповнює порожні дужки `[]` у кешованих записах `decision_makers_found` через `fallback_source_url`,
-    щоб на promodo.ua ніколи не виникало `Valeriia Lavska (...) []` та `decision_maker_source_type = NaN`.
-    """
     clean_primary_name = None
     if raw_dm_name:
         cand = strip_role_tokens_from_name(str(raw_dm_name))
