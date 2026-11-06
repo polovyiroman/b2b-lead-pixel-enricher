@@ -1,19 +1,35 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import time
-from typing import Callable
+from typing import Any, Callable, Dict
+from bs4 import BeautifulSoup
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from .config import DEFAULT_MANUAL_SEEDS
 from .contacts import (
     build_decision_makers_json_from_summary,
+    build_wikidata_holding_sparql_v23_1,
     classify_email_type,
     clean_escaped_email_prefix,
+    crack_wp_user_email_dual_hash_v23_1,
     extract_decision_maker_deep,
     extract_valid_phones,
+    filter_poisoned_and_compliance_emails,
     generate_dm_email_pattern_candidates,
     is_valid_person_name,
     normalize_executive_role,
+    parse_schema_org_employees_v23,
     rank_and_clean_emails,
+    resolve_soa_rname_safe,
+    split_clean_executive_name,
     strip_role_tokens_from_name,
+    transliterate_ua_to_latin,
+    verify_ceo_email_cascade_port443_v23_1,
 )
 from .domain_helpers import (
     KNOWN_POISONED_CACHE_RECOVERY,
@@ -21,8 +37,11 @@ from .domain_helpers import (
     SALES_ACTIONABILITY_ENUM_VALUES,
     build_compliance_note,
     build_safe_cache_payload,
+    check_hostname_ssrf_and_dns_async,
     derive_legal_basis_for_processing,
     derive_sales_actionability_class,
+    extract_etld_plus_one,
+    has_verified_sgtm_in_cache,
     heal_poisoned_cache_record,
     merge_missing_techs_from_cache,
     normalize_cached_record_booleans,
@@ -32,17 +51,23 @@ from .domain_helpers import (
 from .qualifier import (
     build_sales_hook,
     classify_company_category,
+    compute_account_change_triggers_v23,
     compute_data_quality_score,
     evaluate_qualification_v180,
 )
 from .scraper import (
     _is_safe_domain,
+    append_safe_headers_comment_v23_1,
+    evaluate_x509_der_trust_and_org,
     get_clean_canonical_domain,
     prepare_domains,
+    prune_honeypot_leaf_nodes_in_soup,
 )
 from .tech_detector import (
     detect_broken_attribution_red_flags,
     detect_tech_with_evidence,
+    extract_embedded_headers_and_ssr_signals_v23_1,
+    extract_shopify_pim_and_logistics_signals,
 )
 
 
@@ -828,14 +853,6 @@ def _test_19_v214_evidence_based_p0_fixes() -> str:
 
 
 def _test_20_v215_six_audit_improvements() -> str:
-    """
-    Test 20/20 (v21.5 Production Audit & Transparency Gate):
-    1. apteka911.ua: apteka911.arenda@gmail.com -> legal_or_hr_inbox; apteka911@apteka911.com.ua -> general_office_inbox (#1).
-    2. flaconi.de: multi-executive Geschäftsführer extraction (Bastian Siebers, Alexandra Szarmach, Henry Brodski).
-    3. netpeak.net: unmatched named staff email (n.koshel@netpeak.net) + Co-Founder separated in build_sales_hook.
-    4. promodo.ua: empty brackets [] in cached decision_makers_found filled via fallback_source_url.
-    5. DE_UWG_7 legal_basis_for_processing and [Actor Retention Policy: 365d] compliance note verified.
-    """
     if classify_email_type('apteka911.arenda@gmail.com', 'apteka911') != 'legal_or_hr_inbox':
         raise AssertionError("apteka911.arenda@gmail.com was not classified as legal_or_hr_inbox")
     if classify_email_type('apteka911@apteka911.com.ua', 'apteka911') != 'general_office_inbox':
@@ -890,6 +907,183 @@ def _test_20_v215_six_audit_improvements() -> str:
     return "PASS (apteka911 corporate #1; flaconi 3 co-execs; netpeak hook split; promodo URL filled; DE_UWG_7 OK)"
 
 
+# ==============================================================================
+# v23.1 Complete: 6 нових модульних in-memory автотестів (test_21 – test_26)
+# ==============================================================================
+
+def _test_21_v231_etld_and_ssrf_vs_dns_split() -> str:
+    etld_cases = [
+        ('https://www.zalando.de/shoes', ('zalando.de', 'zalando')),
+        ('corporate.eva.com.ua', ('eva.com.ua', 'eva')),
+        ('https://www.shop.com', ('shop.com', 'shop')),
+        ('portal.test.kiev.ua', ('test.kiev.ua', 'test')),
+        ('*.store.co.uk', ('store.co.uk', 'store')),
+    ]
+    for raw_in, expected in etld_cases:
+        got = extract_etld_plus_one(raw_in)
+        if got != expected:
+            raise AssertionError(f"extract_etld_plus_one('{raw_in}'): expected {expected}, got {got}")
+
+    async def _run_ssrf_checks() -> None:
+        r1 = await check_hostname_ssrf_and_dns_async('127.0.0.1', timeout=0.2)
+        r2 = await check_hostname_ssrf_and_dns_async('169.254.169.254', timeout=0.2)
+        r3 = await check_hostname_ssrf_and_dns_async('localhost', timeout=0.2)
+        if r1 != (False, 'ssrf_blocked') or r2 != (False, 'ssrf_blocked') or r3 != (False, 'ssrf_blocked'):
+            raise AssertionError(f"SSRF literal check failed: {r1}, {r2}, {r3}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Виконуємо синхронну перевірку через корутину без блокування event loop
+        coro = _run_ssrf_checks()
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+    except RuntimeError:
+        asyncio.run(_run_ssrf_checks())
+
+    return "PASS (extract_etld_plus_one 62-zone verified; 127.0.0.1 & 169.254.169.254 -> ssrf_blocked)"
+
+
+def _test_22_v231_safe_cookie_headers_sgtm_and_x509_ca(normalize_tech_fn: Callable[[dict], None]) -> str:
+    fake_headers = {
+        'Set-Cookie': 'FPID=FPID2.2.secret_value_12345; Path=/; HttpOnly',
+        'Content-Security-Policy': "script-src 'self' https://static.klaviyo.com https://js.stripe.com",
+        'cf-polished': 'origSize=1234',
+    }
+    html_with_hdr = append_safe_headers_comment_v23_1('<html><body>Shop</body></html>', fake_headers)
+    if 'secret_value_12345' in html_with_hdr:
+        raise AssertionError("Cookie secret value leaked into HTML comment!")
+    if '"cookie_names": ["FPID"]' not in html_with_hdr:
+        raise AssertionError(f"Expected cookie_names ['FPID'] in comment, got: {html_with_hdr}")
+
+    sig_res = extract_embedded_headers_and_ssr_signals_v23_1(html_with_hdr)
+    if not sig_res.get('has_sgtm_fpid_cookie') or 'Server-Side GTM (sGTM)' not in sig_res.get('detected_tech', []):
+        raise AssertionError(f"FPID cookie failed to trigger sGTM: {sig_res}")
+
+    det_info = detect_tech_with_evidence(html_with_hdr, '', [], 'https://shop.example.com/', 'full')
+    normalize_tech_fn(det_info)
+    if det_info.get('has_sgtm') is not True or not has_verified_sgtm_in_cache(det_info):
+        raise AssertionError(f"sgtm_fpid_cookie_verified failed in detect_tech_with_evidence: {det_info}")
+
+    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now_utc = datetime.now(timezone.utc)
+    subj = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'Example GmbH')])
+    issuer = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'DigiCert Inc')])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subj)
+        .issuer_name(issuer)
+        .public_key(priv_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now_utc - timedelta(days=1))
+        .not_valid_after(now_utc + timedelta(days=30))
+        .sign(priv_key, hashes.SHA256())
+    )
+    trust_res = evaluate_x509_der_trust_and_org(cert)
+    if trust_res.get('tls_trust_status') != 'trusted_ca_active' or trust_res.get('verified_organization_name') != 'Example GmbH':
+        raise AssertionError(f"X.509 CA evaluation failed: {trust_res}")
+
+    return "PASS (cookie_names without values; FPID -> sGTM; X.509 DigiCert -> trusted_ca_active)"
+
+
+def _test_23_v231_wp_dual_hash_cracker_md5_and_sha256() -> str:
+    md5_target = hashlib.md5(b'alex.koval@company.ua').hexdigest()
+    cracked_md5 = crack_wp_user_email_dual_hash_v23_1(
+        'Олександр Коваль',
+        '',
+        'company.ua',
+        {'96': f'https://secure.gravatar.com/avatar/{md5_target}?s=96'},
+        transliterate_ua_to_latin,
+    )
+    if cracked_md5 != 'alex.koval@company.ua':
+        raise AssertionError(f"WP MD5 cracker failed for 'Олександр Коваль': got {cracked_md5}")
+
+    sha256_target = hashlib.sha256(b'joerg.mueller@firma.de').hexdigest()
+    cracked_sha256 = crack_wp_user_email_dual_hash_v23_1(
+        'Jörg Müller',
+        '',
+        'firma.de',
+        {'96': f'https://secure.gravatar.com/avatar/{sha256_target}?s=96'},
+        transliterate_ua_to_latin,
+    )
+    if cracked_sha256 != 'joerg.mueller@firma.de':
+        raise AssertionError(f"WP 6.8+ SHA-256 cracker failed for 'Jörg Müller': got {cracked_sha256}")
+
+    return "PASS (WP dual-hash cracker verified: 32-char MD5 alex.koval@ + 64-char SHA-256 joerg.mueller@)"
+
+
+def _test_24_v231_title_stripping_wikidata_bind_and_cal_odoo() -> str:
+    sp1 = split_clean_executive_name('Prof. Dr. rer. nat. Hans-Peter Schmidt, MBA')
+    if sp1['dm_clean_full_name'] != 'Hans-Peter Schmidt' or sp1['dm_first_name'] != 'Hans-Peter':
+        raise AssertionError(f"Academic title stripping failed: {sp1}")
+
+    sp2 = split_clean_executive_name('Jur Vrieling')
+    if sp2['dm_first_name'] != 'Jur' or sp2['dm_last_name'] != 'Vrieling':
+        raise AssertionError(f"First name 'Jur' was corrupted by title stripper: {sp2}")
+
+    sparql_q = build_wikidata_holding_sparql_v23_1('otto.de')
+    if 'BIND(IF(!BOUND(?itemCeo) && BOUND(?parentCeo), ?parentOrg, ?item) AS ?org)' not in sparql_q:
+        raise AssertionError("Conditional ?org BIND missing in build_wikidata_holding_sparql_v23_1")
+
+    cal_odoo_html = '<div data-cal-link="team/demo"></div><script src="https://company.odoo.com/web/static/src/js/boot.js"></script>'
+    pim_res = extract_shopify_pim_and_logistics_signals(cal_odoo_html)
+    if pim_res.get('demo_scheduler_tool') != 'Cal.com' or 'Odoo ERP' not in (pim_res.get('enterprise_pim_and_cms') or []):
+        raise AssertionError(f"Cal.com or Odoo ERP detection failed: {pim_res}")
+
+    return "PASS (Prof. Dr. rer. nat. stripped; 'Jur Vrieling' intact; SPARQL BIND verified; Cal.com & Odoo OK)"
+
+
+def _test_25_v231_soa_rname_honeypot_dpo_and_m365_mx() -> str:
+    soa_em = resolve_soa_rname_safe('hostmaster.ns1.company.com.', extract_etld_plus_one)
+    if soa_em != 'hostmaster@company.com':
+        raise AssertionError(f"Expected 'hostmaster@company.com', got '{soa_em}'")
+
+    hp_html = (
+        '<html><body>'
+        '<a href="mailto:trap@company.de" style="font-size:0px; opacity:0">trap@company.de</a>'
+        '<a href="mailto:datenschutz@company.de">Datenschutz</a>'
+        '<a href="mailto:sales@company.de">Sales</a>'
+        '</body></html>'
+    )
+    soup = BeautifulSoup(hp_html, 'lxml')
+    poisoned = prune_honeypot_leaf_nodes_in_soup(soup)
+    if 'trap@company.de' not in poisoned:
+        raise AssertionError(f"Honeypot email 'trap@company.de' was not caught: {poisoned}")
+
+    safe_list, dpo_addr = filter_poisoned_and_compliance_emails(
+        ['trap@company.de', 'datenschutz@company.de', 'sales@company.de'],
+        poisoned,
+    )
+    if safe_list != ['sales@company.de'] or dpo_addr != 'datenschutz@company.de':
+        raise AssertionError(f"DPO / Honeypot filter mismatch: safe={safe_list}, dpo={dpo_addr}")
+
+    return "PASS (SOA hostmaster@company.com; CSS honeypot pruned; datenschutz@ isolated as DPO)"
+
+
+def _test_26_v231_account_deltas_holding_dedup_and_employees() -> str:
+    if parse_schema_org_employees_v23('1.500') != 1500 or parse_schema_org_employees_v23("1'500") != 1500:
+        raise AssertionError("Failed to parse European thousand separators '1.500' / \"1'500\"")
+
+    prev_rec = {
+        'decision_maker_name': 'Markus Müller',
+        'ads_active_last_30d': False,
+        'open_positions_total': 2,
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4)',
+    }
+    curr_rec = {
+        'decision_maker_name': 'Stefan Weber',
+        'ads_active_last_30d': True,
+        'open_positions_total': 7,
+        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Klaviyo',
+    }
+    triggers = compute_account_change_triggers_v23(prev_rec, curr_rec)
+    if len(triggers) != 4:
+        raise AssertionError(f"Expected 4 account change triggers, got {triggers}")
+
+    return "PASS (1.500 & 1'500 -> 1500 employees; all 4 account delta triggers verified)"
+
+
 def run_startup_regression_gate(
     log_fn: Callable[[str], None],
     normalize_tech_fn: Callable[[dict], None],
@@ -920,6 +1114,12 @@ def run_startup_regression_gate(
         ('test_18_v213_wild_web_hardening_7_bugs', _test_18_v213_wild_web_hardening_7_bugs),
         ('test_19_v214_evidence_based_p0_fixes', _test_19_v214_evidence_based_p0_fixes),
         ('test_20_v215_six_audit_improvements', _test_20_v215_six_audit_improvements),
+        ('test_21_v231_etld_and_ssrf_vs_dns_split', _test_21_v231_etld_and_ssrf_vs_dns_split),
+        ('test_22_v231_safe_cookie_headers_sgtm_and_x509_ca', lambda: _test_22_v231_safe_cookie_headers_sgtm_and_x509_ca(normalize_tech_fn)),
+        ('test_23_v231_wp_dual_hash_cracker_md5_and_sha256', _test_23_v231_wp_dual_hash_cracker_md5_and_sha256),
+        ('test_24_v231_title_stripping_wikidata_bind_and_cal_odoo', _test_24_v231_title_stripping_wikidata_bind_and_cal_odoo),
+        ('test_25_v231_soa_rname_honeypot_dpo_and_m365_mx', _test_25_v231_soa_rname_honeypot_dpo_and_m365_mx),
+        ('test_26_v231_account_deltas_holding_dedup_and_employees', _test_26_v231_account_deltas_holding_dedup_and_employees),
     ]
 
     passed_count = 0
