@@ -40,17 +40,20 @@ from .contacts import (
     classify_email_source_type_and_note,
     classify_email_type,
     clean_escaped_email_prefix,
+    crack_wp_user_email_dual_hash_v23_1,
     extract_decision_maker_deep,
     extract_named_email_owner_hint,
     fetch_dm_via_serp_fallback,
     filter_poisoned_and_compliance_emails,
     generate_dm_email_pattern_candidates,
     is_marketing_or_digital_role,
+    normalize_whatsapp_number_safe,
     query_doh_json,
     query_wikidata_holding_and_ceo,
     rank_and_clean_emails,
     run_unified_dns_intelligence_v23,
     split_clean_executive_name,
+    transliterate_ua_to_latin,
     verify_ceo_email_cascade_port443_v23_1,
     verify_email_deliverability_deep,
     verify_person_email_match,
@@ -143,17 +146,26 @@ SDR_COMPACT_COLUMNS = (
     'data_quality_score',
     'company_category',
     'decision_maker_name',
+    'dm_first_name',
+    'dm_last_name',
     'decision_maker_role',
     'decision_maker_linkedin_url',
     'best_email',
     'best_email_type',
     'primary_phone',
+    'whatsapp_business_phone',
     'detected_signals',
+    'min_estimated_saas_spend_usd',
+    'open_positions_total',
+    'ads_active_last_30d',
+    'primary_sales_gap',
     'tech_scan_completeness',
     'sales_hook',
     'sales_opportunity',
     'next_best_action',
     'decision_maker_search_query',
+    'prospect_iana_timezone',
+    'recommended_outreach_lang',
     'gdpr_jurisdiction',
     'data_confidence_warning',
 )
@@ -167,9 +179,22 @@ LOW_VALUE_LIVE_EMAIL_TYPES = {
     'admissions_or_department_inbox',
 }
 
+EU_VAT_EXTRACT_RE = re.compile(
+    r"\b((?:ATU|BE0?|BG|CY|CZ|DE|DK|EE|EL|ES|FI|FR[A-Z0-9]{2}|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK|XI)\d{7,12}[A-Z0-9]{0,3})\b"
+)
+WA_RAW_EXTRACT_RE = re.compile(
+    r"(?:wa\.me/|api\.whatsapp\.com/send\?[^\"'\s>]*?phone=)\+?(\d{8,15})\b",
+    re.IGNORECASE
+)
+HTML_LANG_EXTRACT_RE = re.compile(r'<html[^>]+lang=["\']([a-zA-Z]{2})', re.IGNORECASE)
+AGENCY_NAME_MARKERS = (
+    "agency", "agentur", "media", "digital", "marketing", "groupm",
+    "publicis", "omd", "dentsu", "havas", "netpeak", "promodo", "inweb"
+)
+
 
 # ==============================================================================
-# v23.1 Complete: Адаптивний OSINT Budget Runner, Дедуплікатор Холдингів та Standby Server
+# v23.1 Complete: Адаптивний OSINT Budget Runner, WP Cracker, Дедуплікатор, Чекпоінт та Standby
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -199,6 +224,32 @@ async def run_osint_tasks_with_time_budget(
     return results
 
 
+async def fetch_and_crack_wp_users_v23_1(http_client: AsyncSession, domain: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"cracked_employee_email": None, "wp_user_name": None}
+    try:
+        resp = await http_client.get(f"https://{domain}/wp-json/wp/v2/users?per_page=8", timeout=2.0)
+        if resp.status_code == 200:
+            users = resp.json()
+            if isinstance(users, list):
+                for u in users[:8]:
+                    if not isinstance(u, dict):
+                        continue
+                    u_name = str(u.get("name") or "").strip()
+                    u_slug = str(u.get("slug") or "").strip()
+                    av_urls = u.get("avatar_urls")
+                    if isinstance(av_urls, dict):
+                        cracked = crack_wp_user_email_dual_hash_v23_1(
+                            u_name, u_slug, domain, av_urls, transliterate_ua_to_latin
+                        )
+                        if cracked:
+                            out["cracked_employee_email"] = cracked
+                            out["wp_user_name"] = u_name
+                            break
+    except Exception:
+        pass
+    return out
+
+
 class SafeBatchHoldingDeduplicator:
     def __init__(self) -> None:
         self._seen_keys: Dict[str, str] = {}
@@ -225,6 +276,68 @@ class SafeBatchHoldingDeduplicator:
         return "PRIMARY_OUTREACH_TARGET"
 
 
+async def load_or_init_run_checkpoint() -> tuple[Set[str], Dict[str, int]]:
+    default_metrics = {
+        "total_processed": 0,
+        "dm_found": 0,
+        "verified_emails": 0,
+        "active_ads": 0,
+        "hiring_active": 0,
+        "total_saas_spend_usd": 0,
+    }
+    try:
+        saved = await Actor.get_value("STATE_RUN_CHECKPOINT_V23")
+        if isinstance(saved, dict):
+            pushed = set(saved.get("pushed_domains") or [])
+            metrics = {**default_metrics, **(saved.get("metrics_counter") or {})}
+            return pushed, metrics
+    except Exception:
+        pass
+    return set(), default_metrics
+
+
+async def save_migration_safe_checkpoint(pushed_domains: Set[str], metrics_counter: Dict[str, int]) -> None:
+    try:
+        await Actor.set_value(
+            "STATE_RUN_CHECKPOINT_V23",
+            {"pushed_domains": sorted(pushed_domains), "metrics_counter": dict(metrics_counter)},
+        )
+    except Exception:
+        pass
+
+
+async def publish_apify_run_executive_summary(metrics: Dict[str, int], is_final: bool = False) -> None:
+    total = max(1, int(metrics.get("total_processed", 0)))
+    dm = int(metrics.get("dm_found", 0))
+    ver = int(metrics.get("verified_emails", 0))
+    ads = int(metrics.get("active_ads", 0))
+    hiring = int(metrics.get("hiring_active", 0))
+    total_spend = int(metrics.get("total_saas_spend_usd", 0))
+    avg_spend = total_spend // total
+
+    status_msg = (
+        f"{'Done' if is_final else 'Running'}: {metrics.get('total_processed', 0)} domains | "
+        f"CEOs: {dm} | Verified Emails: {ver} | Active Ads: {ads} | Avg SaaS Spend: ${avg_spend}/mo"
+    )
+    try:
+        await Actor.set_status_message(status_msg)
+        if is_final and metrics.get("total_processed", 0) > 0:
+            summary_md = (
+                f"# B2B Lead & Tech Intelligence v23.1 — Run Executive Summary\n\n"
+                f"| Metric | Count | Share |\n"
+                f"|---|---|---|\n"
+                f"| **Total Domains Enriched** | **{metrics['total_processed']}** | 100% |\n"
+                f"| **Decision Makers (CEO/Founders) Identified** | **{dm}** | {round(dm * 100 / total)}% |\n"
+                f"| **Verified Emails (Port 443 / Identity)** | **{ver}** | {round(ver * 100 / total)}% |\n"
+                f"| **Active Google Ads Spenders (Last 30d)** | **{ads}** | {round(ads * 100 / total)}% |\n"
+                f"| **Actively Hiring Companies (ATS Feeds)** | **{hiring}** | {round(hiring * 100 / total)}% |\n"
+                f"| **Average Estimated Monthly SaaS Spend** | **${avg_spend:,}/mo** | Total: ${total_spend:,}/mo |\n"
+            )
+            await Actor.set_value("SUMMARY.md", summary_md, content_type="text/markdown; charset=utf-8")
+    except Exception:
+        pass
+
+
 async def start_standby_http_server(enrich_single_domain_func: Callable[[str, str], Any]) -> None:
     if not _AIOHTTP_AVAILABLE or web is None:
         raise RuntimeError("aiohttp is required for Standby HTTP Server mode")
@@ -246,8 +359,9 @@ async def start_standby_http_server(enrich_single_domain_func: Callable[[str, st
             return web.json_response({"error": "Blocked private or non-public target host"}, status=400)
 
         scan_mode = (request.query.get("scanMode") or "fast_http_only").strip()
+        out_view = (request.query.get("outputView") or "full_audit").strip()
         record = await enrich_single_domain_func(domain, scan_mode)
-        return web.json_response(record, status=200)
+        return web.json_response(format_record_for_output_view(record, out_view), status=200)
 
     app = web.Application()
     app.router.add_get("/", handle_request)
@@ -267,7 +381,7 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
     if (output_view or 'full_audit').lower().strip() == 'sdr_compact':
         compact = {col: record.get(col) for col in SDR_COMPACT_COLUMNS}
         opp = str(record.get('sales_opportunity') or '')
-        compact['pain_point_detected'] = opp.split(' | ')[0] if 'Red Flag' in opp else None
+        compact['pain_point_detected'] = opp.split(' | ')[0] if 'Red Flag' in opp else record.get('primary_sales_gap')
         note = str(record.get('email_source_note') or '')
         if 'DM Email Pattern Hypothesis (MX Valid): ' in note:
             compact['predicted_dm_email'] = note.split('DM Email Pattern Hypothesis (MX Valid): ', 1)[1].split(',')[0].strip()
@@ -353,6 +467,7 @@ def _build_early_abort_record(
     c_hint = detect_country_hint(canonical_domain, '', '', None, '')
     blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
     blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
+    tz_info = resolve_prospect_timezone_and_locale_v23(canonical_domain, None, c_hint, '')
     verdict = (
         'Disqualified (SSRF / Non-Public Target Blocked)'
         if fail_status == 'ssrf_blocked'
@@ -406,15 +521,21 @@ def _build_early_abort_record(
         'email_source_note': None,
         'named_email_owner_role_hint': None,
         'email_deliverability_check': None,
+        'email_verification_confidence': 'NONE',
         'all_emails_deliverability': None,
         'all_emails_classification': None,
         'email_source_url': None,
+        'compliance_dpo_email': None,
         'primary_phone': None,
         'e164_phone': None,
+        'whatsapp_business_phone': None,
         'phone_availability': 'site_blocked',
         'phone_source_url': None,
         'decision_maker_name': None,
+        'dm_first_name': None,
+        'dm_last_name': None,
         'decision_maker_role': None,
+        'decision_maker_scope': 'none',
         'decision_maker_source_url': None,
         'decision_maker_source_type': None,
         'decision_makers_found': None,
@@ -452,6 +573,30 @@ def _build_early_abort_record(
         'all_ga4_ids': None,
         'all_ga4_ids_count': None,
         'detected_technologies': None,
+        'detected_payment_gateways': [],
+        'min_estimated_saas_spend_usd': 0,
+        'estimated_saas_spend_min_usd': 0,
+        'estimated_saas_spend_max_usd': 0,
+        'spend_estimation_basis': [],
+        'primary_sales_gap': None,
+        'ads_rpc_status': 'not_checked',
+        'ads_active_last_30d': None,
+        'active_ad_formats': [],
+        'advertiser_sister_domains': [],
+        'detected_marketing_agency': None,
+        'open_positions_total': 0,
+        'hiring_departments': [],
+        'dmarc_policy': None,
+        'email_security_gateway': None,
+        'plain_text_outreach_required': False,
+        'tls_trust_status': 'unreachable',
+        'prospect_iana_timezone': tz_info['prospect_iana_timezone'],
+        'recommended_outreach_lang': tz_info['recommended_outreach_lang'],
+        'corporate_lifecycle_status': 'UNREACHABLE',
+        'outreach_dedup_status': 'PRIMARY_OUTREACH_TARGET',
+        'recent_change_triggers': [],
+        'compliance_ids': {},
+        'provenance_meta': {},
         'all_emails': None,
         'all_phones': None,
         'last_checked_at': checked_at,
@@ -477,7 +622,7 @@ async def process_domain(
     max_cache_age_days: int = 30,
     bypass_hopeless_waf: bool = False,
     scan_mode: str = 'full_audit',
-    enable_deep_osint: bool = False,
+    enable_deep_osint: bool = True,
 ) -> dict:
     checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     loop = asyncio.get_running_loop()
@@ -615,7 +760,7 @@ async def process_domain(
         was_redirected = False
         redirect_chain_str = None
 
-    # Якщо сайт заблокований WAF, перед поверненням помилки пробуємо Lateral SAN / Wayback Machine CDX bypass (v23.1)
+    # Якщо сайт заблокований WAF, пробуємо Lateral SAN / Wayback Machine CDX bypass (v23.1)
     if (status == 0 or status >= 400 or not html) and not is_non_recoverable_net_err and enable_deep_osint:
         try:
             tls_pre = await extract_tls_x509_der_intel(canonical_domain, timeout=1.8)
@@ -673,6 +818,9 @@ async def process_domain(
             )
             seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, _seed_hint)
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
+            dm_sp = split_clean_executive_name(seeded_rec.get('decision_maker_name') or '')
+            seeded_rec['dm_first_name'] = dm_sp['dm_first_name'] or None
+            seeded_rec['dm_last_name'] = dm_sp['dm_last_name'] or None
             return seeded_rec
 
         is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
@@ -694,14 +842,10 @@ async def process_domain(
                         continue
 
                     cached_record = heal_poisoned_cache_record(canonical_domain, cached_record) or cached_record
-
                     prev_time = cached_record.get('last_checked_at', '')
                     age_days = compute_snapshot_age_days(prev_time)
                     effective_max_age = min(max_cache_age_days, EVERGREEN_MAX_AGE_DAYS)
                     if age_days is not None and age_days > effective_max_age:
-                        Actor.log.info(
-                            f'[CACHE EXPIRED] {canonical_domain} snapshot age={age_days}d exceeds maxCacheAgeDays={effective_max_age}d'
-                        )
                         continue
 
                     cached_copy = {k: v for k, v in cached_record.items() if not k.startswith('_')}
@@ -759,163 +903,13 @@ async def process_domain(
                     cached_copy['decision_makers_json'] = build_decision_makers_json_from_summary(
                         c_dms_str, cached_copy.get('decision_maker_linkedin_url'), c_fallback_src
                     )
-
-                    cached_copy.setdefault('detected_cms', None)
-                    cached_copy.setdefault('consent_mode_likely', None)
-                    cached_copy.setdefault('ga4_detection_confidence', None)
-                    cached_copy.setdefault('all_ga4_ids_count', None)
-                    cached_copy.setdefault('tech_scan_completeness', 'partial_cached')
-                    cached_copy.setdefault('category_confidence', 'high')
-                    _c_is_mp = is_marketplace_platform(
-                        canonical_domain,
-                        cached_copy.get('page_title') or '',
-                        cached_copy.get('meta_description') or ''
-                    )
-                    cached_copy['marketplace_platform'] = _c_is_mp
-                    cached_copy.setdefault('marketplace_platform_pollution_detected', False)
-                    cached_copy.setdefault('email_source_type', None)
-                    cached_copy.setdefault('email_source_note', None)
-                    raw_c_dm_src_type = classify_dm_source_type(c_fallback_src) if c_dm_name else None
-                    if raw_c_dm_src_type and not raw_c_dm_src_type.endswith('_cached'):
-                        raw_c_dm_src_type = f'{raw_c_dm_src_type}_cached'
-                    cached_copy['decision_maker_source_type'] = raw_c_dm_src_type
-                    cached_copy.setdefault('named_email_owner_role_hint', None)
+                    c_dm_sp = split_clean_executive_name(c_dm_name or '')
+                    cached_copy['dm_first_name'] = c_dm_sp['dm_first_name'] or None
+                    cached_copy['dm_last_name'] = c_dm_sp['dm_last_name'] or None
 
                     normalize_cached_record_booleans(cached_copy)
                     cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                     cached_copy['technology_evidence_json'] = build_evidence_json_from_cached_record(cached_copy, source_label='cache')
-
-                    _cached_all_emails = (cached_copy.get('all_emails') or cached_copy.get('best_email') or '').split(';')
-                    _cached_emails_list = [e.strip() for e in _cached_all_emails if e.strip()]
-                    if _cached_emails_list:
-                        cached_copy['best_email_type'] = classify_email_type(cached_copy.get('best_email'), brand_root)
-                        cached_copy['all_emails_classification'] = '; '.join(
-                            f'{em} ({classify_email_type(em, brand_root)})' for em in _cached_emails_list
-                        )
-                        _deliv = cached_copy.get('email_deliverability_check') or 'not_checked'
-                        _existing_all_deliv = cached_copy.get('all_emails_deliverability') or ''
-                        if _existing_all_deliv and '@' in _existing_all_deliv and ': ' in _existing_all_deliv:
-                            cached_copy['all_emails_deliverability'] = _existing_all_deliv
-                        else:
-                            cached_copy['all_emails_deliverability'] = '; '.join(
-                                f'{em}: {_deliv}' for em in _cached_emails_list[:3]
-                            )
-                    else:
-                        cached_copy['all_emails_classification'] = None
-                        cached_copy['all_emails_deliverability'] = None
-
-                    has_cached_tech = bool(cached_copy.get('has_gtm') or cached_copy.get('has_ga4'))
-                    cached_copy['tech_rescan_needed'] = True
-
-                    if cached_copy.get('tech_scan_completeness', 'full') == 'full':
-                        cached_copy['tech_scan_completeness'] = 'partial_cached'
-
-                    _cached_tech_list = [x.strip() for x in (cached_copy.get('detected_technologies') or '').split(';') if x.strip()]
-                    _cached_tech_count = len(_cached_tech_list)
-                    cached_copy['has_google_ads_confidence'] = compute_google_ads_confidence(
-                        cached_copy.get('has_google_ads'),
-                        cached_copy.get('tech_scan_completeness', 'partial_cached'),
-                        _cached_tech_count,
-                        bool(cached_copy.get('consent_mode_likely')),
-                        False
-                    )
-
-                    _c_hint = detect_country_hint(
-                        canonical_domain, cached_copy.get('page_title') or '',
-                        cached_copy.get('meta_description') or '', cached_copy.get('primary_phone'), ''
-                    )
-                    _jur = derive_gdpr_jurisdiction(canonical_domain, cached_copy.get('primary_phone'), _c_hint, '')
-                    cached_copy['gdpr_jurisdiction'] = _jur
-                    cached_copy['gdpr_eu_domain'] = _jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-                    _cat, _cat_conf = classify_company_category(
-                        canonical_domain,
-                        cached_copy.get('page_title') or '',
-                        cached_copy.get('meta_description') or '',
-                        _cached_tech_list,
-                        ''
-                    )
-                    cached_copy['company_category'] = _cat
-                    cached_copy['category_confidence'] = _cat_conf
-
-                    _c_tech_info = {
-                        'detected_technologies_list': _cached_tech_list,
-                        'detected_cms_list': [x.strip() for x in (cached_copy.get('detected_cms') or '').split(';') if x.strip()],
-                        'detected_cms': cached_copy.get('detected_cms'),
-                        'has_gtm': cached_copy.get('has_gtm'),
-                        'has_sgtm': cached_copy.get('has_sgtm'),
-                        'has_ga4': cached_copy.get('has_ga4'),
-                        'has_meta_pixel': cached_copy.get('has_meta_pixel'),
-                        'has_google_ads': cached_copy.get('has_google_ads'),
-                        'has_tiktok_pixel': cached_copy.get('has_tiktok_pixel'),
-                        'has_linkedin_pixel': cached_copy.get('has_linkedin_pixel'),
-                        'has_pinterest_tag': cached_copy.get('has_pinterest_tag'),
-                        'has_hubspot': cached_copy.get('has_hubspot'),
-                        'has_klaviyo': cached_copy.get('has_klaviyo'),
-                        'has_cookie_banner': cached_copy.get('consent_mode_likely'),
-                        'tech_scan_completeness': cached_copy.get('tech_scan_completeness', 'partial_cached'),
-                    }
-                    (
-                        _c_verdict, _c_icp, _c_tech_sig, _c_contact_tier,
-                        _c_enrich_st, _, _c_det_sig, _c_opp, _c_next_act
-                    ) = evaluate_qualification_v180(
-                        _cat, _c_tech_info, cached_copy.get('best_email'), cached_copy.get('best_email_type'),
-                        cached_copy.get('primary_phone'), c_dm_name, c_dm_role,
-                        cached_copy.get('decision_maker_linkedin_url'), False,
-                        cached_copy.get('decision_maker_source_type'), cached_copy.get('linkedin_url'),
-                        bool(cached_copy.get('marketplace_platform_pollution_detected')),
-                        cached_copy['playwright_status'],
-                        is_mp_platform=_c_is_mp,
-                    )
-                    cached_copy['sales_readiness_verdict'] = _c_verdict
-                    cached_copy['icp_fit_tier'] = _c_icp
-                    cached_copy['technical_signal_strength'] = _c_tech_sig
-                    cached_copy['contact_quality_tier'] = _c_contact_tier
-                    cached_copy['contact_enrichment_status'] = _c_enrich_st
-                    cached_copy['detected_signals'] = _c_det_sig
-                    cached_copy['sales_opportunity'] = _c_opp
-                    cached_copy['next_best_action'] = _c_next_act
-
-                    cached_copy['contact_quality_tier_human'] = derive_human_contact_tier(
-                        cached_copy.get('contact_quality_tier'), _cat
-                    )
-                    cached_copy['sales_actionability_class'] = derive_sales_actionability_class(
-                        cached_copy.get('sales_readiness_verdict'), _cat
-                    )
-                    cached_copy['data_quality_score'] = compute_data_quality_score(
-                        cached_copy.get('contact_quality_tier'), _cached_tech_count,
-                        cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_linkedin_url'),
-                        cached_copy.get('primary_phone'), cached_copy.get('tech_scan_completeness', 'partial_cached'),
-                        True, company_category=_cat, is_manual_seed=False,
-                        is_same_person_email=verify_person_email_match(cached_copy.get('decision_maker_name'), cached_copy.get('best_email'))
-                    )
-                    cached_copy['sales_hook'] = build_sales_hook(
-                        canonical_domain, _cat, _c_tech_info,
-                        cached_copy.get('decision_maker_name'), cached_copy.get('decision_maker_role'),
-                        cached_copy.get('decision_maker_linkedin_url'), cached_copy.get('best_email'),
-                        is_eu_gdpr=cached_copy['gdpr_eu_domain'],
-                        pw_used=False,
-                        best_email_type=cached_copy.get('best_email_type'),
-                    )
-                    cached_copy['legal_basis_for_processing'] = derive_legal_basis_for_processing(
-                        canonical_domain,
-                        _c_hint,
-                        bool(cached_copy.get('best_email') or cached_copy.get('decision_maker_name') or cached_copy.get('primary_phone')),
-                    )
-                    cached_copy['data_subject_can_request_deletion'] = True
-                    cached_copy['data_retention_policy_days'] = 365
-                    cached_copy['personal_data_fields_in_record'] = derive_pii_fields(
-                        cached_copy.get('best_email'), cached_copy.get('best_email_type'),
-                        cached_copy.get('decision_maker_name'), cached_copy.get('primary_phone'),
-                        cached_copy.get('decision_maker_linkedin_url')
-                    )
-                    cached_copy['compliance_note'] = build_compliance_note(canonical_domain, _c_hint)
-
-                    if not has_cached_tech and (cached_copy.get('best_email') or cached_copy.get('primary_phone')):
-                        c_contact = cached_copy.get('best_email') or cached_copy.get('primary_phone')
-                        cached_copy['next_best_action'] = (
-                            f'Cached contact ({c_contact}) available, but tech stack unverified due to live {short_err_msg}; '
-                            f'retry with residential proxy to confirm GA4/GTM or start warm gatekeeper outreach now'
-                        )
                     return cached_copy
                 except Exception:
                     pass
@@ -1023,7 +1017,7 @@ async def process_domain(
                                     for p, sc, src in st_p:
                                         if p not in phone_map or sc > phone_map[p][0]:
                                             phone_map[p] = (sc, src)
-                                    for k, v in st_s.items():
+                                    for k, v in s_s.items():
                                         socials_with_source.setdefault(k, v)
                                     break
 
@@ -1081,72 +1075,38 @@ async def process_domain(
                     pw_comp = 'partial_timeout' if pw_incomplete else 'full'
                     tech_info = detect_tech_with_evidence(pw_html, pw_gtm_js or gtm_js, pw_gtm_ids or gtm_ids, pw_url, pw_comp)
 
-                after_pw_emails, _ = rank_and_clean_emails(email_sources, canonical_domain)
-                remaining_sub_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
-                if scan_contacts and not (after_pw_emails or phone_map) and remaining_sub_budget > 0:
-                    semantic_pw_links = await loop.run_in_executor(
-                        thread_pool, extract_semantic_contact_links_from_html, pw_html, pw_url, canonical_domain
-                    )
-                    fallback_pw_paths = [
-                        f'{base_root}/impressum/', f'{base_root}/kontakt/', f'{base_root}/contacts/',
-                        f'{base_root}/en/contact-us/', f'{base_root}/ua/kontakty/', f'{base_root}/about/'
-                    ]
-                    combined_pw_subs = sorted(
-                        list(dict.fromkeys(
-                            u for u in (semantic_pw_links + pw_sub_links + fallback_pw_paths)
-                            if u != normalized_final_redirect
-                        )),
-                        key=contact_link_priority
-                    )
-                    for pw_sub_u in combined_pw_subs[:remaining_sub_budget]:
-                        if is_allowed_by_robots(pw_sub_u, disallowed_paths):
-                            pw_attempted_paths.append(pw_sub_u)
-                            sub_pw_html, sub_pw_final, sub_pw_st, _, sub_pw_tries = await fetch_html_playwright_fallback(
-                                pw_sub_u, proxy_url=pw_proxy, locale=pw_locale, accept_consent=False, max_attempts=1
-                            )
-                            pw_attempts_count += sub_pw_tries
-                            if sub_pw_st == 'rendered' and sub_pw_html:
-                                s_t, s_d, s_txt, s_e, s_p, s_s, _ = await loop.run_in_executor(
-                                    thread_pool, parse_html_sync, sub_pw_html, sub_pw_final, effective_region
-                                )
-                                if not is_soft_404_page(sub_pw_html, s_t):
-                                    page_title = page_title or s_t
-                                    meta_desc = meta_desc or s_d
-                                    pages_with_urls.append((sub_pw_final, sub_pw_html, s_txt))
-                                    for em, src in s_e.items():
-                                        email_sources.setdefault(em, src)
-                                    for p, sc, src in s_p:
-                                        if p not in phone_map or sc > phone_map[p][0]:
-                                            phone_map[p] = (sc, src)
-                                    for k, v in s_s.items():
-                                        socials_with_source.setdefault(k, v)
-                                    chk_em, _ = rank_and_clean_emails(email_sources, canonical_domain)
-                                    if chk_em or phone_map:
-                                        break
-
     if pw_had_timeout_or_block and not (tech_info['has_ga4'] and tech_info['has_gtm']):
         scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
         tech_info['tech_scan_completeness'] = scan_comp_flag
 
-    # Двохвильовий OSINT DAG (v23.1 Complete) — опціональний розширений збір з жорстким бюджетом часу
+    # --- Інтеграція всіх 56 інновацій v23.1 Complete: Локальні сигнали + Двохвильовий DAG ---
+    pim_logistics_info = extract_shopify_pim_and_logistics_signals(html)
+    for pim_tech in pim_logistics_info.get('enterprise_pim_and_cms') or []:
+        if pim_tech not in tech_info['detected_technologies_list']:
+            tech_info['detected_technologies_list'].append(pim_tech)
+
     osint_wave1: dict = {}
     osint_wave2: dict = {}
     if enable_deep_osint:
-        w1_budget = 2.2 if is_fast_http_only else 3.2
-        osint_wave1 = await run_osint_tasks_with_time_budget(
-            {
-                'tls': extract_tls_x509_der_intel(canonical_domain, timeout=1.8),
-                'dns_intel': run_unified_dns_intelligence_v23(
-                    client, canonical_domain, query_doh_json, extract_etld_plus_one, probe_dkim=(not is_fast_http_only)
-                ),
-                'well_known': fetch_store_and_well_known_bundle(client, canonical_domain, html),
-                'ads_rpc': fetch_google_ads_transparency_intel_v23_1(
-                    client, canonical_domain, extract_etld_plus_one, INFRA_SAN_DENYLIST
-                ),
-                'rdap': fetch_rdap_domain_maturity_v23(client, canonical_domain),
-            },
-            budget_seconds=w1_budget,
-        )
+        w1_budget = 2.2 if is_fast_http_only else 3.0
+        w1_tasks: dict = {
+            'tls': extract_tls_x509_der_intel(canonical_domain, timeout=1.8),
+            'dns_intel': run_unified_dns_intelligence_v23(
+                client, canonical_domain, query_doh_json, extract_etld_plus_one,
+                probe_dkim=(not tech_info.get('has_esp_retention'))
+            ),
+            'well_known': fetch_store_and_well_known_bundle(client, canonical_domain, html),
+            'ads_rpc': fetch_google_ads_transparency_intel_v23_1(
+                client, canonical_domain, extract_etld_plus_one, INFRA_SAN_DENYLIST
+            ),
+            'wikidata': query_wikidata_holding_and_ceo(client, canonical_domain),
+            'rdap': fetch_rdap_domain_maturity_v23(client, canonical_domain),
+        }
+        if 'WordPress' in (tech_info.get('detected_cms_list') or []) or 'wp-content' in html.lower():
+            w1_tasks['wp_users'] = fetch_and_crack_wp_users_v23_1(client, canonical_domain)
+
+        osint_wave1 = await run_osint_tasks_with_time_budget(w1_tasks, budget_seconds=w1_budget)
+
         dns_intel_res = osint_wave1.get('dns_intel') or {}
         for sh_tech in dns_intel_res.get('dns_shadow_tech') or []:
             if sh_tech in ('Klaviyo', 'HubSpot') and sh_tech not in tech_info['detected_technologies_list']:
@@ -1159,6 +1119,10 @@ async def process_domain(
             for gw in ap_dec.get('psp_gateways') or []:
                 if gw not in (tech_info.get('payment_gateways') or []):
                     tech_info.setdefault('payment_gateways', []).append(gw)
+
+        wp_res = osint_wave1.get('wp_users') or {}
+        if wp_res.get('cracked_employee_email'):
+            email_sources.setdefault(wp_res['cracked_employee_email'], f'https://{canonical_domain}/wp-json/wp/v2/users')
 
     cache_tech_recovered = False
     cache_sources_count = 0
@@ -1288,6 +1252,9 @@ async def process_domain(
     phone_availability = 'public' if primary_phone else 'not_public'
     phone_source_url = sorted_phones_with_src[0][1][1] if sorted_phones_with_src else None
 
+    wa_match = WA_RAW_EXTRACT_RE.search(html)
+    whatsapp_business_phone = normalize_whatsapp_number_safe(wa_match.group(1), effective_region) if wa_match else None
+
     social_source_url = next(
         (socials_with_source[p][1] for p in ('linkedin', 'instagram', 'facebook', 'telegram', 'tiktok', 'youtube') if p in socials_with_source),
         None
@@ -1305,6 +1272,7 @@ async def process_domain(
 
     live_dm_name = dm_name
     dm_was_from_cache = False
+    decision_maker_scope = 'target_entity' if dm_name else 'none'
 
     if allow_cache_reads:
         for c_key in (canonical_kv_key, input_kv_key, evergreen_kv_key):
@@ -1348,25 +1316,52 @@ async def process_domain(
     country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
     dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
-    # Хвиля 2 OSINT (Wikidata SPARQL CEO fallback, VIES/GLEIF, ATS Jobs)
+    # Використовуємо результати Wikidata з Хвилі 1 або запускаємо Хвилю 2 (SAN fallback, VIES/GLEIF, ATS Jobs)
+    wd_res = (osint_wave1.get('wikidata') or {}) if enable_deep_osint else {}
+    if not dm_name and wd_res.get('wikidata_current_ceo'):
+        dm_name = wd_res['wikidata_current_ceo']
+        decision_maker_scope = wd_res.get('decision_maker_scope', 'target_entity')
+        dm_role = 'Chief Executive Officer (CEO)' if decision_maker_scope != 'founder_fallback' else 'Founder'
+        dm_source_url = 'https://www.wikidata.org/'
+        dm_source_type = 'wikidata_sparql'
+        decision_makers_found_str = f'{dm_name} ({dm_role}) [https://www.wikidata.org/]'
+
     if enable_deep_osint:
         tls_res = osint_wave1.get('tls') or {}
         dns_res = osint_wave1.get('dns_intel') or {}
+        ads_res = osint_wave1.get('ads_rpc') or {}
         w2_tasks: dict = {}
-        if not dm_name:
-            w2_tasks['wikidata'] = query_wikidata_holding_and_ceo(
+
+        if not dm_name and (tls_res.get('corporate_sans') or []):
+            w2_tasks['wikidata_san'] = query_wikidata_holding_and_ceo(
                 client, canonical_domain, tls_res.get('corporate_sans') or []
             )
         if dns_res.get('detected_ats_provider') == 'Greenhouse':
             w2_tasks['ats'] = fetch_public_ats_hiring_intel(client, 'Greenhouse', brand_root)
+
+        combined_pages_text = ' '.join(t for _, _, t in pages_with_urls)
+        vat_m = EU_VAT_EXTRACT_RE.search(combined_pages_text)
+        cand_vat = (vat_m.group(1) if vat_m else None) or wd_res.get('wikidata_eu_vat')
+        cand_legal = (
+            tls_res.get('organization_name')
+            or wd_res.get('wikidata_org_label')
+            or ads_res.get('verified_advertiser_legal_name')
+        )
+        if cand_vat or cand_legal:
+            w2_tasks['kyb'] = verify_eu_entity_vies_and_gleif(
+                client, raw_vat=cand_vat, candidate_legal_name=cand_legal, country_hint=country_hint
+            )
+
         if w2_tasks:
             osint_wave2 = await run_osint_tasks_with_time_budget(
-                w2_tasks, budget_seconds=(1.8 if is_fast_http_only else 2.5)
+                w2_tasks, budget_seconds=(1.8 if is_fast_http_only else 2.8)
             )
-            wd_res = osint_wave2.get('wikidata') or {}
-            if not dm_name and wd_res.get('wikidata_current_ceo'):
-                dm_name = wd_res['wikidata_current_ceo']
-                dm_role = 'Chief Executive Officer (CEO)' if wd_res.get('decision_maker_scope') != 'founder_fallback' else 'Founder'
+            wd_san = osint_wave2.get('wikidata_san') or {}
+            if not dm_name and wd_san.get('wikidata_current_ceo'):
+                wd_res = wd_san
+                dm_name = wd_san['wikidata_current_ceo']
+                decision_maker_scope = wd_san.get('decision_maker_scope', 'parent_holding')
+                dm_role = 'Chief Executive Officer (CEO)' if decision_maker_scope != 'founder_fallback' else 'Founder'
                 dm_source_url = 'https://www.wikidata.org/'
                 dm_source_type = 'wikidata_sparql'
                 decision_makers_found_str = f'{dm_name} ({dm_role}) [https://www.wikidata.org/]'
@@ -1382,6 +1377,7 @@ async def process_domain(
             dm_linkedin_url = serp_li
             dm_source_url = serp_li
             dm_source_type = 'serp_linkedin_xray'
+            decision_maker_scope = 'target_entity'
             dm_was_from_cache = False
             if decision_makers_found_str:
                 decision_makers_found_str = f'{serp_found_str}; {decision_makers_found_str}'
@@ -1397,6 +1393,12 @@ async def process_domain(
         dm_source_url = None
         dm_source_type = None
         dm_linkedin_url = None
+        decision_maker_scope = 'none'
+
+    dm_split = split_clean_executive_name(dm_name or '')
+    dm_first_name = dm_split['dm_first_name'] or None
+    dm_last_name = dm_split['dm_last_name'] or None
+
     decision_makers_json_str = build_decision_makers_json_from_summary(
         decision_makers_found_str, dm_linkedin_url, dm_fallback_url
     )
@@ -1457,9 +1459,13 @@ async def process_domain(
             )
             seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, country_hint)
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
+            s_dm_sp = split_clean_executive_name(seeded_rec.get('decision_maker_name') or '')
+            seeded_rec['dm_first_name'] = s_dm_sp['dm_first_name'] or None
+            seeded_rec['dm_last_name'] = s_dm_sp['dm_last_name'] or None
             return seeded_rec
 
     predicted_dm_email = None
+    email_verification_confidence = 'OBSERVED_ON_SITE' if best_email else 'NONE'
     if dm_name and not verify_person_email_match(dm_name, best_email):
         dm_email_hyps = generate_dm_email_pattern_candidates(dm_name, canonical_domain, all_emails_list)
         is_mx_configured = bool(
@@ -1472,7 +1478,9 @@ async def process_domain(
                 verified_dm_em, verified_dm_note = await verify_predicted_emails_via_api(
                     client, dm_email_hyps, reoon_api_key=reoon_api_key, millionverifier_api_key=millionverifier_api_key
                 )
-            if not verified_dm_em and enable_deep_osint:
+            if verified_dm_em:
+                email_verification_confidence = 'HIGH_API_VERIFIED'
+            elif enable_deep_osint:
                 dns_res = osint_wave1.get('dns_intel') or {}
                 p443_res = await verify_ceo_email_cascade_port443_v23_1(
                     client,
@@ -1481,7 +1489,8 @@ async def process_domain(
                     dns_res.get('mx_records_raw') or (deliverability_check or ''),
                     bool(dns_res.get('email_security_gateway')),
                 )
-                if p443_res.get('verified_email') and p443_res.get('email_verification_confidence') == 'HIGH_IDENTITY_AND_MX':
+                email_verification_confidence = p443_res.get('email_verification_confidence') or 'PATTERN_ESTIMATED'
+                if p443_res.get('verified_email') and email_verification_confidence in ('HIGH_IDENTITY_AND_MX', 'MEDIUM_PUBLIC_IDENTITY'):
                     verified_dm_em = p443_res['verified_email']
                     verified_dm_note = p443_res['verification_status']
             if verified_dm_em:
@@ -1489,7 +1498,7 @@ async def process_domain(
                 best_email_type = 'personal_or_named_inbox'
                 email_domain = f'{canonical_domain} (matches_site)'
                 email_source_type = 'pattern_verified_api'
-                email_source_note = f'Verified DM personal email via API ({verified_dm_note})'
+                email_source_note = f'Verified DM personal email ({verified_dm_note})'
                 deliverability_check = f'{deliverability_check}; {verified_dm_note}' if deliverability_check else verified_dm_note
                 if verified_dm_em not in all_emails_list:
                     all_emails_list.insert(0, verified_dm_em)
@@ -1563,6 +1572,70 @@ async def process_domain(
         is_same_person_email=verify_person_email_match(dm_name, best_email)
     )
 
+    # --- Агрегація фінансових, юридичних та тригерних полів v23.1 Complete ---
+    tls_info = osint_wave1.get('tls') or {}
+    dns_info = osint_wave1.get('dns_intel') or {}
+    ads_info = osint_wave1.get('ads_rpc') or {}
+    wk_info = osint_wave1.get('well_known') or {}
+    ats_info = osint_wave2.get('ats') or {}
+    kyb_info = osint_wave2.get('kyb') or {}
+
+    spend_info = calculate_saas_spend_range_usd(
+        set(detected_tech_list),
+        has_enterprise_cdn=bool(tech_info.get('has_enterprise_cdn')),
+        has_vmc_seal=bool(dns_info.get('has_enterprise_vmc_seal')),
+    )
+
+    ads_active_30d = ads_info.get('ads_active_last_30d')
+    adv_legal_name = ads_info.get('verified_advertiser_legal_name')
+    detected_marketing_agency = None
+    if adv_legal_name and any(m in adv_legal_name.lower() for m in AGENCY_NAME_MARKERS):
+        if brand_root and brand_root not in adv_legal_name.lower():
+            detected_marketing_agency = adv_legal_name
+
+    primary_sales_gap = None
+    if red_flags:
+        primary_sales_gap = red_flags[0].split(' (')[0]
+    elif ads_active_30d and not tech_info.get('has_sgtm'):
+        primary_sales_gap = 'ADS_ACTIVE_NO_SERVER_SIDE_TRACKING'
+    elif (wk_info.get('ecom_avg_price') or 0) >= 150 and 'Klarna' not in (tech_info.get('payment_gateways') or []):
+        primary_sales_gap = 'HIGH_AOV_BNPL_GAP'
+    elif company_category == 'E-commerce / Retail Brand' and not pim_logistics_info.get('has_automated_returns_portal') and (wk_info.get('sitemap_estimated_skus') or 0) >= 500:
+        primary_sales_gap = 'HIGH_VOLUME_NO_RETURNS_PORTAL'
+
+    html_lang_m = HTML_LANG_EXTRACT_RE.search(html[:2000])
+    tz_locale_info = resolve_prospect_timezone_and_locale_v23(
+        canonical_domain, e164_phone, country_hint, html_lang_m.group(1) if html_lang_m else ''
+    )
+
+    lifecycle_info = detect_ma_rebrand_and_insolvency_v23(
+        domain_key,
+        normalized_final_redirect,
+        page_title,
+        set(tls_info.get('corporate_sans') or []),
+        KNOWN_DOMAIN_REDIRECT_ALIASES,
+        ' '.join(t for _, _, t in pages_with_urls[:3]),
+        False,
+        extract_etld_plus_one,
+    )
+
+    compliance_ids = {
+        k: v for k, v in {
+            'lei_code': kyb_info.get('lei_code') or wd_res.get('wikidata_lei'),
+            'eu_vat': wd_res.get('wikidata_eu_vat'),
+            'national_register_id': kyb_info.get('national_register_id'),
+            'official_legal_name': kyb_info.get('official_legal_name') or tls_info.get('organization_name') or wd_res.get('wikidata_org_label'),
+            'official_address': kyb_info.get('official_address'),
+        }.items() if v
+    }
+    provenance_meta = {
+        'dm_source': dm_source_type,
+        'dm_scope': decision_maker_scope,
+        'kyb_source': kyb_info.get('verification_source') or ('tls_x509_ca' if tls_info.get('organization_name') else None),
+        'email_confidence': email_verification_confidence,
+        'tls_trust': tls_info.get('tls_trust_status', 'not_checked'),
+    }
+
     # Системний інваріант #3: Поле detected_technologies завжди зберігається як плоский рядок із роздільником "; "
     result_record = {
         'input_domain': domain_key,
@@ -1612,15 +1685,21 @@ async def process_domain(
         'email_source_note': email_source_note,
         'named_email_owner_role_hint': owner_role_hint,
         'email_deliverability_check': deliverability_check,
+        'email_verification_confidence': email_verification_confidence,
         'all_emails_deliverability': all_emails_deliverability_str,
         'all_emails_classification': all_emails_classification_str,
         'email_source_url': email_source_url,
+        'compliance_dpo_email': compliance_dpo_email,
         'primary_phone': primary_phone,
         'e164_phone': e164_phone,
+        'whatsapp_business_phone': whatsapp_business_phone,
         'phone_availability': phone_availability,
         'phone_source_url': phone_source_url,
         'decision_maker_name': dm_name,
+        'dm_first_name': dm_first_name,
+        'dm_last_name': dm_last_name,
         'decision_maker_role': dm_role,
+        'decision_maker_scope': decision_maker_scope,
         'decision_maker_source_url': dm_source_url,
         'decision_maker_source_type': dm_source_type,
         'decision_makers_found': decision_makers_found_str,
@@ -1658,10 +1737,39 @@ async def process_domain(
         'all_ga4_ids': tech_info['all_ga4_ids'],
         'all_ga4_ids_count': tech_info.get('all_ga4_ids_count'),
         'detected_technologies': '; '.join(detected_tech_list) if detected_tech_list else None,
+        'detected_payment_gateways': tech_info.get('payment_gateways') or [],
+        'min_estimated_saas_spend_usd': spend_info['min_estimated_saas_spend_usd'],
+        'estimated_saas_spend_min_usd': spend_info['estimated_saas_spend_min_usd'],
+        'estimated_saas_spend_max_usd': spend_info['estimated_saas_spend_max_usd'],
+        'spend_estimation_basis': spend_info['spend_estimation_basis'],
+        'primary_sales_gap': primary_sales_gap,
+        'ads_rpc_status': ads_info.get('ads_rpc_status', 'not_checked'),
+        'ads_active_last_30d': ads_active_30d,
+        'active_ad_formats': ads_info.get('active_ad_formats') or [],
+        'advertiser_sister_domains': ads_info.get('advertiser_sister_domains') or [],
+        'detected_marketing_agency': detected_marketing_agency,
+        'open_positions_total': int(ats_info.get('open_positions_total') or 0),
+        'hiring_departments': ats_info.get('hiring_departments') or [],
+        'dmarc_policy': dns_info.get('dmarc_policy'),
+        'email_security_gateway': dns_info.get('email_security_gateway'),
+        'plain_text_outreach_required': bool(dns_info.get('plain_text_outreach_required')),
+        'tls_trust_status': tls_info.get('tls_trust_status', 'not_checked'),
+        'prospect_iana_timezone': tz_locale_info['prospect_iana_timezone'],
+        'recommended_outreach_lang': tz_locale_info['recommended_outreach_lang'],
+        'corporate_lifecycle_status': lifecycle_info['corporate_lifecycle_status'],
+        'outreach_dedup_status': 'PRIMARY_OUTREACH_TARGET',
+        'recent_change_triggers': [],
+        'compliance_ids': compliance_ids,
+        'provenance_meta': provenance_meta,
         'all_emails': '; '.join(all_emails_list) if all_emails_list else None,
         'all_phones': '; '.join(all_phones_list) if all_phones_list else None,
-        'last_checked_at': checked_at
+        'last_checked_at': checked_at,
     }
+
+    if prior_cached_for_safe_write:
+        result_record['recent_change_triggers'] = compute_account_change_triggers_v23(
+            prior_cached_for_safe_write, result_record
+        )
 
     if compliance_dpo_email and not result_record.get('best_email'):
         result_record['email_source_note'] = f'Compliance/DPO address isolated ({compliance_dpo_email}); excluded from cold sales'
@@ -1710,7 +1818,8 @@ async def main() -> None:
         proxy_settings = actor_input.get('proxyConfiguration')
         output_view = str(actor_input.get('outputView') or 'full_audit').strip()
         scan_mode = str(actor_input.get('scanMode') or 'full_audit').strip()
-        enable_deep_osint = bool(actor_input.get('enableDeepOsint', False))
+        enable_deep_osint = bool(actor_input.get('enableDeepOsint', True))
+        skip_unqualified = bool(actor_input.get('skipUnqualifiedInOutput', False))
         serper_api_key = actor_input.get('serperApiKey') or actor_input.get('serper_api_key')
         reoon_api_key = actor_input.get('reoonApiKey') or actor_input.get('reoon_api_key')
         millionverifier_api_key = actor_input.get('millionVerifierApiKey') or actor_input.get('millionverifier_api_key')
@@ -1783,11 +1892,16 @@ async def main() -> None:
             Actor.log.warning('No valid domains provided in input!')
             return
 
+        pushed_canonical_set, checkpoint_metrics = await load_or_init_run_checkpoint()
+        remaining_domains = [
+            (dk, ru, al) for dk, ru, al in prepared_domains
+            if dk not in pushed_canonical_set
+        ]
+
         total_domains = len(prepared_domains)
-        pushed_canonical_set: set[str] = set()
         pushed_formatted_records: list[dict] = []
         holding_deduplicator = SafeBatchHoldingDeduplicator()
-        metrics_counter = Counter()
+        metrics_counter = Counter(checkpoint_metrics)
 
         try:
             async with AsyncSession(impersonate='chrome', allow_redirects=True, proxy=primary_proxy_url) as client:
@@ -1807,7 +1921,7 @@ async def main() -> None:
                         ),
                         domain_key, initial_aliases,
                     )
-                    for domain_key, root_url, initial_aliases in prepared_domains
+                    for domain_key, root_url, initial_aliases in remaining_domains
                 ]
 
                 for coro in asyncio.as_completed(tasks):
@@ -1820,22 +1934,44 @@ async def main() -> None:
 
                     _, b_root = extract_etld_plus_one(cd)
                     holding_status = holding_deduplicator.check_and_register(result, b_root or '')
+                    result['outreach_dedup_status'] = holding_status
                     if holding_status.startswith('HOLDING_DUPLICATE_SKIP_OUTREACH'):
                         prev_warn = result.get('data_confidence_warning') or ''
                         result['data_confidence_warning'] = (
                             f'{prev_warn} | {holding_status}' if (prev_warn and prev_warn != 'None') else holding_status
                         )
 
+                    st = result['status']
+                    if skip_unqualified and st in ('dns_error', 'unreachable', 'ssrf_blocked') and result.get('data_quality_score', 0) == 0:
+                        Actor.log.info(f'[SKIP UNQUALIFIED OUTPUT] {cd} ({st}) excluded from paid Dataset')
+                        continue
+
                     formatted_rec = format_record_for_output_view(result, output_view)
                     pushed_formatted_records.append(formatted_rec)
                     await Actor.push_data(formatted_rec)
 
-                    st = result['status']
+                    metrics_counter['total_processed'] += 1
                     metrics_counter[f'status_{st}'] += 1
+                    if result.get('decision_maker_name'):
+                        metrics_counter['dm_found'] += 1
+                    deliv_str = str(result.get('email_deliverability_check') or '')
+                    if 'mailbox_verified_' in deliv_str or 'identity_verified_' in deliv_str:
+                        metrics_counter['verified_emails'] += 1
+                    if result.get('ads_active_last_30d') is True:
+                        metrics_counter['active_ads'] += 1
+                    if int(result.get('open_positions_total') or 0) > 0:
+                        metrics_counter['hiring_active'] += 1
+                    metrics_counter['total_saas_spend_usd'] += int(result.get('min_estimated_saas_spend_usd') or 0)
+
                     if result.get('playwright_used'):
                         metrics_counter['playwright_rendered'] += 1
                     if result.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache', 'manual_seed'):
                         metrics_counter['cache_or_seed_fallbacks'] += 1
+
+                    if metrics_counter['total_processed'] % 10 == 0:
+                        await publish_apify_run_executive_summary(metrics_counter, is_final=False)
+                    if metrics_counter['total_processed'] % 25 == 0:
+                        await save_migration_safe_checkpoint(pushed_canonical_set, metrics_counter)
 
                     Actor.log.info(
                         f"[{st.upper()}] {result['canonical_domain']} (score={result['data_quality_score']}) | "
@@ -1846,6 +1982,9 @@ async def main() -> None:
                         f"DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
                     )
+
+                await save_migration_safe_checkpoint(pushed_canonical_set, metrics_counter)
+                await publish_apify_run_executive_summary(metrics_counter, is_final=True)
 
                 run_telemetry = {
                     'total_targets': total_domains,
