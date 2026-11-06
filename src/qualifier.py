@@ -1,9 +1,22 @@
+from datetime import datetime, timezone
 import json
 import re
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
+
+try:
+    import phonenumbers
+    from phonenumbers import timezone as pn_timezone
+    _PHONENUMBERS_TZ_AVAILABLE = True
+except ImportError:
+    _PHONENUMBERS_TZ_AVAILABLE = False
+
 from .config import (
     KNOWN_MARKETPLACE_DOMAINS,
     MARKETPLACE_TEXT_MARKERS,
+    PARKING_AND_BROKER_DENYLIST,
     ROLE_NORMALIZATION_MAP,
+    SAAS_PRICING_RANGE_USD,
     compute_snapshot_age_days,
     truncate_error_msg,
 )
@@ -37,6 +50,324 @@ KNOWN_DTC_ECOM_DOMAINS = {
     'stylus.ua',
 }
 
+EU_VIES_COUNTRIES = {
+    "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES",
+    "FI", "FR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT",
+    "NL", "PL", "PT", "RO", "SE", "SI", "SK", "XI"
+}
+
+RDAP_SUPPORTED_TLDS = {
+    "com", "net", "org", "io", "co", "ai", "app", "dev", "tech", "shop", "store",
+    "uk", "co.uk", "org.uk", "nl", "pl", "cz", "fr", "eu", "no", "se", "fi",
+    "br", "com.br", "au", "com.au", "ca", "in", "me", "biz", "info", "pro", "group"
+}
+
+ENTERPRISE_REGISTRAR_MARKERS = (
+    "markmonitor", "csc corporate", "corporation service company",
+    "safenames", "com laude", "nom-iq", "brandsight"
+)
+
+LIQUIDATION_MARKERS_RE = re.compile(
+    r"\b(gmbh\s+i\.\s*l\.|gmbh\s+i\.\s*abw\.|in\s+liquidation|insolvenzverfahren|"
+    r"w\s+likwidacji|w\s+upadłości|в\s+стані\s+припинення|в\s+процесі\s+ліквідації|"
+    r"in\s+administration|in\s+receivership)\b",
+    re.IGNORECASE
+)
+FOR_SALE_TITLE_RE = re.compile(
+    r"\b(for\s+sale|buy\s+this\s+domain|domain\s+is\s+available|parked\s+domain|"
+    r"domain\s+parking|inquire\s+about\s+this\s+domain|домен\s+продається)\b",
+    re.IGNORECASE
+)
+
+EXACT_TLD_TO_TZ_AND_LANG: Dict[str, Tuple[str, str]] = {
+    "ua": ("Europe/Kyiv", "uk"), "de": ("Europe/Berlin", "de"),
+    "at": ("Europe/Vienna", "de"), "ch": ("Europe/Zurich", "de"),
+    "pl": ("Europe/Warsaw", "pl"), "cz": ("Europe/Prague", "cs"),
+    "nl": ("Europe/Amsterdam", "nl"), "be": ("Europe/Brussels", "nl"),
+    "fr": ("Europe/Paris", "fr"), "es": ("Europe/Madrid", "es"),
+    "it": ("Europe/Rome", "it"), "uk": ("Europe/London", "en"),
+    "co.uk": ("Europe/London", "en"), "ie": ("Europe/Dublin", "en"),
+    "se": ("Europe/Stockholm", "en"), "no": ("Europe/Oslo", "en"),
+    "dk": ("Europe/Copenhagen", "en"), "fi": ("Europe/Helsinki", "en"),
+    "pt": ("Europe/Lisbon", "pt"), "au": ("Australia/Sydney", "en"),
+    "com.au": ("Australia/Sydney", "en"),
+}
+
+NAME_TOKEN_RE = re.compile(r"[a-zа-яіїєґäöüß]{3,}", re.IGNORECASE)
+
+
+# ==============================================================================
+# v23.1 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
+# ==============================================================================
+
+async def verify_eu_entity_vies_and_gleif(
+    http_session: Any,
+    raw_vat: Optional[str] = None,
+    candidate_legal_name: Optional[str] = None,
+    country_hint: Optional[str] = None
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "vat_valid": False,
+        "official_legal_name": None,
+        "official_address": None,
+        "lei_code": None,
+        "national_register_id": None,
+        "verification_source": None,
+    }
+    if raw_vat and len(raw_vat) >= 8:
+        clean_vat = re.sub(r"[^A-Z0-9]", "", raw_vat.upper())
+        prefix, number = clean_vat[:2], clean_vat[2:]
+        if prefix == "GR":
+            prefix = "EL"
+        if prefix in EU_VIES_COUNTRIES and number:
+            try:
+                resp = await http_session.get(
+                    f"https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{prefix}/vat/{number}",
+                    timeout=2.2
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("isValid") is True:
+                        out["vat_valid"] = True
+                        out["verification_source"] = "eu_vies_registry"
+                        name = (data.get("name") or "").strip()
+                        addr = (data.get("address") or "").strip().replace("\n", ", ")
+                        if name and name != "---":
+                            out["official_legal_name"] = name
+                        if addr and addr != "---":
+                            out["official_address"] = addr
+                        if not country_hint:
+                            country_hint = "GR" if prefix == "EL" else prefix
+            except Exception:
+                pass
+
+    if (not out["official_legal_name"] or not out["lei_code"]) and candidate_legal_name:
+        clean_query = candidate_legal_name.strip()
+        if len(clean_query) >= 3:
+            gleif_url = f"https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]={quote(clean_query)}&page[size]=3"
+            try:
+                g_resp = await http_session.get(gleif_url, headers={"Accept": "application/vnd.api+json"}, timeout=2.2)
+                if g_resp.status_code == 200:
+                    for rec in (g_resp.json().get("data") or []):
+                        attrs = rec.get("attributes") or {}
+                        entity = attrs.get("entity") or {}
+                        hq = entity.get("headquartersAddress") or entity.get("legalAddress") or {}
+                        rec_country = hq.get("country")
+                        if country_hint and rec_country and rec_country.upper() != country_hint.upper():
+                            continue
+                        out["lei_code"] = attrs.get("lei")
+                        out["official_legal_name"] = out["official_legal_name"] or (entity.get("legalName") or {}).get("name")
+                        out["national_register_id"] = entity.get("registeredAs")
+                        if not out["official_address"] and hq:
+                            parts = (hq.get("addressLines") or []) + [hq.get("postalCode") or "", hq.get("city") or "", rec_country or ""]
+                            out["official_address"] = ", ".join(p for p in parts if p)
+                        out["verification_source"] = "eu_vies_and_gleif" if out["vat_valid"] else "gleif_financial_registry"
+                        break
+            except Exception:
+                pass
+    return out
+
+
+def _extract_registrar_name_from_entities(entities: List[Dict[str, Any]]) -> Optional[str]:
+    for ent in (entities or []):
+        if not isinstance(ent, dict):
+            continue
+        roles = [str(r).lower() for r in (ent.get("roles") or [])]
+        if "registrar" in roles:
+            vcard = ent.get("vcardArray")
+            if isinstance(vcard, list) and len(vcard) >= 2 and isinstance(vcard[1], list):
+                for prop in vcard[1]:
+                    if isinstance(prop, list) and len(prop) >= 4 and prop[0] in ("fn", "org"):
+                        val = str(prop[3]).strip()
+                        if val:
+                            return val
+        nested = ent.get("entities")
+        if isinstance(nested, list):
+            found = _extract_registrar_name_from_entities(nested)
+            if found:
+                return found
+    return None
+
+
+async def fetch_rdap_domain_maturity_v23(http_session: Any, domain: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "domain_age_years": None,
+        "registrar_name": None,
+        "has_enterprise_brand_registrar": False,
+    }
+    clean_dom = domain.lower().strip().rstrip(".")
+    parts = clean_dom.split(".")
+    if len(parts) < 2:
+        return out
+    if parts[-1] not in RDAP_SUPPORTED_TLDS and f"{parts[-2]}.{parts[-1]}" not in RDAP_SUPPORTED_TLDS:
+        return out
+
+    try:
+        resp = await http_session.get(
+            f"https://rdap.org/domain/{clean_dom}",
+            headers={"Accept": "application/rdap+json"},
+            timeout=2.2
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for ev in (data.get("events") or []):
+                if isinstance(ev, dict) and ev.get("eventAction") == "registration":
+                    dt_str = str(ev.get("eventDate") or "")
+                    if len(dt_str) >= 4 and dt_str[:4].isdigit():
+                        out["domain_age_years"] = max(0, datetime.now(timezone.utc).year - int(dt_str[:4]))
+                    break
+            reg_name = _extract_registrar_name_from_entities(data.get("entities") or [])
+            if reg_name:
+                out["registrar_name"] = reg_name
+                if any(m in reg_name.lower() for m in ENTERPRISE_REGISTRAR_MARKERS):
+                    out["has_enterprise_brand_registrar"] = True
+    except Exception:
+        pass
+    return out
+
+
+def detect_ma_rebrand_and_insolvency_v23(
+    input_domain: str,
+    final_url: str,
+    page_title: str,
+    tls_corporate_sans: Set[str],
+    known_redirect_aliases: Dict[str, str],
+    legal_text_or_impressum: str,
+    shared_pixel_match: bool,
+    etld_extractor_func: Callable[[str], tuple[str, str]]
+) -> Dict[str, Any]:
+    if legal_text_or_impressum and LIQUIDATION_MARKERS_RE.search(legal_text_or_impressum):
+        return {"corporate_lifecycle_status": "IN_LIQUIDATION_OR_INSOLVENCY", "redirected_parent_domain": None}
+
+    in_reg, in_brand = etld_extractor_func(input_domain)
+    fin_reg, fin_brand = etld_extractor_func(final_url)
+    if not in_reg or not fin_reg or in_reg == fin_reg or in_brand == fin_brand:
+        return {"corporate_lifecycle_status": "ACTIVE_INDEPENDENT", "redirected_parent_domain": None}
+
+    title_low = (page_title or "").lower()
+    if any(fin_reg.endswith(b) for b in PARKING_AND_BROKER_DENYLIST) or FOR_SALE_TITLE_RE.search(title_low):
+        return {"corporate_lifecycle_status": "DOMAIN_PARKED_OR_FOR_SALE", "redirected_parent_domain": fin_reg}
+
+    if (
+        known_redirect_aliases.get(in_reg) == fin_reg
+        or fin_reg in tls_corporate_sans
+        or shared_pixel_match
+        or (len(in_brand) >= 4 and in_brand in title_low)
+    ):
+        return {"corporate_lifecycle_status": "ACTIVE_REBRAND_ALIAS", "redirected_parent_domain": fin_reg}
+
+    return {"corporate_lifecycle_status": "REDIRECTED_OR_ACQUIRED", "redirected_parent_domain": fin_reg}
+
+
+def calculate_saas_spend_range_usd(
+    detected_tech_set: Set[str],
+    has_enterprise_cdn: bool = False,
+    has_vmc_seal: bool = False
+) -> Dict[str, Any]:
+    min_total = 0
+    max_total = 0
+    basis: List[str] = []
+    for tech in sorted(detected_tech_set):
+        if tech in SAAS_PRICING_RANGE_USD:
+            lo, hi = SAAS_PRICING_RANGE_USD[tech]
+            min_total += lo
+            max_total += hi
+            basis.append(f"{tech} (${lo}-${hi})")
+    if has_enterprise_cdn:
+        min_total += 1500
+        max_total += 4000
+        basis.append("Enterprise CDN ($1500-$4000)")
+    if has_vmc_seal:
+        min_total += 125
+        max_total += 150
+        basis.append("BIMI VMC Seal ($125-$150)")
+    return {
+        "min_estimated_saas_spend_usd": min_total,
+        "estimated_saas_spend_min_usd": min_total,
+        "estimated_saas_spend_max_usd": max_total,
+        "spend_estimation_basis": basis[:10],
+    }
+
+
+def resolve_prospect_timezone_and_locale_v23(
+    domain: str,
+    e164_phone: Optional[str] = None,
+    detected_country_code: str = "",
+    html_lang_attr: str = ""
+) -> Dict[str, str]:
+    clean_dom = domain.lower().strip().rstrip(".")
+    parts = clean_dom.split(".")
+    tld_1 = parts[-1] if parts else ""
+    tld_2 = f"{parts[-2]}.{parts[-1]}" if len(parts) >= 2 else ""
+
+    tz: Optional[str] = None
+    default_lang = "en"
+    if tld_2 in EXACT_TLD_TO_TZ_AND_LANG:
+        tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[tld_2]
+    elif tld_1 in EXACT_TLD_TO_TZ_AND_LANG:
+        tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[tld_1]
+
+    if not tz and e164_phone and e164_phone.startswith("+") and _PHONENUMBERS_TZ_AVAILABLE:
+        try:
+            parsed_num = phonenumbers.parse(e164_phone, None)
+            tz_list = pn_timezone.time_zones_for_number(parsed_num)
+            if tz_list:
+                tz = str(tz_list[0])
+        except Exception:
+            pass
+
+    if not tz:
+        cc_low = (detected_country_code or "").strip().lower()
+        if cc_low in EXACT_TLD_TO_TZ_AND_LANG:
+            tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[cc_low]
+        elif cc_low == "us":
+            tz, default_lang = ("America/New_York", "en")
+        elif cc_low == "ca":
+            tz, default_lang = ("America/Toronto", "en")
+        else:
+            tz, default_lang = ("Europe/London", "en")
+
+    clean_html_lang = (html_lang_attr or "").strip().lower()[:2]
+    supported_langs = {"uk", "de", "pl", "fr", "es", "it", "nl", "cs", "pt", "en"}
+    outreach_lang = clean_html_lang if clean_html_lang in supported_langs else default_lang
+    return {"prospect_iana_timezone": tz, "recommended_outreach_lang": outreach_lang}
+
+
+def compute_account_change_triggers_v23(
+    prev_record: Optional[Dict[str, Any]],
+    curr_record: Dict[str, Any]
+) -> List[str]:
+    if not prev_record or not isinstance(prev_record, dict):
+        return []
+    triggers: List[str] = []
+
+    old_dm = (prev_record.get("decision_maker_name") or "").strip()
+    new_dm = (curr_record.get("decision_maker_name") or "").strip()
+    if old_dm and new_dm:
+        old_t = set(NAME_TOKEN_RE.findall(old_dm.lower()))
+        new_t = set(NAME_TOKEN_RE.findall(new_dm.lower()))
+        if old_t and new_t and not (old_t & new_t):
+            triggers.append(f"NEW_DECISION_MAKER: {new_dm} (replaced {old_dm})")
+
+    if prev_record.get("ads_active_last_30d") is False and curr_record.get("ads_active_last_30d") is True:
+        triggers.append("AD_CAMPAIGN_NEWLY_LAUNCHED")
+
+    old_jobs = int(prev_record.get("open_positions_total") or 0)
+    new_jobs = int(curr_record.get("open_positions_total") or 0)
+    if new_jobs >= old_jobs + 3:
+        triggers.append(f"HIRING_SURGE (+{new_jobs - old_jobs} open roles)")
+
+    old_tech = {t.strip() for t in str(prev_record.get("detected_technologies") or "").split(";") if t.strip()}
+    new_tech = {t.strip() for t in str(curr_record.get("detected_technologies") or "").split(";") if t.strip()}
+    added = sorted(new_tech - old_tech)
+    if added:
+        triggers.append(f"ADDED_TECH: {', '.join(added[:3])}")
+    return triggers
+
+
+# ==============================================================================
+# Core Qualification, Scoring & Sales Hook Engine
+# ==============================================================================
 
 def is_marketplace_platform(canonical_domain: str, page_title: str, meta_desc: str) -> bool:
     if canonical_domain.lower() in KNOWN_MARKETPLACE_DOMAINS:
@@ -110,7 +441,7 @@ def classify_company_category(
     if (
         dom_low in KNOWN_MARKETPLACE_DOMAINS
         or dom_low in KNOWN_DTC_ECOM_DOMAINS
-        or any(cms in detected_tech for cms in ('Shopify', 'WooCommerce'))
+        or any(cms in detected_tech for cms in ('Shopify', 'WooCommerce', 'Magento', 'Shopware'))
         or has_product_schema
         or any(k in text for k in ecom_keywords)
     ):
@@ -309,11 +640,6 @@ def build_sales_hook(
     pw_used: bool = False,
     best_email_type: str | None = None,
 ) -> str:
-    """
-    Удосконалення №2 (v21.5):
-    Усуває розсинхрон між decision_maker_name та власником best_email у sales_hook (напр. на netpeak.net та esputnik.com).
-    Якщо best_email є іменною поштою іншої людини (не dm_name), чітко розділяє Named Contact та Listed Executive!
-    """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
         return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
