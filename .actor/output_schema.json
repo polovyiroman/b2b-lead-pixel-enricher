@@ -1,0 +1,19 @@
+{
+  "actorOutputSchemaVersion": 1,
+  "title": "B2B Website Tech Signal & Account Intelligence Output",
+  "description": "Enriched B2B lead records and MarTech audit dataset views.",
+  "properties": {
+    "overview": {
+      "type": "string",
+      "title": "B2B Tech Signals & Account Intelligence (Full 96-Column Audit)",
+      "description": "Complete engineering & compliance audit table.",
+      "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
+    },
+    "sdrCompact": {
+      "type": "string",
+      "title": "SDR Compact Outbound View (20 Columns)",
+      "description": "Actionable B2B leads with MarTech hooks, DM contacts, and GDPR/UWG §7 compliance.",
+      "template": "{{links.apiDefaultDatasetUrl}}/items?view=sdr_compact"
+    }
+  }
+}
