@@ -288,6 +288,10 @@ def generate_phonetic_token_variants_v23(
     raw_token: str,
     translit_func: Optional[Callable[[str], str]] = None
 ) -> List[str]:
+    """
+    Виправлено (v23.1): active_translit викликається на кожній із 3 гілок (t, ascii_pre, din_pre),
+    щоб комбіновані імена з умлаутами та слов'янською діакритикою/кирилицею ніколи не втрачали символи.
+    """
     if not raw_token:
         return []
     t = raw_token.strip().lower()
@@ -302,7 +306,7 @@ def generate_phonetic_token_variants_v23(
     active_translit = translit_func or transliterate_ua_to_latin
     variants: Set[str] = set()
     for branch in (t, ascii_pre, din_pre):
-        lat = active_translit(branch).lower() if branch == t else branch
+        lat = active_translit(branch).lower()
         clean_v = re.sub(r"[^a-z0-9]", "", lat)
         if clean_v:
             variants.add(clean_v)
@@ -1265,11 +1269,6 @@ def extract_valid_phones(
     raw_tel_links: list[tuple[str, str]],
     default_region: str = 'US'
 ) -> list[tuple[str, int]]:
-    """
-    Системний інваріант #5 (v23.1 Complete):
-    Локальні телефонні номери країни домену (+380 на .ua, +49 на .de) зберігають найвищий пріоритет (+35),
-    а факсові номери попередньо вирізаються через FAX_CONTEXT_RE.
-    """
     target_region = (default_region or 'US').upper().strip()
     expected_prefix = REGION_DIALING_PREFIX_MAP.get(target_region, '+1')
     candidates: dict[str, int] = {}
