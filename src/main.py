@@ -120,9 +120,11 @@ from .scraper import (
     fetch_waf_bypass_or_wayback_legal,
     get_clean_canonical_domain,
     is_allowed_by_robots,
+    is_checkout_redirect_url,
     is_dynamic_hopeless_waf,
     is_playwright_available,
     is_soft_404_page,
+    is_waf_challenge_page,
     load_robots_rules,
     parse_html_sync,
     prepare_domains,
@@ -138,6 +140,8 @@ from .tech_detector import (
     fetch_google_ads_transparency_intel_v23_1,
     fetch_public_ats_hiring_intel,
 )
+
+_OSINT_SEMAPHORE = asyncio.Semaphore(12)
 
 SDR_COMPACT_COLUMNS = (
     'canonical_domain',
@@ -194,34 +198,44 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v23.2 Complete: Адаптивний OSINT Budget Runner, WP Cracker, Дедуплікатор, Чекпоінт та Standby
+# v23.3 Complete: Адаптивний OSINT Budget Runner, Дедуплікатор Холдингів, Чекпоінт та Схема
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
     named_coros: Dict[str, Coroutine[Any, Any, Any]],
-    budget_seconds: float = 3.0
+    budget_seconds: float = 4.0
 ) -> Dict[str, Any]:
+    """
+    Виправлено Проблему R1 (v23.3):
+    Виконує групу OSINT-корутин під семафором _OSINT_SEMAPHORE і зберігає результати
+    всіх задач, що встигли завершитися (task.done()), навіть якщо одна з паралельних
+    задач перевищила budget_seconds.
+    """
     if not named_coros:
         return {}
-    task_map = {name: asyncio.create_task(coro) for name, coro in named_coros.items()}
-    results: Dict[str, Any] = {name: None for name in named_coros}
-    pending = set(task_map.values())
-    try:
-        done, pending = await asyncio.wait(
-            task_map.values(),
-            timeout=budget_seconds,
-            return_when=asyncio.ALL_COMPLETED,
-        )
-        for name, task in task_map.items():
-            if task in done and not task.cancelled() and task.exception() is None:
-                results[name] = task.result()
-    finally:
-        for p_task in pending:
-            if not p_task.done():
-                p_task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-    return results
+    async with _OSINT_SEMAPHORE:
+        task_map = {name: asyncio.create_task(coro) for name, coro in named_coros.items()}
+        results: Dict[str, Any] = {name: None for name in named_coros}
+        pending = set(task_map.values())
+        try:
+            done, pending = await asyncio.wait(
+                task_map.values(),
+                timeout=budget_seconds,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for name, task in task_map.items():
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    results[name] = task.result()
+        finally:
+            for p_task in pending:
+                if not p_task.done():
+                    p_task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for name, task in task_map.items():
+                if results[name] is None and task.done() and not task.cancelled() and task.exception() is None:
+                    results[name] = task.result()
+        return results
 
 
 async def fetch_and_crack_wp_users_v23_1(http_client: AsyncSession, domain: str) -> Dict[str, Any]:
@@ -251,6 +265,12 @@ async def fetch_and_crack_wp_users_v23_1(http_client: AsyncSession, domain: str)
 
 
 class SafeBatchHoldingDeduplicator:
+    """
+    Виправлено Проблему R10 (modivo.pl / eobuwie.com.pl):
+    Дедуплікує домени одного холдингу не лише за іменною поштою/DM/myshopify,
+    а й за спільними корпоративними соцмережами (YouTube, LinkedIn, Instagram)
+    та спільним першим ідентифікатором GA4.
+    """
     def __init__(self) -> None:
         self._seen_keys: Dict[str, str] = {}
 
@@ -268,12 +288,91 @@ class SafeBatchHoldingDeduplicator:
         if myshopify:
             lookup_keys.append(f"shop:{myshopify}")
 
+        for soc_field in ("youtube_url", "linkedin_url", "instagram_url"):
+            soc_val = str(record.get(soc_field) or "").strip().lower().rstrip("/")
+            if soc_val and len(soc_val) > 18:
+                lookup_keys.append(f"soc:{soc_val}")
+
+        ga4_str = str(record.get("all_ga4_ids") or "").strip().upper()
+        if ga4_str:
+            first_ga4 = ga4_str.split(";")[0].strip()
+            if first_ga4.startswith("G-") and len(first_ga4) >= 8:
+                lookup_keys.append(f"ga4:{first_ga4}")
+
         for k in lookup_keys:
             if k in self._seen_keys and self._seen_keys[k] != domain:
                 return f"HOLDING_DUPLICATE_SKIP_OUTREACH (primary: {self._seen_keys[k]})"
         for k in lookup_keys:
             self._seen_keys.setdefault(k, domain)
         return "PRIMARY_OUTREACH_TARGET"
+
+
+def _ensure_full_v23_schema(rec: dict, canonical_domain: str, default_region: str = 'US') -> dict:
+    """
+    Виправлено Проблему R4 (v23.3):
+    Гарантує наявність усіх 110 ключів схеми v23.3 у будь-якому записі
+    (включно з кешованими фолбеками eva.ua, allo.ua та manual_seed).
+    """
+    dm_sp = split_clean_executive_name(rec.get('decision_maker_name') or '')
+    rec.setdefault('dm_first_name', dm_sp['dm_first_name'] or None)
+    rec.setdefault('dm_last_name', dm_sp['dm_last_name'] or None)
+    rec.setdefault('decision_maker_scope', 'target_entity' if rec.get('decision_maker_name') else 'none')
+    rec.setdefault('email_verification_confidence', 'OBSERVED_ON_SITE' if rec.get('best_email') else 'NONE')
+    rec.setdefault('compliance_dpo_email', None)
+    rec.setdefault('whatsapp_business_phone', None)
+    rec.setdefault('detected_payment_gateways', [])
+
+    tech_set = {x.strip() for x in str(rec.get('detected_technologies') or '').split(';') if x.strip()}
+    spend_info = calculate_saas_spend_range_usd(tech_set)
+    rec.setdefault('min_estimated_saas_spend_usd', spend_info['min_estimated_saas_spend_usd'])
+    rec.setdefault('estimated_saas_spend_min_usd', spend_info['estimated_saas_spend_min_usd'])
+    rec.setdefault('estimated_saas_spend_max_usd', spend_info['estimated_saas_spend_max_usd'])
+    rec.setdefault('spend_estimation_basis', spend_info['spend_estimation_basis'])
+
+    rec.setdefault('primary_sales_gap', None)
+    rec.setdefault('ads_rpc_status', 'not_checked')
+    rec.setdefault('ads_active_last_30d', None)
+    rec.setdefault('active_ad_formats', [])
+    rec.setdefault('advertiser_sister_domains', [])
+    rec.setdefault('detected_marketing_agency', None)
+    rec.setdefault('open_positions_total', 0)
+    rec.setdefault('hiring_departments', [])
+    rec.setdefault('dmarc_policy', None)
+    rec.setdefault('email_security_gateway', None)
+    rec.setdefault('plain_text_outreach_required', False)
+    rec.setdefault('tls_trust_status', 'not_checked')
+
+    c_hint = detect_country_hint(
+        canonical_domain,
+        rec.get('page_title') or '',
+        rec.get('meta_description') or '',
+        rec.get('primary_phone'),
+        '',
+    )
+    tz_info = resolve_prospect_timezone_and_locale_v23(
+        canonical_domain,
+        rec.get('e164_phone'),
+        c_hint,
+        '',
+        page_title=str(rec.get('page_title') or ''),
+    )
+    rec.setdefault('prospect_iana_timezone', tz_info['prospect_iana_timezone'])
+    rec.setdefault('recommended_outreach_lang', tz_info['recommended_outreach_lang'])
+    rec.setdefault('corporate_lifecycle_status', 'ACTIVE_INDEPENDENT')
+    rec.setdefault('outreach_dedup_status', 'PRIMARY_OUTREACH_TARGET')
+    rec.setdefault('recent_change_triggers', [])
+    rec.setdefault('compliance_ids', {})
+    rec.setdefault(
+        'provenance_meta',
+        {
+            'dm_source': rec.get('decision_maker_source_type'),
+            'dm_scope': rec.get('decision_maker_scope'),
+            'kyb_source': None,
+            'email_confidence': rec.get('email_verification_confidence'),
+            'tls_trust': rec.get('tls_trust_status', 'not_checked'),
+        },
+    )
+    return rec
 
 
 async def load_or_init_run_checkpoint() -> tuple[Set[str], Dict[str, int]]:
@@ -323,7 +422,7 @@ async def publish_apify_run_executive_summary(metrics: Dict[str, int], is_final:
         await Actor.set_status_message(status_msg)
         if is_final and metrics.get("total_processed", 0) > 0:
             summary_md = (
-                f"# B2B Lead & Tech Intelligence v23.2 — Run Executive Summary\n\n"
+                f"# B2B Lead & Tech Intelligence v23.3 — Run Executive Summary\n\n"
                 f"| Metric | Count | Share |\n"
                 f"|---|---|---|\n"
                 f"| **Total Domains Enriched** | **{metrics['total_processed']}** | 100% |\n"
@@ -345,12 +444,12 @@ async def start_standby_http_server(enrich_single_domain_func: Callable[[str, st
 
     async def handle_request(request: web.Request) -> web.Response:
         if request.headers.get("x-apify-container-server-readiness-probe"):
-            return web.json_response({"status": "ready", "version": "23.2"}, status=200)
+            return web.json_response({"status": "ready", "version": "23.3"}, status=200)
 
         domain = (request.query.get("domain") or "").strip()
         if not domain:
             if request.path == "/":
-                return web.json_response({"status": "ready", "version": "23.2"}, status=200)
+                return web.json_response({"status": "ready", "version": "23.3"}, status=200)
             return web.json_response({"error": "Missing required query parameter: domain"}, status=400)
 
         reg_dom, _ = extract_etld_plus_one(domain)
@@ -394,6 +493,8 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
 def _is_cache_record_fresh(c_rec: dict | None, max_cache_age_days: int) -> bool:
     if not isinstance(c_rec, dict) or max_cache_age_days <= 0:
         return False
+    if is_waf_challenge_page('', str(c_rec.get('page_title') or '')):
+        return False
     prev_time = c_rec.get('last_checked_at')
     if not prev_time:
         return True
@@ -421,7 +522,7 @@ async def _send_completion_webhook(
 
     payload = {
         'event': 'b2b_lead_pixel_enricher.run_completed',
-        'version': '23.2',
+        'version': '23.3',
         'summary': run_telemetry,
         'records_count': len(records),
         'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
@@ -434,7 +535,6 @@ async def _send_completion_webhook(
             headers={'Content-Type': 'application/json'},
             json=payload,
             timeout=10.0,
-            proxy=None,
         )
         Actor.log.info(f'[WEBHOOK SENT] POST {clean_wh} -> HTTP {resp.status_code} ({len(records)} records)')
     except Exception as exc:
@@ -665,6 +765,11 @@ async def process_domain(
     if not brand_root:
         brand_root = canonical_domain.split('.')[0].lower() if canonical_domain else ''
 
+    # Виправлено Проблему R5 (gymshark.com -> us.checkout.gymshark.com):
+    # Якщо сайт перекинув на порожній піддомен чекауту, скидаємо final_url назад на канонічний корінь.
+    if is_checkout_redirect_url(final_url):
+        final_url = f'https://{canonical_domain}/'
+
     prelim_fail_class = classify_failure_status(status, err_msg) if (status == 0 or status >= 400) else 'ok'
     is_non_recoverable_net_err = (status == 0 and prelim_fail_class in ('dns_error', 'unreachable', 'ssl_error'))
 
@@ -719,7 +824,7 @@ async def process_domain(
                 Actor.log.info(f'Playwright rescue succeeded for {canonical_domain} ({len(pw_rescue_html)} bytes)!')
                 status = 200
                 html = pw_rescue_html
-                final_url = pw_rescue_url
+                final_url = f'https://{canonical_domain}/' if is_checkout_redirect_url(pw_rescue_url) else pw_rescue_url
                 err_msg = ''
                 short_err_msg = ''
                 pw_used_flag = True
@@ -735,7 +840,7 @@ async def process_domain(
     parsed_final = urlparse(final_url)
     scheme = parsed_final.scheme or 'https'
     clean_website_url = f'{scheme}://{canonical_domain}/'
-    normalized_final_redirect = clean_url_port(final_url) or clean_website_url
+    normalized_final_redirect = clean_website_url if is_checkout_redirect_url(final_url) else (clean_url_port(final_url) or clean_website_url)
     canonical_kv_key = sanitize_kv_key(canonical_domain)
     input_kv_key = sanitize_kv_key(domain_key)
     evergreen_kv_key = f'evergreen_{canonical_kv_key}'
@@ -816,10 +921,7 @@ async def process_domain(
             )
             seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, _seed_hint)
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
-            dm_sp = split_clean_executive_name(seeded_rec.get('decision_maker_name') or '')
-            seeded_rec['dm_first_name'] = dm_sp['dm_first_name'] or None
-            seeded_rec['dm_last_name'] = dm_sp['dm_last_name'] or None
-            return seeded_rec
+            return _ensure_full_v23_schema(seeded_rec, canonical_domain, default_region)
 
         is_tier1_marketplace = canonical_domain in KNOWN_MARKETPLACE_DOMAINS
         cache_keys_order = (
@@ -837,6 +939,18 @@ async def process_domain(
                     if not is_evergreen and cached_record.get('_schema', 0) < MIN_COMPATIBLE_CACHE_SCHEMA:
                         continue
                     if cached_record.get('status') not in ('success', 'no_contacts_found'):
+                        continue
+
+                    # Виправлено Проблему R3 (foxtrot.com.ua): відхиляємо кешований запис, якщо це антибот-заглушка Cloudflare
+                    if is_waf_challenge_page('', str(cached_record.get('page_title') or '')):
+                        Actor.log.warning(f'[CACHE POISON SKIP] Ignoring WAF challenge cache for {canonical_domain}')
+                        continue
+                    if (
+                        cached_record.get('status') == 'no_contacts_found'
+                        and not cached_record.get('detected_technologies')
+                        and not cached_record.get('best_email')
+                        and not cached_record.get('primary_phone')
+                    ):
                         continue
 
                     cached_record = heal_poisoned_cache_record(canonical_domain, cached_record) or cached_record
@@ -901,28 +1015,11 @@ async def process_domain(
                     cached_copy['decision_makers_json'] = build_decision_makers_json_from_summary(
                         c_dms_str, cached_copy.get('decision_maker_linkedin_url'), c_fallback_src
                     )
-                    c_dm_sp = split_clean_executive_name(c_dm_name or '')
-                    cached_copy['dm_first_name'] = c_dm_sp['dm_first_name'] or None
-                    cached_copy['dm_last_name'] = c_dm_sp['dm_last_name'] or None
-
-                    # Гарантоване заповнення фінансових/таймзональних полів для кешованих фолбеків (eva.ua, allo.ua)
-                    cached_copy.setdefault('min_estimated_saas_spend_usd', 0)
-                    cached_copy.setdefault('estimated_saas_spend_min_usd', 0)
-                    cached_copy.setdefault('estimated_saas_spend_max_usd', 0)
-                    cached_copy.setdefault('spend_estimation_basis', [])
-                    cached_copy.setdefault('open_positions_total', 0)
-                    cached_copy.setdefault('hiring_departments', [])
-                    cached_copy.setdefault('detected_payment_gateways', [])
-                    c_hint_cached = detect_country_hint(canonical_domain, cached_copy.get('page_title') or '', cached_copy.get('meta_description') or '', cached_copy.get('primary_phone'), '')
-                    c_tz_info = resolve_prospect_timezone_and_locale_v23(canonical_domain, cached_copy.get('e164_phone'), c_hint_cached, '')
-                    cached_copy.setdefault('prospect_iana_timezone', c_tz_info['prospect_iana_timezone'])
-                    cached_copy.setdefault('recommended_outreach_lang', c_tz_info['recommended_outreach_lang'])
-                    cached_copy.setdefault('corporate_lifecycle_status', 'ACTIVE_INDEPENDENT')
 
                     normalize_cached_record_booleans(cached_copy)
                     cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                     cached_copy['technology_evidence_json'] = build_evidence_json_from_cached_record(cached_copy, source_label='cache')
-                    return cached_copy
+                    return _ensure_full_v23_schema(cached_copy, canonical_domain, default_region)
                 except Exception:
                     pass
 
@@ -972,7 +1069,7 @@ async def process_domain(
                 phone_map[p] = (sc, src)
 
         pages_with_urls = [(normalized_final_redirect, html, main_text)]
-        base_root = f"{scheme}://{re.sub(r':\d+$', '', parsed_final.netloc) or canonical_domain}"
+        base_root = f"{scheme}://{canonical_domain}"
         disallowed_paths, crawl_delay = await load_robots_rules(client, base_root)
 
         if scan_contacts and not contact_links:
@@ -1029,7 +1126,7 @@ async def process_domain(
                                     for p, sc, src in st_p:
                                         if p not in phone_map or sc > phone_map[p][0]:
                                             phone_map[p] = (sc, src)
-                                    for k, v in st_s.items():
+                                    for k, v in s_s.items():
                                         socials_with_source.setdefault(k, v)
                                     break
 
@@ -1091,6 +1188,13 @@ async def process_domain(
         scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
         tech_info['tech_scan_completeness'] = scan_comp_flag
 
+    # Виправлено Проблему R6 (flaconi.de): Якщо GTM/GA4 знайдені лише у заголовку CSP без жодного ID в HTML/GTM,
+    # позначаємо повноту як 'partial_csp_headers', а не 'full'.
+    if tech_info.get('has_ga4') and not tech_info.get('all_ga4_ids') and not tech_info.get('ga4_detection_confidence'):
+        tech_info['ga4_detection_confidence'] = 'Low (CSP Header Allowlist Only — Tag Firing Unverified)'
+        if tech_info.get('tech_scan_completeness') == 'full':
+            tech_info['tech_scan_completeness'] = 'partial_csp_headers'
+
     pim_logistics_info = extract_shopify_pim_and_logistics_signals(html)
     for pim_tech in pim_logistics_info.get('enterprise_pim_and_cms') or []:
         if pim_tech not in tech_info['detected_technologies_list']:
@@ -1099,7 +1203,7 @@ async def process_domain(
     osint_wave1: dict = {}
     osint_wave2: dict = {}
     if enable_deep_osint:
-        w1_budget = 2.2 if is_fast_http_only else 3.0
+        w1_budget = 2.8 if is_fast_http_only else 4.0
         w1_tasks: dict = {
             'tls': extract_tls_x509_der_intel(canonical_domain, timeout=1.8),
             'dns_intel': run_unified_dns_intelligence_v23(
@@ -1308,6 +1412,7 @@ async def process_domain(
                             dm_was_from_cache = True
                         dm_name, dm_role, dm_linkedin_url = c_dm_name, c_dm_role, c_dm_li
                         dm_source_url, dm_source_type = c_dm_src, c_dm_src_type
+                        decision_maker_scope = c_rec.get('decision_maker_scope') or 'target_entity'
                         if cached_dms_count >= curr_dms_count and c_dms_str:
                             decision_makers_found_str = c_dms_str
                         break
@@ -1320,6 +1425,7 @@ async def process_domain(
                         dm_linkedin_url = dm_linkedin_url or c_dm_li
                         dm_source_url = c_dm_src or dm_source_url
                         dm_source_type = c_dm_src_type or dm_source_type
+                        decision_maker_scope = c_rec.get('decision_maker_scope') or 'target_entity'
                         break
             except Exception:
                 pass
@@ -1364,7 +1470,7 @@ async def process_domain(
 
         if w2_tasks:
             osint_wave2 = await run_osint_tasks_with_time_budget(
-                w2_tasks, budget_seconds=(1.8 if is_fast_http_only else 2.8)
+                w2_tasks, budget_seconds=(2.0 if is_fast_http_only else 3.0)
             )
             wd_san = osint_wave2.get('wikidata_san') or {}
             if not dm_name and wd_san.get('wikidata_current_ceo'):
@@ -1404,6 +1510,8 @@ async def process_domain(
         dm_source_type = None
         dm_linkedin_url = None
         decision_maker_scope = 'none'
+    elif decision_maker_scope == 'none':
+        decision_maker_scope = 'target_entity'
 
     dm_split = split_clean_executive_name(dm_name or '')
     dm_first_name = dm_split['dm_first_name'] or None
@@ -1469,10 +1577,7 @@ async def process_domain(
             )
             seeded_rec['compliance_note'] = build_compliance_note(canonical_domain, country_hint)
             seeded_rec.setdefault('all_ga4_ids_count', 1 if seeded_rec.get('all_ga4_ids') else None)
-            s_dm_sp = split_clean_executive_name(seeded_rec.get('decision_maker_name') or '')
-            seeded_rec['dm_first_name'] = s_dm_sp['dm_first_name'] or None
-            seeded_rec['dm_last_name'] = s_dm_sp['dm_last_name'] or None
-            return seeded_rec
+            return _ensure_full_v23_schema(seeded_rec, canonical_domain, default_region)
 
     predicted_dm_email = None
     email_verification_confidence = 'OBSERVED_ON_SITE' if best_email else 'NONE'
@@ -1589,6 +1694,11 @@ async def process_domain(
     ats_info = osint_wave2.get('ats') or {}
     kyb_info = osint_wave2.get('kyb') or {}
 
+    # Синхронізація шлюзу безпеки пошти між email_deliverability_check та dns_info (gymshark.com)
+    seg_gw = dns_info.get('email_security_gateway')
+    if not seg_gw and deliverability_check and 'Proofpoint/Mimecast' in deliverability_check:
+        seg_gw = 'Proofpoint/Mimecast'
+
     spend_info = calculate_saas_spend_range_usd(
         set(detected_tech_list),
         has_enterprise_cdn=bool(tech_info.get('has_enterprise_cdn')),
@@ -1614,7 +1724,11 @@ async def process_domain(
 
     html_lang_m = HTML_LANG_EXTRACT_RE.search(html[:2000])
     tz_locale_info = resolve_prospect_timezone_and_locale_v23(
-        canonical_domain, e164_phone, country_hint, html_lang_m.group(1) if html_lang_m else ''
+        canonical_domain,
+        e164_phone,
+        country_hint,
+        html_lang_m.group(1) if html_lang_m else '',
+        page_title=page_title or '',
     )
 
     lifecycle_info = detect_ma_rebrand_and_insolvency_v23(
@@ -1759,8 +1873,8 @@ async def process_domain(
         'open_positions_total': int(ats_info.get('open_positions_total') or 0),
         'hiring_departments': ats_info.get('hiring_departments') or [],
         'dmarc_policy': dns_info.get('dmarc_policy'),
-        'email_security_gateway': dns_info.get('email_security_gateway'),
-        'plain_text_outreach_required': bool(dns_info.get('plain_text_outreach_required')),
+        'email_security_gateway': seg_gw,
+        'plain_text_outreach_required': bool(seg_gw or dns_info.get('plain_text_outreach_required')),
         'tls_trust_status': tls_info.get('tls_trust_status', 'not_checked'),
         'prospect_iana_timezone': tz_locale_info['prospect_iana_timezone'],
         'recommended_outreach_lang': tz_locale_info['recommended_outreach_lang'],
@@ -1782,7 +1896,13 @@ async def process_domain(
     if compliance_dpo_email and not result_record.get('best_email'):
         result_record['email_source_note'] = f'Compliance/DPO address isolated ({compliance_dpo_email}); excluded from cold sales'
 
-    if cache_store is not None and final_status in ('success', 'no_contacts_found'):
+    # Виправлено Проблему R3 (foxtrot.com.ua): Записуємо у кеш лише валідні сторінки (не антибот-заглушки і не порожні)
+    is_worth_caching = (
+        not is_waf_challenge_page(html, page_title or '')
+        and not homepage_was_soft_404
+        and bool(best_email or primary_phone or detected_tech_list)
+    )
+    if cache_store is not None and final_status in ('success', 'no_contacts_found') and is_worth_caching:
         cache_payload = build_safe_cache_payload(result_record, prior_cached_for_safe_write)
         try:
             await cache_store.set_value(canonical_kv_key, cache_payload)
@@ -1797,10 +1917,6 @@ async def process_domain(
 
 
 async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
-    """
-    Виправлено (v23.2): Захисний обробник винятків логує повний стектрейс рантайм-помилок
-    через Actor.log.exception, не дозволяючи непередбаченим збоям мовчки ламати прогін.
-    """
     rem = remaining_run_seconds()
     budget = max(45.0, rem - 30.0) if rem is not None else 900.0
     if rem is not None and rem <= 20.0:
@@ -1832,7 +1948,7 @@ async def main() -> None:
         scan_contacts = actor_input.get('scanContactPages', True)
         unpack_gtm = actor_input.get('unpackGtmContainers', True)
         default_region = actor_input.get('defaultPhoneRegion', 'US').upper().strip()
-        max_concurrency = max(30, int(actor_input.get('maxConcurrency', 30)))
+        max_concurrency = max(15, min(30, int(actor_input.get('maxConcurrency', 20))))
         proxy_settings = actor_input.get('proxyConfiguration')
         output_view = str(actor_input.get('outputView') or 'full_audit').strip()
         scan_mode = str(actor_input.get('scanMode') or 'full_audit').strip()
@@ -1862,12 +1978,9 @@ async def main() -> None:
             cache_store = None
 
         proxy_config = None
-        primary_proxy_url = None
         try:
             if proxy_settings and proxy_settings.get('useApifyProxy'):
                 proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_settings)
-                if proxy_config:
-                    primary_proxy_url = await proxy_config.new_url()
             else:
                 proxy_config = await Actor.create_proxy_configuration()
         except Exception:
@@ -1883,13 +1996,17 @@ async def main() -> None:
         semaphore = asyncio.Semaphore(max_concurrency)
         thread_pool = ThreadPoolExecutor(max_workers=max(16, max_concurrency * 2))
 
+        # Виправлено Проблему R1 та R7 (v23.3):
+        # AsyncSession створюється БЕЗ параметра proxy=primary_proxy_url!
+        # Завдяки цьому всі S2S-запити (DoH, Google Ads RPC, Wikidata, VIES, GLEIF, RDAP)
+        # гарантовано йдуть напряму з контейнера за 20 мс, а проксі використовується лише у fetch_html_safely.
         if os.environ.get('APIFY_META_ORIGIN') == 'STANDBY' and not raw_domains:
             async def _enrich_single_standby(dom: str, mode: str) -> dict:
                 prep = prepare_domains([dom])
                 if not prep:
                     return {'error': 'Invalid domain', 'input_domain': dom}
                 d_key, r_url, aliases = prep[0]
-                async with AsyncSession(impersonate='chrome', allow_redirects=True, proxy=primary_proxy_url) as st_client:
+                async with AsyncSession(impersonate='chrome', allow_redirects=True) as st_client:
                     return await process_domain(
                         st_client, d_key, r_url, aliases,
                         scan_contacts, unpack_gtm, default_region, proxy_config,
@@ -1922,7 +2039,7 @@ async def main() -> None:
         metrics_counter = Counter(checkpoint_metrics)
 
         try:
-            async with AsyncSession(impersonate='chrome', allow_redirects=True, proxy=primary_proxy_url) as client:
+            async with AsyncSession(impersonate='chrome', allow_redirects=True) as client:
                 tasks = [
                     guarded(
                         process_domain(
@@ -1996,8 +2113,8 @@ async def main() -> None:
                         f"Class: {result['sales_actionability_class']} | "
                         f"Tier: {result['contact_quality_tier_human']} | "
                         f"PW: {result['playwright_status']} (tries={result['playwright_attempts_count']}) | "
-                        f"GA4: {result['all_ga4_ids'] or ('True(dyn)' if result['has_ga4'] else '-')} | "
-                        f"DM: {result['decision_maker_name'] or '-'} | "
+                        f"TLS: {result.get('tls_trust_status')} | AdsRPC: {result.get('ads_rpc_status')} | "
+                        f"DMARC: {result.get('dmarc_policy')} | DM: {result['decision_maker_name'] or '-'} | "
                         f"Email: {result['best_email'] or '-'}"
                     )
 
