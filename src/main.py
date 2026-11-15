@@ -194,7 +194,7 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v23.1 Complete: Адаптивний OSINT Budget Runner, WP Cracker, Дедуплікатор, Чекпоінт та Standby
+# v23.2 Complete: Адаптивний OSINT Budget Runner, WP Cracker, Дедуплікатор, Чекпоінт та Standby
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -323,7 +323,7 @@ async def publish_apify_run_executive_summary(metrics: Dict[str, int], is_final:
         await Actor.set_status_message(status_msg)
         if is_final and metrics.get("total_processed", 0) > 0:
             summary_md = (
-                f"# B2B Lead & Tech Intelligence v23.1 — Run Executive Summary\n\n"
+                f"# B2B Lead & Tech Intelligence v23.2 — Run Executive Summary\n\n"
                 f"| Metric | Count | Share |\n"
                 f"|---|---|---|\n"
                 f"| **Total Domains Enriched** | **{metrics['total_processed']}** | 100% |\n"
@@ -345,12 +345,12 @@ async def start_standby_http_server(enrich_single_domain_func: Callable[[str, st
 
     async def handle_request(request: web.Request) -> web.Response:
         if request.headers.get("x-apify-container-server-readiness-probe"):
-            return web.json_response({"status": "ready", "version": "23.1"}, status=200)
+            return web.json_response({"status": "ready", "version": "23.2"}, status=200)
 
         domain = (request.query.get("domain") or "").strip()
         if not domain:
             if request.path == "/":
-                return web.json_response({"status": "ready", "version": "23.1"}, status=200)
+                return web.json_response({"status": "ready", "version": "23.2"}, status=200)
             return web.json_response({"error": "Missing required query parameter: domain"}, status=400)
 
         reg_dom, _ = extract_etld_plus_one(domain)
@@ -421,7 +421,7 @@ async def _send_completion_webhook(
 
     payload = {
         'event': 'b2b_lead_pixel_enricher.run_completed',
-        'version': '23.1',
+        'version': '23.2',
         'summary': run_telemetry,
         'records_count': len(records),
         'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
@@ -634,7 +634,6 @@ async def process_domain(
     pw_had_timeout_or_block = False
     allow_cache_reads = (cache_store is not None and max_cache_age_days > 0)
 
-    # Фаза 4 (v23.1): Неблокуючий сокет-префільтр SSRF vs DNS (NXDOMAIN) за 0 мс до запуску HTTP/Playwright
     reg_input_dom, _ = extract_etld_plus_one(domain_key)
     check_host = reg_input_dom or domain_key
     is_host_allowed, host_reason = await check_hostname_ssrf_and_dns_async(check_host, timeout=1.5)
@@ -760,7 +759,6 @@ async def process_domain(
         was_redirected = False
         redirect_chain_str = None
 
-    # Якщо сайт заблокований WAF, пробуємо Lateral SAN / Wayback Machine CDX bypass (v23.1)
     if (status == 0 or status >= 400 or not html) and not is_non_recoverable_net_err and enable_deep_osint:
         try:
             tls_pre = await extract_tls_x509_der_intel(canonical_domain, timeout=1.8)
@@ -907,6 +905,20 @@ async def process_domain(
                     cached_copy['dm_first_name'] = c_dm_sp['dm_first_name'] or None
                     cached_copy['dm_last_name'] = c_dm_sp['dm_last_name'] or None
 
+                    # Гарантоване заповнення фінансових/таймзональних полів для кешованих фолбеків (eva.ua, allo.ua)
+                    cached_copy.setdefault('min_estimated_saas_spend_usd', 0)
+                    cached_copy.setdefault('estimated_saas_spend_min_usd', 0)
+                    cached_copy.setdefault('estimated_saas_spend_max_usd', 0)
+                    cached_copy.setdefault('spend_estimation_basis', [])
+                    cached_copy.setdefault('open_positions_total', 0)
+                    cached_copy.setdefault('hiring_departments', [])
+                    cached_copy.setdefault('detected_payment_gateways', [])
+                    c_hint_cached = detect_country_hint(canonical_domain, cached_copy.get('page_title') or '', cached_copy.get('meta_description') or '', cached_copy.get('primary_phone'), '')
+                    c_tz_info = resolve_prospect_timezone_and_locale_v23(canonical_domain, cached_copy.get('e164_phone'), c_hint_cached, '')
+                    cached_copy.setdefault('prospect_iana_timezone', c_tz_info['prospect_iana_timezone'])
+                    cached_copy.setdefault('recommended_outreach_lang', c_tz_info['recommended_outreach_lang'])
+                    cached_copy.setdefault('corporate_lifecycle_status', 'ACTIVE_INDEPENDENT')
+
                     normalize_cached_record_booleans(cached_copy)
                     cached_copy['technology_evidence_summary'] = build_summary_from_cached_record(cached_copy)
                     cached_copy['technology_evidence_json'] = build_evidence_json_from_cached_record(cached_copy, source_label='cache')
@@ -1017,7 +1029,7 @@ async def process_domain(
                                     for p, sc, src in st_p:
                                         if p not in phone_map or sc > phone_map[p][0]:
                                             phone_map[p] = (sc, src)
-                                    for k, v in s_s.items():
+                                    for k, v in st_s.items():
                                         socials_with_source.setdefault(k, v)
                                     break
 
@@ -1079,7 +1091,6 @@ async def process_domain(
         scan_comp_flag = 'partial_timeout' if ('timeout' in pw_status_str.lower() or 'exceeded' in pw_status_str.lower()) else 'partial_blocked'
         tech_info['tech_scan_completeness'] = scan_comp_flag
 
-    # --- Інтеграція всіх 56 інновацій v23.1 Complete: Локальні сигнали + Двохвильовий DAG ---
     pim_logistics_info = extract_shopify_pim_and_logistics_signals(html)
     for pim_tech in pim_logistics_info.get('enterprise_pim_and_cms') or []:
         if pim_tech not in tech_info['detected_technologies_list']:
@@ -1316,7 +1327,6 @@ async def process_domain(
     country_hint = detect_country_hint(canonical_domain, page_title, meta_desc, primary_phone, html)
     dm_search_query = build_linkedin_xray_query(canonical_domain, company_category, country_hint)
 
-    # Використовуємо результати Wikidata з Хвилі 1 або запускаємо Хвилю 2 (SAN fallback, VIES/GLEIF, ATS Jobs)
     wd_res = (osint_wave1.get('wikidata') or {}) if enable_deep_osint else {}
     if not dm_name and wd_res.get('wikidata_current_ceo'):
         dm_name = wd_res['wikidata_current_ceo']
@@ -1572,7 +1582,6 @@ async def process_domain(
         is_same_person_email=verify_person_email_match(dm_name, best_email)
     )
 
-    # --- Агрегація фінансових, юридичних та тригерних полів v23.1 Complete ---
     tls_info = osint_wave1.get('tls') or {}
     dns_info = osint_wave1.get('dns_intel') or {}
     ads_info = osint_wave1.get('ads_rpc') or {}
@@ -1636,7 +1645,6 @@ async def process_domain(
         'tls_trust': tls_info.get('tls_trust_status', 'not_checked'),
     }
 
-    # Системний інваріант #3: Поле detected_technologies завжди зберігається як плоский рядок із роздільником "; "
     result_record = {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -1789,6 +1797,10 @@ async def process_domain(
 
 
 async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
+    """
+    Виправлено (v23.2): Захисний обробник винятків логує повний стектрейс рантайм-помилок
+    через Actor.log.exception, не дозволяючи непередбаченим збоям мовчки ламати прогін.
+    """
     rem = remaining_run_seconds()
     budget = max(45.0, rem - 30.0) if rem is not None else 900.0
     if rem is not None and rem <= 20.0:
@@ -1796,8 +1808,14 @@ async def guarded(coro, domain_key: str, aliases: list[str]) -> dict:
         return build_timeout_stub(domain_key, aliases)
     try:
         return await asyncio.wait_for(coro, timeout=budget)
-    except Exception:
+    except asyncio.TimeoutError:
+        Actor.log.warning(f'[DOMAIN TIMEOUT] {domain_key} exceeded budget={budget:.1f}s')
         return build_timeout_stub(domain_key, aliases)
+    except Exception as exc:
+        Actor.log.exception(f'[DOMAIN UNHANDLED ERROR] {domain_key} crashed: {exc}')
+        stub = build_timeout_stub(domain_key, aliases)
+        stub['error_message'] = truncate_error_msg(f'Unhandled error: {exc}')
+        return stub
 
 
 async def main() -> None:
