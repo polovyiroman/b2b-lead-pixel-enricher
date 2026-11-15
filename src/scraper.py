@@ -68,8 +68,10 @@ MULTI_PART_TLD_SUFFIXES = tuple(f'.{t}' for t in CONFIG_MULTI_PART_TLDS)
 
 CF_EMAIL_ATTR_RE = re.compile(r'data-cfemail=["\']([0-9a-fA-F]{10,128})["\']')
 CF_EMAIL_HREF_RE = re.compile(r'/cdn-cgi/l/email-protection#([0-9a-fA-F]{10,128})')
+
+# Виправлено Баг №1 (allbirds.com / westwing.de): не чіпаємо opacity:0 самий по собі (щоб не ламати слайдери)
 HONEYPOT_STYLE_RE = re.compile(
-    r"(?:font-size\s*:\s*0(?:px|em|rem|pt|%|\b)|opacity\s*:\s*0(?:\.0+)?\b|"
+    r"(?:font-size\s*:\s*0(?:px|em|rem|pt|%|\b)|"
     r"left\s*:\s*-\d{3,}px|text-indent\s*:\s*-\d{3,}px)",
     re.IGNORECASE
 )
@@ -138,7 +140,7 @@ async def _check_host_ssrf_local(hostname: str, timeout: float = 1.2) -> tuple[b
 
 
 # ==============================================================================
-# v23.1 Complete: 7 функцій безбраузерного витягу даних (Фаза 1)
+# v23.2 Complete: 7 функцій безбраузерного витягу даних (Фаза 1)
 # ==============================================================================
 
 def append_safe_headers_comment_v23_1(html_text: str, resp_headers: Any) -> str:
@@ -209,6 +211,10 @@ def evaluate_x509_der_trust_and_org(cert: x509.Certificate) -> Dict[str, Any]:
 
 
 async def extract_tls_x509_der_intel(domain: str, timeout: float = 2.0) -> Dict[str, Any]:
+    """
+    Виправлено Баг №2 (v23.2): У блоці finally миттєво закриває транспорт (transport.abort())
+    без очікування нескінченного TLS close_notify у await writer.wait_closed() в Python 3.12.
+    """
     result: Dict[str, Any] = {
         "organization_name": None,
         "tls_trust_status": "unreachable",
@@ -269,7 +275,9 @@ async def extract_tls_x509_der_intel(domain: str, timeout: float = 2.0) -> Dict[
         if writer is not None:
             try:
                 writer.close()
-                await writer.wait_closed()
+                transport = getattr(writer, "transport", None)
+                if transport is not None:
+                    transport.abort()
             except Exception:
                 pass
     return result
@@ -304,11 +312,18 @@ def deobfuscate_cfemails_in_html(html_text: str) -> str:
 
 
 def prune_honeypot_leaf_nodes_in_soup(soup: Any) -> Set[str]:
+    """
+    Виправлено Баг №1 (allbirds.com / westwing.de):
+    Перевіряє getattr(tag, 'attrs', None) is not None, щоб не падати з AttributeError
+    на дочірніх вузлах вже видаленого через .decompose() батьківського тегу.
+    """
     poisoned_emails: Set[str] = set()
     if not soup:
         return poisoned_emails
     email_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-    for tag in soup.find_all(["span", "a", "div", "p", "small"]):
+    for tag in list(soup.find_all(["span", "a", "div", "p", "small"])):
+        if getattr(tag, "attrs", None) is None:
+            continue
         if tag.find(["div", "section", "nav", "ul", "table", "form"]):
             continue
         style_str = str(tag.get("style") or "")
@@ -326,11 +341,6 @@ async def fetch_waf_bypass_or_wayback_legal(
     domain: str,
     bypass_hosts: List[str]
 ) -> Tuple[str, str]:
-    """
-    Повертає (recovered_html, recovery_source).
-    Спочатку перевіряє корпоративні SAN-хости з тим самим brand_root (після Anti-SSRF перевірки),
-    а за їх відсутності забирає юридичний роут із Wayback Machine CDX API з модифікатором id_.
-    """
     _, target_brand = _extract_etld_local(domain)
     for host in (bypass_hosts or [])[:3]:
         _, host_brand = _extract_etld_local(host)
@@ -353,7 +363,7 @@ async def fetch_waf_bypass_or_wayback_legal(
         f"&filter=original:.*(impressum|imprint|legal|kontakt|contact|about).*&limit=3"
     )
     try:
-        cdx_resp = await http_client.get(cdx_url, timeout=2.5)
+        cdx_resp = await http_client.get(cdx_url, timeout=2.2, proxy=None)
         if cdx_resp.status_code == 200:
             rows = cdx_resp.json()
             if isinstance(rows, list) and len(rows) >= 2:
@@ -363,7 +373,7 @@ async def fetch_waf_bypass_or_wayback_legal(
                 ts = row_dict.get("timestamp")
                 orig = row_dict.get("original")
                 if ts and orig:
-                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.8)
+                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.5, proxy=None)
                     if snap_resp.status_code == 200 and len(snap_resp.text) > 500:
                         return snap_resp.text, "wayback_cdx_legal"
     except Exception:
@@ -388,14 +398,14 @@ async def fetch_store_and_well_known_bundle(
     }
     is_shopify = "shopify" in (html_text or "").lower()
     tasks: Dict[str, Any] = {
-        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=2.0),
-        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=2.0),
-        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=2.0),
-        "sitemap": http_client.get(f"https://{domain}/sitemap.xml", timeout=2.2),
+        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=1.8),
+        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=1.8),
+        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=1.8),
+        "sitemap": http_client.get(f"https://{domain}/sitemap.xml", timeout=2.0),
     }
     if is_shopify:
-        tasks["products_json"] = http_client.get(f"https://{domain}/products.json?limit=250", timeout=2.5)
-        tasks["cart_js"] = http_client.get(f"https://{domain}/cart.js", timeout=1.8)
+        tasks["products_json"] = http_client.get(f"https://{domain}/products.json?limit=250", timeout=2.2)
+        tasks["cart_js"] = http_client.get(f"https://{domain}/cart.js", timeout=1.6)
 
     keys = list(tasks.keys())
     res_list = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -647,11 +657,6 @@ async def fetch_html_safely(
     timeout: float = 12.0,
     retries: int = 2
 ) -> tuple[int, str, str, str]:
-    """
-    Системний інваріант #1 та #2 (v23.1 Complete):
-    Незмінно повертає 4-елементний кортеж (status, html, final_url, err_msg)
-    та вшиває безпечні HTTP-заголовки і cookie_names у коментар <!-- http_headers_json: {...} -->.
-    """
     last_status = 0
     last_err = ''
     final_url = url
@@ -694,9 +699,9 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
 
     async def _fetch_one(gid: str) -> str:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gid}'
-        for use_direct in (False, True):
+        for use_direct in (True, False):
             try:
-                kwargs: dict = {'timeout': 6.0}
+                kwargs: dict = {'timeout': 5.0}
                 if use_direct:
                     kwargs['proxy'] = None
                 resp = await client.get(gtm_url, **kwargs)
@@ -987,9 +992,9 @@ async def fetch_html_playwright_fallback(
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
     """
-    v23.1 Complete:
-    При запуску з резидентським проксі (start_residential=True) обмежує кількість спроб до 1
-    після отримання launched_empty_shell або жорсткого WAF-блокування.
+    v23.2 Complete:
+    1. При запуску з резидентським проксі (start_residential=True) обмежує кількість спроб до 1.
+    2. Захищено виклик await page.content() від помилки 'Unable to retrieve content because the page is navigating'.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', False, 0
@@ -1020,11 +1025,12 @@ async def fetch_html_playwright_fallback(
                     ctx_kwargs['user_agent'] = _NATIVE_CLEAN_UA
                 if active_proxy:
                     parsed_p = urlparse(active_proxy)
-                    ctx_kwargs['proxy'] = {
-                        'server': f'{parsed_p.scheme}://{parsed_p.hostname}:{parsed_p.port}',
-                        'username': parsed_p.username or '',
-                        'password': parsed_p.password or '',
-                    }
+                    if parsed_p.hostname and parsed_p.port:
+                        ctx_kwargs['proxy'] = {
+                            'server': f'{parsed_p.scheme}://{parsed_p.hostname}:{parsed_p.port}',
+                            'username': parsed_p.username or '',
+                            'password': parsed_p.password or '',
+                        }
 
                 context = await browser.new_context(**ctx_kwargs)
                 page = await context.new_page()
@@ -1082,7 +1088,12 @@ async def fetch_html_playwright_fallback(
                     except Exception:
                         pass
 
-                content = await page.content()
+                try:
+                    content = await page.content()
+                except Exception:
+                    await page.wait_for_timeout(500)
+                    content = await page.content()
+
                 final_u = page.url or url
 
                 if captured_tracker_urls:
