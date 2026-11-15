@@ -94,10 +94,11 @@ EXACT_TLD_TO_TZ_AND_LANG: Dict[str, Tuple[str, str]] = {
 }
 
 NAME_TOKEN_RE = re.compile(r"[a-zа-яіїєґäöüß]{3,}", re.IGNORECASE)
+CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v23.2 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
+# v23.3 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -123,8 +124,7 @@ async def verify_eu_entity_vies_and_gleif(
             try:
                 resp = await http_session.get(
                     f"https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{prefix}/vat/{number}",
-                    timeout=1.8,
-                    proxy=None,
+                    timeout=2.0,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -150,8 +150,7 @@ async def verify_eu_entity_vies_and_gleif(
                 g_resp = await http_session.get(
                     gleif_url,
                     headers={"Accept": "application/vnd.api+json"},
-                    timeout=1.8,
-                    proxy=None,
+                    timeout=2.0,
                 )
                 if g_resp.status_code == 200:
                     for rec in (g_resp.json().get("data") or []):
@@ -212,8 +211,7 @@ async def fetch_rdap_domain_maturity_v23(http_session: Any, domain: str) -> Dict
         resp = await http_session.get(
             f"https://rdap.org/domain/{clean_dom}",
             headers={"Accept": "application/rdap+json"},
-            timeout=1.8,
-            proxy=None,
+            timeout=2.0,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -300,13 +298,15 @@ def resolve_prospect_timezone_and_locale_v23(
     domain: str,
     e164_phone: Optional[str] = None,
     detected_country_code: str = "",
-    html_lang_attr: str = ""
+    html_lang_attr: str = "",
+    page_title: str = "",
 ) -> Dict[str, str]:
     """
-    Виправлено Баг №4 (v23.2):
-    Для загальнонаціональних Toll-Free номерів США/Канади (+1 800/844/855/888),
-    де phonenumbers повертає 30+ зон із 'America/Adak' на першому місці за алфавітом,
-    встановлює стандарт східного узбережжя 'America/New_York'.
+    Виправлено Проблеми R4 та R9 (v23.3):
+    1. Захист від 'America/Adak' на Toll-Free номерах (+1 800/844/855/888 -> America/New_York).
+    2. Захист від шаблонного <html lang="en"> на українських та локальних європейських сайтах
+       (yakaboo.ua, stls.store): якщо page_title містить кирилицю або домен має строгий національний TLD
+       (.ua, .de, .pl, .fr, .es, .it, .nl, .cz), використовується національна мова замість шаблонного 'en'.
     """
     clean_dom = domain.lower().strip().rstrip(".")
     parts = clean_dom.split(".")
@@ -315,10 +315,14 @@ def resolve_prospect_timezone_and_locale_v23(
 
     tz: Optional[str] = None
     default_lang = "en"
+    has_strict_national_tld = False
+
     if tld_2 in EXACT_TLD_TO_TZ_AND_LANG:
         tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[tld_2]
+        has_strict_national_tld = (default_lang != "en")
     elif tld_1 in EXACT_TLD_TO_TZ_AND_LANG:
         tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[tld_1]
+        has_strict_national_tld = (default_lang != "en")
 
     if not tz and e164_phone and e164_phone.startswith("+") and _PHONENUMBERS_TZ_AVAILABLE:
         try:
@@ -332,8 +336,8 @@ def resolve_prospect_timezone_and_locale_v23(
         except Exception:
             pass
 
+    cc_low = (detected_country_code or "").strip().lower()
     if not tz:
-        cc_low = (detected_country_code or "").strip().lower()
         if cc_low in EXACT_TLD_TO_TZ_AND_LANG:
             tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[cc_low]
         elif cc_low == "us":
@@ -342,10 +346,21 @@ def resolve_prospect_timezone_and_locale_v23(
             tz, default_lang = ("America/Toronto", "en")
         else:
             tz, default_lang = ("Europe/London", "en")
+    elif default_lang == "en" and cc_low in EXACT_TLD_TO_TZ_AND_LANG:
+        _, default_lang = EXACT_TLD_TO_TZ_AND_LANG[cc_low]
 
     clean_html_lang = (html_lang_attr or "").strip().lower()[:2]
     supported_langs = {"uk", "de", "pl", "fr", "es", "it", "nl", "cs", "pt", "en"}
-    outreach_lang = clean_html_lang if clean_html_lang in supported_langs else default_lang
+
+    if page_title and CYRILLIC_TEXT_RE.search(page_title):
+        outreach_lang = "uk"
+    elif clean_html_lang == "en" and (has_strict_national_tld or tz == "Europe/Kyiv"):
+        outreach_lang = default_lang if default_lang != "en" else "uk"
+    elif clean_html_lang in supported_langs:
+        outreach_lang = clean_html_lang
+    else:
+        outreach_lang = default_lang
+
     return {"prospect_iana_timezone": tz, "recommended_outreach_lang": outreach_lang}
 
 
@@ -353,6 +368,12 @@ def compute_account_change_triggers_v23(
     prev_record: Optional[Dict[str, Any]],
     curr_record: Dict[str, Any]
 ) -> List[str]:
+    """
+    Виправлено Проблему R6 (v23.3):
+    Якщо попередній запис у кеші був збережений старою схемою (_schema < 29, де CSP не парсився),
+    виключаємо технології, знайдені суто через http_headers_or_ssr, із тригера ADDED_TECH,
+    щоб не видавати оновлення алгоритму скрапера за зміни у клієнта (flaconi.de, hiutdenim.co.uk).
+    """
     if not prev_record or not isinstance(prev_record, dict):
         return []
     triggers: List[str] = []
@@ -375,7 +396,23 @@ def compute_account_change_triggers_v23(
 
     old_tech = {t.strip() for t in str(prev_record.get("detected_technologies") or "").split(";") if t.strip()}
     new_tech = {t.strip() for t in str(curr_record.get("detected_technologies") or "").split(";") if t.strip()}
-    added = sorted(new_tech - old_tech)
+    added_candidates = new_tech - old_tech
+
+    prev_schema = int(prev_record.get("_schema") or 0)
+    if added_candidates and prev_schema < 29:
+        ev_json_raw = curr_record.get("technology_evidence_json")
+        if ev_json_raw:
+            try:
+                ev_map = json.loads(ev_json_raw) if isinstance(ev_json_raw, str) else ev_json_raw
+                if isinstance(ev_map, dict):
+                    added_candidates = {
+                        t for t in added_candidates
+                        if (ev_map.get(t) or {}).get("source") != "http_headers_or_ssr"
+                    }
+            except Exception:
+                pass
+
+    added = sorted(added_candidates)
     if added:
         triggers.append(f"ADDED_TECH: {', '.join(added[:3])}")
     return triggers
