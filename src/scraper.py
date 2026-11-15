@@ -38,15 +38,16 @@ from .contacts import (
     pick_best_social_candidate,
 )
 
+# Виправлено Проблему R2 (v23.3): Пріоритет стандартному playwright (бінарники якого вже є в образі Apify)
 try:
-    from patchright.async_api import async_playwright
+    from playwright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
-    _USING_PATCHRIGHT = True
+    _USING_PATCHRIGHT = False
 except ImportError:
     try:
-        from playwright.async_api import async_playwright
+        from patchright.async_api import async_playwright
         _PLAYWRIGHT_AVAILABLE = True
-        _USING_PATCHRIGHT = False
+        _USING_PATCHRIGHT = True
     except ImportError:
         _PLAYWRIGHT_AVAILABLE = False
         _USING_PATCHRIGHT = False
@@ -69,12 +70,48 @@ MULTI_PART_TLD_SUFFIXES = tuple(f'.{t}' for t in CONFIG_MULTI_PART_TLDS)
 CF_EMAIL_ATTR_RE = re.compile(r'data-cfemail=["\']([0-9a-fA-F]{10,128})["\']')
 CF_EMAIL_HREF_RE = re.compile(r'/cdn-cgi/l/email-protection#([0-9a-fA-F]{10,128})')
 
-# Виправлено Баг №1 (allbirds.com / westwing.de): не чіпаємо opacity:0 самий по собі (щоб не ламати слайдери)
 HONEYPOT_STYLE_RE = re.compile(
     r"(?:font-size\s*:\s*0(?:px|em|rem|pt|%|\b)|"
     r"left\s*:\s*-\d{3,}px|text-indent\s*:\s*-\d{3,}px)",
     re.IGNORECASE
 )
+
+# Виправлено Проблему R3 (foxtrot.com.ua): Маркери заголовків антибот-сторінок Cloudflare/WAF
+WAF_CHALLENGE_TITLE_REGEX = re.compile(
+    r"(?:^\s*(?:трохи\s+зачекайте|один\s+момент|зачекайте\s*,\s*будь\s+ласка|"
+    r"just\s+a\s+moment|attention\s+required|checking\s+your\s+browser|"
+    r"please\s+wait|ddos-guard|access\s+denied|security\s+check|"
+    r"un\s+instant|einen\s+moment\s+bitte|chwilę\s+czekać)\b)",
+    re.IGNORECASE
+)
+
+WAF_CHALLENGE_BODY_MARKERS = (
+    'cf-browser-verification',
+    'cf_chl_opt',
+    'challenge-platform/h/b/orchestrate',
+    'enable javascript and cookies to continue',
+    'ddos-guard',
+)
+
+
+def is_waf_challenge_page(html: str | None, page_title: str = '') -> bool:
+    """
+    Визначає, чи є сторінка антибот-заглушкою Cloudflare / DataDome / DDoS-Guard
+    (навіть якщо сервер повернув HTTP 200).
+    """
+    if page_title and WAF_CHALLENGE_TITLE_REGEX.search(page_title.strip()):
+        return True
+    if not html:
+        return False
+    head_low = html[:12000].lower()
+    if any(m in head_low for m in WAF_CHALLENGE_BODY_MARKERS):
+        return True
+    title_m = re.search(r'<title[^>]*>(.*?)</title>', head_low, re.DOTALL)
+    if title_m:
+        raw_t = ' '.join(title_m.group(1).split())
+        if WAF_CHALLENGE_TITLE_REGEX.search(raw_t):
+            return True
+    return False
 
 
 def _extract_etld_local(host_or_url: str) -> tuple[str, str]:
@@ -140,7 +177,7 @@ async def _check_host_ssrf_local(hostname: str, timeout: float = 1.2) -> tuple[b
 
 
 # ==============================================================================
-# v23.2 Complete: 7 функцій безбраузерного витягу даних (Фаза 1)
+# v23.3 Complete: 7 функцій безбраузерного витягу даних (Фаза 1)
 # ==============================================================================
 
 def append_safe_headers_comment_v23_1(html_text: str, resp_headers: Any) -> str:
@@ -211,10 +248,6 @@ def evaluate_x509_der_trust_and_org(cert: x509.Certificate) -> Dict[str, Any]:
 
 
 async def extract_tls_x509_der_intel(domain: str, timeout: float = 2.0) -> Dict[str, Any]:
-    """
-    Виправлено Баг №2 (v23.2): У блоці finally миттєво закриває транспорт (transport.abort())
-    без очікування нескінченного TLS close_notify у await writer.wait_closed() в Python 3.12.
-    """
     result: Dict[str, Any] = {
         "organization_name": None,
         "tls_trust_status": "unreachable",
@@ -312,11 +345,6 @@ def deobfuscate_cfemails_in_html(html_text: str) -> str:
 
 
 def prune_honeypot_leaf_nodes_in_soup(soup: Any) -> Set[str]:
-    """
-    Виправлено Баг №1 (allbirds.com / westwing.de):
-    Перевіряє getattr(tag, 'attrs', None) is not None, щоб не падати з AttributeError
-    на дочірніх вузлах вже видаленого через .decompose() батьківського тегу.
-    """
     poisoned_emails: Set[str] = set()
     if not soup:
         return poisoned_emails
@@ -352,7 +380,7 @@ async def fetch_waf_bypass_or_wayback_legal(
         for path in ("/impressum", "/imprint", "/en/imprint", "/contact", ""):
             try:
                 resp = await http_client.get(f"https://{host}{path}", timeout=2.5)
-                if resp.status_code == 200 and len(resp.text) > 800:
+                if resp.status_code == 200 and len(resp.text) > 800 and not is_waf_challenge_page(resp.text):
                     return resp.text, f"lateral_san:{host}{path}"
             except Exception:
                 continue
@@ -363,7 +391,7 @@ async def fetch_waf_bypass_or_wayback_legal(
         f"&filter=original:.*(impressum|imprint|legal|kontakt|contact|about).*&limit=3"
     )
     try:
-        cdx_resp = await http_client.get(cdx_url, timeout=2.2, proxy=None)
+        cdx_resp = await http_client.get(cdx_url, timeout=2.2)
         if cdx_resp.status_code == 200:
             rows = cdx_resp.json()
             if isinstance(rows, list) and len(rows) >= 2:
@@ -373,8 +401,8 @@ async def fetch_waf_bypass_or_wayback_legal(
                 ts = row_dict.get("timestamp")
                 orig = row_dict.get("original")
                 if ts and orig:
-                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.5, proxy=None)
-                    if snap_resp.status_code == 200 and len(snap_resp.text) > 500:
+                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.5)
+                    if snap_resp.status_code == 200 and len(snap_resp.text) > 500 and not is_waf_challenge_page(snap_resp.text):
                         return snap_resp.text, "wayback_cdx_legal"
     except Exception:
         pass
@@ -398,14 +426,14 @@ async def fetch_store_and_well_known_bundle(
     }
     is_shopify = "shopify" in (html_text or "").lower()
     tasks: Dict[str, Any] = {
-        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=1.8),
-        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=1.8),
-        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=1.8),
-        "sitemap": http_client.get(f"https://{domain}/sitemap.xml", timeout=2.0),
+        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=1.6),
+        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=1.6),
+        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=1.6),
+        "sitemap": http_client.get(f"https://{domain}/sitemap.xml", timeout=1.8),
     }
     if is_shopify:
-        tasks["products_json"] = http_client.get(f"https://{domain}/products.json?limit=250", timeout=2.2)
-        tasks["cart_js"] = http_client.get(f"https://{domain}/cart.js", timeout=1.6)
+        tasks["products_json"] = http_client.get(f"https://{domain}/products.json?limit=250", timeout=2.0)
+        tasks["cart_js"] = http_client.get(f"https://{domain}/cart.js", timeout=1.5)
 
     keys = list(tasks.keys())
     res_list = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -583,6 +611,20 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
     return [(dom, root_urls[dom], aliases) for dom, aliases in grouped.items()]
 
 
+def is_checkout_redirect_url(url_str: str | None) -> bool:
+    """
+    Виправлено Проблему R5 (gymshark.com -> us.checkout.gymshark.com):
+    Перевіряє, чи веде фінальний URL на технічний піддомен оплати/чекауту.
+    """
+    if not url_str:
+        return False
+    try:
+        host = re.sub(r':\d+$', '', (urlparse(url_str).netloc or '').lower()).strip('.')
+        return bool(host and CHECKOUT_REDIRECT_HOSTS.match(host))
+    except Exception:
+        return False
+
+
 def get_clean_canonical_domain(final_url: str, fallback_domain: str) -> str:
     fb_clean = strip_language_or_www_subdomains(fallback_domain)
     try:
@@ -628,6 +670,8 @@ def is_soft_404_page(html: str, page_title: str) -> bool:
         return True
     if page_title and SOFT_404_TITLE_REGEX.search(page_title):
         return True
+    if is_waf_challenge_page(html, page_title):
+        return True
     if len(html) < 1800 and ('404' in html[:800] or 'not found' in html[:800].lower()):
         return True
     return False
@@ -657,26 +701,41 @@ async def fetch_html_safely(
     timeout: float = 12.0,
     retries: int = 2
 ) -> tuple[int, str, str, str]:
+    """
+    Системний інваріант #1 та #2 + Виправлення R1/R3 (v23.3):
+    1. Повертає 4-елементний кортеж (status, html, final_url, err_msg).
+    2. Оскільки client тепер створюється без глобального проксі (для миттєвих S2S-запитів),
+       проксі призначається локально для кожного запиту до цільового сайту.
+    3. Якщо сторінка повертає HTTP 200, але містить антибот-заглушку Cloudflare ('Трохи зачекайте…'),
+       повертає статус 403 (waf:cf_challenge), щоб ніколи не труїти кеш.
+    """
     last_status = 0
     last_err = ''
     final_url = url
 
     for attempt in range(retries + 1):
         proxy_url = None
-        if proxy_config is not None and attempt > 0:
+        if proxy_config is not None:
             try:
                 proxy_url = await proxy_config.new_url()
             except Exception:
                 proxy_url = None
         try:
-            kwargs = {'timeout': timeout, 'allow_redirects': True}
-            if proxy_url:
+            kwargs: dict = {'timeout': timeout, 'allow_redirects': True}
+            if proxy_url and attempt > 0:
                 kwargs['proxy'] = proxy_url
             resp = await client.get(url, **kwargs)
             last_status = resp.status_code
             final_url = str(resp.url) or url
             if 200 <= last_status < 400:
                 text = resp.text[:MAX_HTML_BYTES] if resp.text else ''
+                if is_waf_challenge_page(text):
+                    last_status = 403
+                    last_err = 'HTTP 403 (waf:cf_challenge)'
+                    if attempt < retries:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    return 403, '', final_url, last_err
                 text = append_safe_headers_comment_v23_1(text, getattr(resp, 'headers', None))
                 return last_status, text, final_url, ''
             waf_tag = _detect_waf_vendor_from_response(resp)
@@ -684,7 +743,7 @@ async def fetch_html_safely(
         except Exception as e:
             last_err = str(e)
         if attempt < retries:
-            await asyncio.sleep(0.6 * (attempt + 1))
+            await asyncio.sleep(0.5 * (attempt + 1))
 
     return last_status, '', final_url, last_err
 
@@ -699,16 +758,12 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
 
     async def _fetch_one(gid: str) -> str:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gid}'
-        for use_direct in (True, False):
-            try:
-                kwargs: dict = {'timeout': 5.0}
-                if use_direct:
-                    kwargs['proxy'] = None
-                resp = await client.get(gtm_url, **kwargs)
-                if resp.status_code == 200 and resp.text:
-                    return resp.text[:450_000]
-            except Exception:
-                continue
+        try:
+            resp = await client.get(gtm_url, timeout=4.5)
+            if resp.status_code == 200 and resp.text:
+                return resp.text[:450_000]
+        except Exception:
+            pass
         return ''
 
     scripts = await asyncio.gather(*(_fetch_one(gid) for gid in gtm_ids[:2]))
@@ -719,7 +774,7 @@ async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[
     disallowed: list[str] = []
     crawl_delay = 0.05
     try:
-        resp = await client.get(f'{base_root}/robots.txt', timeout=4.0)
+        resp = await client.get(f'{base_root}/robots.txt', timeout=3.5)
         if resp.status_code == 200 and resp.text:
             active_ua = False
             for line in resp.text.splitlines()[:200]:
@@ -754,7 +809,7 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
     found: list[str] = []
     for sm_path in ('/sitemap.xml', '/sitemap_index.xml', '/page-sitemap.xml'):
         try:
-            resp = await client.get(f'{base_root}{sm_path}', timeout=5.0)
+            resp = await client.get(f'{base_root}{sm_path}', timeout=4.0)
             if resp.status_code == 200 and resp.text:
                 locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', resp.text, re.I)
                 for loc in locs[:400]:
@@ -992,9 +1047,11 @@ async def fetch_html_playwright_fallback(
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
     """
-    v23.2 Complete:
-    1. При запуску з резидентським проксі (start_residential=True) обмежує кількість спроб до 1.
-    2. Захищено виклик await page.content() від помилки 'Unable to retrieve content because the page is navigating'.
+    Виправлено Проблему R2 (v23.3):
+    1. Логує точну причину помилки Playwright через Actor.log.warning.
+    2. Якщо перша спроба через проксі дає ERR_PROXY_CONNECTION_FAILED / ERR_TUNNEL_CONNECTION_FAILED,
+       автоматично повторює спробу без проксі (direct fallback), щоб живі сайти (ccc.eu, shafa.ua,
+       hiutdenim.co.uk, serpstat.com, westwing.de) гарантовано рендерилися.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', False, 0
@@ -1002,13 +1059,14 @@ async def fetch_html_playwright_fallback(
     attempts_made = 0
     last_status = 'launched_failed'
     effective_max_attempts = 1 if start_residential else max_attempts
+    force_direct_no_proxy = False
 
     async with _PW_SEMAPHORE:
         for attempt_idx in range(1, effective_max_attempts + 1):
             attempts_made += 1
             use_res = start_residential or (attempt_idx > 1 and _ESCALATION_PROXY_CFG is not None)
-            active_proxy = proxy_url
-            if use_res and _ESCALATION_PROXY_CFG is not None:
+            active_proxy = None if force_direct_no_proxy else proxy_url
+            if not force_direct_no_proxy and use_res and _ESCALATION_PROXY_CFG is not None:
                 try:
                     active_proxy = await _ESCALATION_PROXY_CFG.new_url()
                 except Exception:
@@ -1075,7 +1133,13 @@ async def fetch_html_playwright_fallback(
                             continue
                 except Exception as nav_err:
                     nav_incomplete = True
-                    if 'timeout' in str(nav_err).lower():
+                    err_str = str(nav_err)
+                    Actor.log.warning(f"[PW NAV WARN] {url} (try {attempt_idx}/{effective_max_attempts}): {err_str[:160]}")
+                    if any(p_err in err_str for p_err in ('ERR_PROXY_', 'ERR_TUNNEL_', 'ERR_SOCKS_')) and active_proxy:
+                        force_direct_no_proxy = True
+                        if attempt_idx < effective_max_attempts:
+                            continue
+                    if 'timeout' in err_str.lower():
                         last_status = 'launched_timeout'
                     else:
                         last_status = 'launched_error'
@@ -1088,30 +1152,36 @@ async def fetch_html_playwright_fallback(
                     except Exception:
                         pass
 
+                content = ''
                 try:
                     content = await page.content()
                 except Exception:
-                    await page.wait_for_timeout(500)
-                    content = await page.content()
+                    try:
+                        await page.wait_for_timeout(500)
+                        content = await page.content()
+                    except Exception:
+                        content = ''
 
                 final_u = page.url or url
 
-                if captured_tracker_urls:
+                if captured_tracker_urls and content:
                     net_comments = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_tracker_urls)
                     content = f'{content}\n{net_comments}'
 
                 if content and len(content) >= 2500:
-                    low_c = content[:4000].lower()
-                    if any(w in low_c for w in ('just a moment...', 'attention required! | cloudflare', 'cf-browser-verification')):
+                    if is_waf_challenge_page(content):
                         last_status = 'launched_blocked_cloudflare'
                         if attempt_idx < effective_max_attempts:
                             continue
-                    return content[:MAX_HTML_BYTES], final_u, 'rendered', nav_incomplete, attempts_made
+                    else:
+                        return content[:MAX_HTML_BYTES], final_u, 'rendered', nav_incomplete, attempts_made
 
-                last_status = 'launched_empty_shell'
+                if last_status not in ('launched_timeout', 'launched_blocked_cloudflare') and not last_status.startswith('launched_blocked_'):
+                    last_status = 'launched_empty_shell'
                 if start_residential:
                     break
             except Exception as e:
+                Actor.log.warning(f"[PW LAUNCH ERROR] {url} (try {attempt_idx}): {e}")
                 last_status = 'launched_timeout' if 'timeout' in str(e).lower() else 'launched_error'
             finally:
                 if context is not None:
