@@ -113,7 +113,7 @@ INTERNAL_TECH_PATTERNS = re.compile(
 
 
 # ==============================================================================
-# v23.1 Complete: 5 функцій розширеної детекції технологій (Фаза 3)
+# v23.2 Complete: 5 функцій розширеної детекції технологій (Фаза 3 + S2S Direct)
 # ==============================================================================
 
 def extract_embedded_headers_and_ssr_signals_v23_1(html_text: str) -> Dict[str, Any]:
@@ -305,6 +305,10 @@ async def fetch_google_ads_transparency_intel_v23_1(
     etld_func: Callable[[str], tuple[str, str]],
     infra_denylist: tuple[str, ...]
 ) -> Dict[str, Any]:
+    """
+    Виправлено Баг №2 (v23.2):
+    Обидва RPC-виклики до adstransparency.google.com виконуються напряму (proxy=None, timeout=1.8s).
+    """
     result: Dict[str, Any] = {
         "ads_rpc_status": "not_checked",
         "has_verified_advertiser_profile": False,
@@ -327,7 +331,8 @@ async def fetch_google_ads_transparency_intel_v23_1(
             sugg_url,
             data={"f.req": json.dumps({"1": domain, "2": 5, "3": 5})},
             headers=headers,
-            timeout=2.8
+            timeout=1.8,
+            proxy=None,
         )
         if resp1.status_code == 429:
             result["ads_rpc_status"] = "rate_limited"
@@ -368,7 +373,8 @@ async def fetch_google_ads_transparency_intel_v23_1(
             creatives_url,
             data={"f.req": json.dumps(creatives_req)},
             headers=headers,
-            timeout=2.8
+            timeout=1.8,
+            proxy=None,
         )
         if resp2.status_code == 200:
             raw_text2 = resp2.text.lstrip(")]}'\n ")
@@ -425,7 +431,7 @@ async def fetch_public_ats_hiring_intel(
     if ats_provider == "Greenhouse":
         dept_url = f"https://boards-api.greenhouse.io/v1/boards/{company_token}/departments"
         try:
-            resp = await http_session.get(dept_url, timeout=2.5)
+            resp = await http_session.get(dept_url, timeout=2.0, proxy=None)
             if resp.status_code != 200:
                 return out
             departments_raw = resp.json().get("departments") or []
@@ -458,7 +464,8 @@ async def fetch_public_ats_hiring_intel(
                 try:
                     j_resp = await http_session.get(
                         f"https://boards-api.greenhouse.io/v1/boards/{company_token}/jobs/{jid}",
-                        timeout=2.0
+                        timeout=1.8,
+                        proxy=None,
                     )
                     if j_resp.status_code == 200:
                         content = j_resp.json().get("content") or ""
@@ -852,7 +859,6 @@ def detect_tech_with_evidence(
                 }
                 break
 
-    # Додаємо технології, знайдені через безпечні HTTP-заголовки / CSP / cookie_names (v23.1)
     for hdr_tech in header_ssr_signals.get('detected_tech') or []:
         if hdr_tech in ('Shopify', 'Magento', 'Shopware') and hdr_tech not in detected_cms_list:
             detected_cms_list.append(hdr_tech)
