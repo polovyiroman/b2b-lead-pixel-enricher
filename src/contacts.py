@@ -86,6 +86,11 @@ ACADEMIC_SUFFIX_TITLES_RE = re.compile(
     re.IGNORECASE
 )
 
+# Виправлено Проблему R8 (epicentrk.ua): суфікси українських/слов'янських по батькові
+PATRONYMIC_SUFFIX_RE = re.compile(
+    r"^(?:[А-ЯІЇЄҐA-Z][а-яіїєґa-z']+)(?:ович|івна|ївна|йович|ич|овна|евна|ична)$"
+)
+
 FAX_CONTEXT_RE = re.compile(
     r"(?:telefax|fax|факс|faks|télécopie)\s*[:.\-/]?\s*[\+\d\s()/.-]{6,22}",
     re.IGNORECASE
@@ -125,10 +130,17 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
 
 
 # ==============================================================================
-# v23.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
+# v23.3 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
 # ==============================================================================
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
+    """
+    Виправлено Проблему R8 (v23.3):
+    Якщо в ПІБ 3 токени (напр., 'Галина Федорівна Герега') і середній токен є по батькові
+    (-ович, -івна, -ївна, -ич), прибирає по батькові з dm_last_name, залишаючи чисте прізвище ('Герега').
+    Якщо першим токеном стоїть прізвище перед ім'ям та по батькові ('Герега Галина Федорівна'),
+    коректно розпізнає ім'я та прізвище.
+    """
     if not raw_full_name:
         return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
     clean = raw_full_name.strip()
@@ -146,6 +158,21 @@ def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
         return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
     if len(tokens) == 1:
         return {"dm_clean_full_name": tokens[0], "dm_first_name": tokens[0], "dm_last_name": ""}
+
+    if len(tokens) == 3:
+        if PATRONYMIC_SUFFIX_RE.match(tokens[1]):
+            return {
+                "dm_clean_full_name": f"{tokens[0]} {tokens[2]}",
+                "dm_first_name": tokens[0],
+                "dm_last_name": tokens[2],
+            }
+        if PATRONYMIC_SUFFIX_RE.match(tokens[2]):
+            return {
+                "dm_clean_full_name": f"{tokens[1]} {tokens[0]}",
+                "dm_first_name": tokens[1],
+                "dm_last_name": tokens[0],
+            }
+
     return {
         "dm_clean_full_name": " ".join(tokens),
         "dm_first_name": tokens[0],
@@ -241,7 +268,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/23.2 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/23.3 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -249,8 +276,7 @@ async def query_wikidata_holding_and_ceo(
                 "https://query.wikidata.org/sparql",
                 params={"query": sparql, "format": "json"},
                 headers=headers,
-                timeout=2.0,
-                proxy=None,
+                timeout=2.2,
             )
             if resp.status_code == 200:
                 bindings = (resp.json().get("results") or {}).get("bindings") or []
@@ -385,7 +411,7 @@ async def verify_m365_candidates_safe(
             "flowToken": ""
         }
         try:
-            resp = await http_session.post(endpoint, json=payload, timeout=2.0, proxy=None)
+            resp = await http_session.post(endpoint, json=payload, timeout=2.0)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
@@ -452,14 +478,14 @@ async def verify_candidates_via_gravatar_two_step(
         md5_hash = hashlib.md5(clean_email.encode("utf-8")).hexdigest()
         try:
             head_resp = await http_session.head(
-                f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.5, proxy=None
+                f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.5
             )
             if head_resp.status_code == 200:
                 result["verified_email"] = clean_email
                 result["verification_status"] = "identity_verified_gravatar_profile"
                 try:
                     j_resp = await http_session.get(
-                        f"https://en.gravatar.com/{md5_hash}.json", timeout=1.5, proxy=None
+                        f"https://en.gravatar.com/{md5_hash}.json", timeout=1.5
                     )
                     if j_resp.status_code == 200:
                         entries = j_resp.json().get("entry") or []
@@ -523,7 +549,7 @@ async def verify_ceo_email_cascade_port443_v23_1(
     for cand in candidate_emails[:2]:
         try:
             pgp_url = f"https://keys.openpgp.org/vks/v1/by-email/{quote(cand.strip().lower())}"
-            resp = await http_client.get(pgp_url, timeout=1.5, proxy=None)
+            resp = await http_client.get(pgp_url, timeout=1.5)
             if resp.status_code == 200:
                 return {
                     "verified_email": cand.strip().lower(),
@@ -1029,7 +1055,7 @@ async def verify_predicted_emails_via_api(
         if r_key:
             try:
                 url = f'https://emailverifier.reoon.com/api/v1/verify?email={cand}&key={r_key}&mode=quick'
-                resp = await client.get(url, timeout=5.0, proxy=None)
+                resp = await client.get(url, timeout=5.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     st = str(data.get('status') or '').lower()
@@ -1040,7 +1066,7 @@ async def verify_predicted_emails_via_api(
         if mv_key:
             try:
                 url = f'https://api.millionverifier.com/api/v3/?api={mv_key}&email={cand}&timeout=5'
-                resp = await client.get(url, timeout=5.0, proxy=None)
+                resp = await client.get(url, timeout=5.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     res_code = str(data.get('result') or '').lower()
@@ -1177,27 +1203,24 @@ async def query_doh_json(
     record_type: str = 'MX'
 ) -> tuple[bool, list[dict]]:
     """
-    Виправлено Баг №2 (v23.2):
-    Спочатку виконує прямий S2S-запит без проксі (use_direct=True, timeout=1.5s),
-    щоб паралельні DNS-запити (MX, TXT, DMARC, BIMI, SOA, DKIM) виконувалися за ~20 мс.
+    Виправлено Проблему R1 та R7 (v23.3):
+    Оскільки сесія client тепер ініціалізується без проксі, S2S-запити до Cloudflare та Google DoH
+    дійсно йдуть напряму з контейнера й відповідають за 15–30 мс.
     """
     doh_endpoints = (
         f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
         f'https://dns.google/resolve?name={domain}&type={record_type}',
+        f'https://dns.quad9.net:5053/dns-query?name={domain}&type={record_type}',
     )
-    for use_direct in (True, False):
-        for ep in doh_endpoints:
-            try:
-                kwargs: dict = {'headers': {'Accept': 'application/dns-json'}, 'timeout': 1.5}
-                if use_direct:
-                    kwargs['proxy'] = None
-                resp = await client.get(ep, **kwargs)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    answers = data.get('Answer') or []
-                    return True, answers
-            except Exception:
-                continue
+    for ep in doh_endpoints:
+        try:
+            resp = await client.get(ep, headers={'Accept': 'application/dns-json'}, timeout=1.8)
+            if resp.status_code == 200:
+                data = resp.json()
+                answers = data.get('Answer') or []
+                return True, answers
+        except Exception:
+            continue
     return False, []
 
 
@@ -1709,7 +1732,6 @@ async def fetch_dm_via_serp_fallback(
             },
             json={'q': search_query, 'num': 5},
             timeout=5.0,
-            proxy=None,
         )
         if resp.status_code != 200:
             return None, None, None, None
