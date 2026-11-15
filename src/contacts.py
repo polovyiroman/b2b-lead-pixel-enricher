@@ -125,7 +125,7 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
 
 
 # ==============================================================================
-# v23.1 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
+# v23.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
 # ==============================================================================
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
@@ -176,10 +176,6 @@ def parse_schema_org_employees_v23(emp_node: Any) -> Optional[int]:
 
 
 def build_wikidata_holding_sparql_v23_1(domain: str, extra_san_domains: List[str] | None = None) -> str:
-    """
-    Використовує B-Tree індекс VALUES ?website, піднімається по wdt:P749 (без інвестфондів P127)
-    і коректно прив'язує ?org до ?parentOrg через IF(!BOUND(?itemCeo) && BOUND(?parentCeo), ...).
-    """
     domains_to_check = [domain] + (extra_san_domains[:2] if extra_san_domains else [])
     uri_literals = []
     for d in dict.fromkeys(domains_to_check):
@@ -245,7 +241,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/23.1 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/23.2 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -253,7 +249,8 @@ async def query_wikidata_holding_and_ceo(
                 "https://query.wikidata.org/sparql",
                 params={"query": sparql, "format": "json"},
                 headers=headers,
-                timeout=2.2
+                timeout=2.0,
+                proxy=None,
             )
             if resp.status_code == 200:
                 bindings = (resp.json().get("results") or {}).get("bindings") or []
@@ -288,10 +285,6 @@ def generate_phonetic_token_variants_v23(
     raw_token: str,
     translit_func: Optional[Callable[[str], str]] = None
 ) -> List[str]:
-    """
-    Виправлено (v23.1): active_translit викликається на кожній із 3 гілок (t, ascii_pre, din_pre),
-    щоб комбіновані імена з умлаутами та слов'янською діакритикою/кирилицею ніколи не втрачали символи.
-    """
     if not raw_token:
         return []
     t = raw_token.strip().lower()
@@ -322,10 +315,6 @@ def crack_wp_user_email_dual_hash_v23_1(
     avatar_urls: Dict[str, str],
     translit_func: Optional[Callable[[str], str]] = None
 ) -> Optional[str]:
-    """
-    Двохешевий дешифратор (MD5 32 символи + SHA-256 64 символи для WordPress 6.8+).
-    Використовується для математичного визначення корпоративного шаблону пошт домену.
-    """
     if not domain or not avatar_urls:
         return None
     target_hash = None
@@ -396,7 +385,7 @@ async def verify_m365_candidates_safe(
             "flowToken": ""
         }
         try:
-            resp = await http_session.post(endpoint, json=payload, timeout=2.5)
+            resp = await http_session.post(endpoint, json=payload, timeout=2.0, proxy=None)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
@@ -462,12 +451,16 @@ async def verify_candidates_via_gravatar_two_step(
             continue
         md5_hash = hashlib.md5(clean_email.encode("utf-8")).hexdigest()
         try:
-            head_resp = await http_session.head(f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.8)
+            head_resp = await http_session.head(
+                f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.5, proxy=None
+            )
             if head_resp.status_code == 200:
                 result["verified_email"] = clean_email
                 result["verification_status"] = "identity_verified_gravatar_profile"
                 try:
-                    j_resp = await http_session.get(f"https://en.gravatar.com/{md5_hash}.json", timeout=1.8)
+                    j_resp = await http_session.get(
+                        f"https://en.gravatar.com/{md5_hash}.json", timeout=1.5, proxy=None
+                    )
                     if j_resp.status_code == 200:
                         entries = j_resp.json().get("entry") or []
                         if entries and isinstance(entries[0], dict):
@@ -530,7 +523,7 @@ async def verify_ceo_email_cascade_port443_v23_1(
     for cand in candidate_emails[:2]:
         try:
             pgp_url = f"https://keys.openpgp.org/vks/v1/by-email/{quote(cand.strip().lower())}"
-            resp = await http_client.get(pgp_url, timeout=1.8)
+            resp = await http_client.get(pgp_url, timeout=1.5, proxy=None)
             if resp.status_code == 200:
                 return {
                     "verified_email": cand.strip().lower(),
@@ -1036,7 +1029,7 @@ async def verify_predicted_emails_via_api(
         if r_key:
             try:
                 url = f'https://emailverifier.reoon.com/api/v1/verify?email={cand}&key={r_key}&mode=quick'
-                resp = await client.get(url, timeout=6.0)
+                resp = await client.get(url, timeout=5.0, proxy=None)
                 if resp.status_code == 200:
                     data = resp.json()
                     st = str(data.get('status') or '').lower()
@@ -1047,7 +1040,7 @@ async def verify_predicted_emails_via_api(
         if mv_key:
             try:
                 url = f'https://api.millionverifier.com/api/v3/?api={mv_key}&email={cand}&timeout=5'
-                resp = await client.get(url, timeout=6.0)
+                resp = await client.get(url, timeout=5.0, proxy=None)
                 if resp.status_code == 200:
                     data = resp.json()
                     res_code = str(data.get('result') or '').lower()
@@ -1183,15 +1176,19 @@ async def query_doh_json(
     domain: str,
     record_type: str = 'MX'
 ) -> tuple[bool, list[dict]]:
+    """
+    Виправлено Баг №2 (v23.2):
+    Спочатку виконує прямий S2S-запит без проксі (use_direct=True, timeout=1.5s),
+    щоб паралельні DNS-запити (MX, TXT, DMARC, BIMI, SOA, DKIM) виконувалися за ~20 мс.
+    """
     doh_endpoints = (
-        f'https://dns.google/resolve?name={domain}&type={record_type}',
         f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
-        f'https://dns.quad9.net:5053/dns-query?name={domain}&type={record_type}',
+        f'https://dns.google/resolve?name={domain}&type={record_type}',
     )
-    for use_direct in (False, True):
+    for use_direct in (True, False):
         for ep in doh_endpoints:
             try:
-                kwargs: dict = {'headers': {'Accept': 'application/dns-json'}, 'timeout': 4.0}
+                kwargs: dict = {'headers': {'Accept': 'application/dns-json'}, 'timeout': 1.5}
                 if use_direct:
                     kwargs['proxy'] = None
                 resp = await client.get(ep, **kwargs)
@@ -1711,7 +1708,8 @@ async def fetch_dm_via_serp_fallback(
                 'Content-Type': 'application/json',
             },
             json={'q': search_query, 'num': 5},
-            timeout=6.0,
+            timeout=5.0,
+            proxy=None,
         )
         if resp.status_code != 200:
             return None, None, None, None
