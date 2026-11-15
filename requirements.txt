@@ -1,5 +1,6 @@
-apify>=2.7.0,<3.0.0
-crawlee>=0.6.0,<1.0.0
+apify==2.7.3
+crawlee==0.6.12
+pydantic>=2.9.0,<2.10.0
 curl_cffi>=0.7.0
 beautifulsoup4>=4.12.3
 lxml>=5.2.0
