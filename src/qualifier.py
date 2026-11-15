@@ -97,7 +97,7 @@ NAME_TOKEN_RE = re.compile(r"[a-zа-яіїєґäöüß]{3,}", re.IGNORECASE)
 
 
 # ==============================================================================
-# v23.1 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
+# v23.2 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -123,7 +123,8 @@ async def verify_eu_entity_vies_and_gleif(
             try:
                 resp = await http_session.get(
                     f"https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{prefix}/vat/{number}",
-                    timeout=2.2
+                    timeout=1.8,
+                    proxy=None,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -146,7 +147,12 @@ async def verify_eu_entity_vies_and_gleif(
         if len(clean_query) >= 3:
             gleif_url = f"https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]={quote(clean_query)}&page[size]=3"
             try:
-                g_resp = await http_session.get(gleif_url, headers={"Accept": "application/vnd.api+json"}, timeout=2.2)
+                g_resp = await http_session.get(
+                    gleif_url,
+                    headers={"Accept": "application/vnd.api+json"},
+                    timeout=1.8,
+                    proxy=None,
+                )
                 if g_resp.status_code == 200:
                     for rec in (g_resp.json().get("data") or []):
                         attrs = rec.get("attributes") or {}
@@ -206,7 +212,8 @@ async def fetch_rdap_domain_maturity_v23(http_session: Any, domain: str) -> Dict
         resp = await http_session.get(
             f"https://rdap.org/domain/{clean_dom}",
             headers={"Accept": "application/rdap+json"},
-            timeout=2.2
+            timeout=1.8,
+            proxy=None,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -295,6 +302,12 @@ def resolve_prospect_timezone_and_locale_v23(
     detected_country_code: str = "",
     html_lang_attr: str = ""
 ) -> Dict[str, str]:
+    """
+    Виправлено Баг №4 (v23.2):
+    Для загальнонаціональних Toll-Free номерів США/Канади (+1 800/844/855/888),
+    де phonenumbers повертає 30+ зон із 'America/Adak' на першому місці за алфавітом,
+    встановлює стандарт східного узбережжя 'America/New_York'.
+    """
     clean_dom = domain.lower().strip().rstrip(".")
     parts = clean_dom.split(".")
     tld_1 = parts[-1] if parts else ""
@@ -310,9 +323,12 @@ def resolve_prospect_timezone_and_locale_v23(
     if not tz and e164_phone and e164_phone.startswith("+") and _PHONENUMBERS_TZ_AVAILABLE:
         try:
             parsed_num = phonenumbers.parse(e164_phone, None)
-            tz_list = pn_timezone.time_zones_for_number(parsed_num)
+            tz_list = list(pn_timezone.time_zones_for_number(parsed_num) or [])
             if tz_list:
-                tz = str(tz_list[0])
+                if len(tz_list) > 5 or tz_list[0] in ("America/Adak", "Etc/Unknown"):
+                    tz = "America/New_York" if e164_phone.startswith("+1") else str(tz_list[0])
+                else:
+                    tz = str(tz_list[0])
         except Exception:
             pass
 
