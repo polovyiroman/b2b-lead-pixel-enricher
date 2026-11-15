@@ -889,7 +889,7 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
 
 
 # ==============================================================================
-# v23.1 Complete: Константні структури даних (Фаза 1)
+# v23.2 Complete: Константні структури даних (Фаза 1 + Google/Meta CSP)
 # ==============================================================================
 
 MULTI_PART_TLDS: set[str] = {
@@ -929,6 +929,12 @@ TRUSTED_CA_ISSUER_MARKERS: tuple[str, ...] = (
 )
 
 CSP_STRICT_SIGNATURES: dict[str, str] = {
+    "googletagmanager.com": "Google Tag Manager",
+    "google-analytics.com": "Google Analytics (GA4)",
+    "analytics.google.com": "Google Analytics (GA4)",
+    "googleadservices.com": "Google Ads Conversion",
+    "connect.facebook.net": "Meta Pixel",
+    "snap.licdn.com": "LinkedIn Insight Tag",
     "klaviyo.com": "Klaviyo",
     "intercom.io": "Intercom",
     "intercomcdn.com": "Intercom",
