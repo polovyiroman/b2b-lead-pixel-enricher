@@ -680,7 +680,7 @@ async def fetch_html_safely(
     retries: int = 1
 ) -> tuple[int, str, str, str]:
     """
-    v23.4 Store Release: Оптимізовані таймаути (8.0s, 1 ретрай) для швидкого виконання батчів.
+    v23.7 Final Corrected: Виправлено друкарку str | str (тепер коректний конкатенатор / присвоєння).
     """
     last_status = 0
     last_err = ''
@@ -699,7 +699,7 @@ async def fetch_html_safely(
                 kwargs['proxy'] = proxy_url
             resp = await client.get(url, **kwargs)
             last_status = resp.status_code
-            final_url = str(resp.url) | url
+            final_url = str(resp.url) if resp.url else url
             if 200 <= last_status < 400:
                 text = resp.text[:MAX_HTML_BYTES] if resp.text else ''
                 if is_waf_challenge_page(text):
@@ -721,10 +721,6 @@ async def fetch_html_safely(
 
 
 async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str], str]:
-    """
-    Виправлено регресію weblium.com (v23.4):
-    Збільшено таймаут завантаження gtm.js до 8.0 с із 2 спробами (напряму і через проксі).
-    """
     gtm_ids = sorted({
         m.upper() for m in GTM_ID_REGEX.findall(html)
         if is_valid_gtm_id(m)
@@ -1027,9 +1023,6 @@ async def fetch_html_playwright_fallback(
     max_attempts: int = 1,
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
-    """
-    v23.4 Store Release: Оптимізовані таймаути (14s) та 1 спроба для максимальної швидкості.
-    """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', False, 0
 
