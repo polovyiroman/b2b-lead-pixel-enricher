@@ -98,7 +98,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v23.3 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
+# v23.4 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -301,13 +301,6 @@ def resolve_prospect_timezone_and_locale_v23(
     html_lang_attr: str = "",
     page_title: str = "",
 ) -> Dict[str, str]:
-    """
-    Виправлено Проблеми R4 та R9 (v23.3):
-    1. Захист від 'America/Adak' на Toll-Free номерах (+1 800/844/855/888 -> America/New_York).
-    2. Захист від шаблонного <html lang="en"> на українських та локальних європейських сайтах
-       (yakaboo.ua, stls.store): якщо page_title містить кирилицю або домен має строгий національний TLD
-       (.ua, .de, .pl, .fr, .es, .it, .nl, .cz), використовується національна мова замість шаблонного 'en'.
-    """
     clean_dom = domain.lower().strip().rstrip(".")
     parts = clean_dom.split(".")
     tld_1 = parts[-1] if parts else ""
@@ -352,8 +345,12 @@ def resolve_prospect_timezone_and_locale_v23(
     clean_html_lang = (html_lang_attr or "").strip().lower()[:2]
     supported_langs = {"uk", "de", "pl", "fr", "es", "it", "nl", "cs", "pt", "en"}
 
+    is_global_com_brand = tld_1 in ("com", "net", "io", "org", "co", "ai", "app", "tech")
+
     if page_title and CYRILLIC_TEXT_RE.search(page_title):
         outreach_lang = "uk"
+    elif is_global_com_brand and clean_html_lang == "en" and not CYRILLIC_TEXT_RE.search(page_title):
+        outreach_lang = "en"
     elif clean_html_lang == "en" and (has_strict_national_tld or tz == "Europe/Kyiv"):
         outreach_lang = default_lang if default_lang != "en" else "uk"
     elif clean_html_lang in supported_langs:
@@ -368,12 +365,6 @@ def compute_account_change_triggers_v23(
     prev_record: Optional[Dict[str, Any]],
     curr_record: Dict[str, Any]
 ) -> List[str]:
-    """
-    Виправлено Проблему R6 (v23.3):
-    Якщо попередній запис у кеші був збережений старою схемою (_schema < 29, де CSP не парсився),
-    виключаємо технології, знайдені суто через http_headers_or_ssr, із тригера ADDED_TECH,
-    щоб не видавати оновлення алгоритму скрапера за зміни у клієнта (flaconi.de, hiutdenim.co.uk).
-    """
     if not prev_record or not isinstance(prev_record, dict):
         return []
     triggers: List[str] = []
@@ -1370,6 +1361,7 @@ def build_manual_seed_record(
         'error_message': truncate_error_msg(f'Live {short_err_msg}; served verified manual_seed from {verified_at}'),
         'data_quality_score': dq_score,
         'sales_readiness_verdict': sales_readiness_verdict,
+        'sales_actionability_class': derive_sales_actionability_class(sales_readiness_verdict, cat),
         'company_category': cat,
         'category_confidence': cat_conf,
         'marketplace_platform': is_mp,
@@ -1379,12 +1371,19 @@ def build_manual_seed_record(
         'tech_scan_completeness': 'full',
         'tech_rescan_needed': False,
         'contact_quality_tier': contact_quality_tier,
+        'contact_quality_tier_human': derive_human_contact_tier(contact_quality_tier, cat),
         'contact_enrichment_status': enrichment_status,
         'data_confidence_warning': (
             f'Note: Live crawl encountered {short_err_msg}; returning verified manual_seed '
             f'(age={age_days}d, verified_at={verified_at}).'
         ),
         'gdpr_eu_domain': is_eu_gdpr,
+        'gdpr_jurisdiction': derive_gdpr_jurisdiction(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), ''),
+        'legal_basis_for_processing': derive_legal_basis_for_processing(canonical_domain, detect_country_hint(canonical_domain, '', '', primary_phone, ''), bool(best_email or dm_name or primary_phone)),
+        'data_subject_can_request_deletion': True,
+        'data_retention_policy_days': 365,
+        'personal_data_fields_in_record': derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, seed.get('decision_maker_linkedin_url')),
+        'compliance_note': build_compliance_note(canonical_domain, detect_country_hint(canonical_domain, '', '', primary_phone, '')),
         'playwright_available': playwright_available,
         'playwright_used': False,
         'playwright_status': 'not_attempted_manual_seed',
@@ -1399,15 +1398,21 @@ def build_manual_seed_record(
         'email_source_note': seed.get('email_source_note', 'Verified via manual audit seed'),
         'named_email_owner_role_hint': None,
         'email_deliverability_check': deliv_str,
+        'email_verification_confidence': 'OBSERVED_ON_SITE' if best_email else 'NONE',
         'all_emails_deliverability': all_emails_deliv_str,
         'all_emails_classification': all_emails_class_str,
         'email_source_url': seed.get('email_source_url', clean_website_url),
+        'compliance_dpo_email': None,
         'primary_phone': primary_phone,
         'e164_phone': seed.get('e164_phone') or (re.sub(r'[\s\-()]', '', primary_phone) if primary_phone else None),
+        'whatsapp_business_phone': None,
         'phone_availability': 'public' if primary_phone else 'not_public',
         'phone_source_url': seed.get('phone_source_url', clean_website_url),
         'decision_maker_name': dm_name,
+        'dm_first_name': split_clean_executive_name(dm_name or '')['dm_first_name'] or None,
+        'dm_last_name': split_clean_executive_name(dm_name or '')['dm_last_name'] or None,
         'decision_maker_role': dm_role,
+        'decision_maker_scope': 'target_entity' if dm_name else 'none',
         'decision_maker_source_url': dm_src,
         'decision_maker_source_type': dm_src_type,
         'decision_makers_found': dms_found_str,
@@ -1443,7 +1448,32 @@ def build_manual_seed_record(
         'has_gtm': tech_info['has_gtm'],
         'has_sgtm': tech_info['has_sgtm'],
         'all_ga4_ids': tech_info['all_ga4_ids'],
+        'all_ga4_ids_count': 1 if tech_info['all_ga4_ids'] else None,
         'detected_technologies': seed.get('detected_technologies'),
+        'detected_payment_gateways': [],
+        'min_estimated_saas_spend_usd': 0,
+        'estimated_saas_spend_min_usd': 0,
+        'estimated_saas_spend_max_usd': 0,
+        'spend_estimation_basis': [],
+        'primary_sales_gap': None,
+        'ads_rpc_status': 'not_checked',
+        'ads_active_last_30d': None,
+        'active_ad_formats': [],
+        'advertiser_sister_domains': [],
+        'detected_marketing_agency': None,
+        'open_positions_total': 0,
+        'hiring_departments': [],
+        'dmarc_policy': None,
+        'email_security_gateway': None,
+        'plain_text_outreach_required': False,
+        'tls_trust_status': 'not_checked',
+        'prospect_iana_timezone': resolve_prospect_timezone_and_locale_v23(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), '', page_title=seed.get('page_title') or '')['prospect_iana_timezone'],
+        'recommended_outreach_lang': resolve_prospect_timezone_and_locale_v23(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), '', page_title=seed.get('page_title') or '')['recommended_outreach_lang'],
+        'corporate_lifecycle_status': 'ACTIVE_INDEPENDENT',
+        'outreach_dedup_status': 'PRIMARY_OUTREACH_TARGET',
+        'recent_change_triggers': [],
+        'compliance_ids': {},
+        'provenance_meta': {},
         'all_emails': seed.get('all_emails', best_email),
         'all_phones': seed.get('all_phones', primary_phone),
         'last_checked_at': verified_at
