@@ -38,7 +38,6 @@ from .contacts import (
     pick_best_social_candidate,
 )
 
-# Виправлено Проблему R2 (v23.3): Пріоритет стандартному playwright (бінарники якого вже є в образі Apify)
 try:
     from playwright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
@@ -56,7 +55,7 @@ _SHARED_PW = None
 _SHARED_BROWSER = None
 _NATIVE_CLEAN_UA: str | None = None
 _BROWSER_LOCK = asyncio.Lock()
-_PW_SEMAPHORE = asyncio.Semaphore(3)
+_PW_SEMAPHORE = asyncio.Semaphore(2)
 _ESCALATION_PROXY_CFG = None
 
 STRIPPABLE_SUBDOMAIN_PREFIXES = {
@@ -76,7 +75,6 @@ HONEYPOT_STYLE_RE = re.compile(
     re.IGNORECASE
 )
 
-# Виправлено Проблему R3 (foxtrot.com.ua): Маркери заголовків антибот-сторінок Cloudflare/WAF
 WAF_CHALLENGE_TITLE_REGEX = re.compile(
     r"(?:^\s*(?:трохи\s+зачекайте|один\s+момент|зачекайте\s*,\s*будь\s+ласка|"
     r"just\s+a\s+moment|attention\s+required|checking\s+your\s+browser|"
@@ -95,10 +93,6 @@ WAF_CHALLENGE_BODY_MARKERS = (
 
 
 def is_waf_challenge_page(html: str | None, page_title: str = '') -> bool:
-    """
-    Визначає, чи є сторінка антибот-заглушкою Cloudflare / DataDome / DDoS-Guard
-    (навіть якщо сервер повернув HTTP 200).
-    """
     if page_title and WAF_CHALLENGE_TITLE_REGEX.search(page_title.strip()):
         return True
     if not html:
@@ -176,15 +170,7 @@ async def _check_host_ssrf_local(hostname: str, timeout: float = 1.2) -> tuple[b
         return False, "dns_error"
 
 
-# ==============================================================================
-# v23.3 Complete: 7 функцій безбраузерного витягу даних (Фаза 1)
-# ==============================================================================
-
 def append_safe_headers_comment_v23_1(html_text: str, resp_headers: Any) -> str:
-    """
-    Вшиває інфраструктурні заголовки та ВИКЛЮЧНО імена кукі (cookie_names без значень)
-    у коментар <!-- http_headers_json: {...} --> в кінці HTML.
-    """
     if not html_text or not resp_headers:
         return html_text
     safe_keys = {
@@ -247,7 +233,7 @@ def evaluate_x509_der_trust_and_org(cert: x509.Certificate) -> Dict[str, Any]:
     }
 
 
-async def extract_tls_x509_der_intel(domain: str, timeout: float = 2.0) -> Dict[str, Any]:
+async def extract_tls_x509_der_intel(domain: str, timeout: float = 1.8) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "organization_name": None,
         "tls_trust_status": "unreachable",
@@ -379,7 +365,7 @@ async def fetch_waf_bypass_or_wayback_legal(
             continue
         for path in ("/impressum", "/imprint", "/en/imprint", "/contact", ""):
             try:
-                resp = await http_client.get(f"https://{host}{path}", timeout=2.5)
+                resp = await http_client.get(f"https://{host}{path}", timeout=2.2)
                 if resp.status_code == 200 and len(resp.text) > 800 and not is_waf_challenge_page(resp.text):
                     return resp.text, f"lateral_san:{host}{path}"
             except Exception:
@@ -391,7 +377,7 @@ async def fetch_waf_bypass_or_wayback_legal(
         f"&filter=original:.*(impressum|imprint|legal|kontakt|contact|about).*&limit=3"
     )
     try:
-        cdx_resp = await http_client.get(cdx_url, timeout=2.2)
+        cdx_resp = await http_client.get(cdx_url, timeout=2.0)
         if cdx_resp.status_code == 200:
             rows = cdx_resp.json()
             if isinstance(rows, list) and len(rows) >= 2:
@@ -401,7 +387,7 @@ async def fetch_waf_bypass_or_wayback_legal(
                 ts = row_dict.get("timestamp")
                 orig = row_dict.get("original")
                 if ts and orig:
-                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.5)
+                    snap_resp = await http_client.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=2.2)
                     if snap_resp.status_code == 200 and len(snap_resp.text) > 500 and not is_waf_challenge_page(snap_resp.text):
                         return snap_resp.text, "wayback_cdx_legal"
     except Exception:
@@ -426,9 +412,9 @@ async def fetch_store_and_well_known_bundle(
     }
     is_shopify = "shopify" in (html_text or "").lower()
     tasks: Dict[str, Any] = {
-        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=1.6),
-        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=1.6),
-        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=1.6),
+        "apple_pay": http_client.get(f"https://{domain}/.well-known/apple-developer-merchantid-domain-association", timeout=1.5),
+        "assetlinks": http_client.get(f"https://{domain}/.well-known/assetlinks.json", timeout=1.5),
+        "security_txt": http_client.get(f"https://{domain}/.well-known/security.txt", timeout=1.5),
         "sitemap": http_client.get(f"https://{domain}/sitemap.xml", timeout=1.8),
     }
     if is_shopify:
@@ -506,10 +492,6 @@ async def fetch_store_and_well_known_bundle(
     return out
 
 
-# ==============================================================================
-# Core Scraper & Playwright Engine
-# ==============================================================================
-
 def is_playwright_available() -> bool:
     return _PLAYWRIGHT_AVAILABLE
 
@@ -518,10 +500,10 @@ def has_residential_escalation_proxy() -> bool:
     return _ESCALATION_PROXY_CFG is not None
 
 
-def configure_pw(escalation_proxy=None, max_concurrent: int = 3) -> None:
+def configure_pw(escalation_proxy=None, max_concurrent: int = 2) -> None:
     global _ESCALATION_PROXY_CFG, _PW_SEMAPHORE
     _ESCALATION_PROXY_CFG = escalation_proxy
-    _PW_SEMAPHORE = asyncio.Semaphore(max(1, int(max_concurrent or 3)))
+    _PW_SEMAPHORE = asyncio.Semaphore(max(1, int(max_concurrent or 2)))
 
 
 async def close_shared_playwright_browser() -> None:
@@ -612,10 +594,6 @@ def prepare_domains(raw_domains: list[str]) -> list[tuple[str, str, list[str]]]:
 
 
 def is_checkout_redirect_url(url_str: str | None) -> bool:
-    """
-    Виправлено Проблему R5 (gymshark.com -> us.checkout.gymshark.com):
-    Перевіряє, чи веде фінальний URL на технічний піддомен оплати/чекауту.
-    """
     if not url_str:
         return False
     try:
@@ -698,16 +676,11 @@ async def fetch_html_safely(
     client: AsyncSession,
     url: str,
     proxy_config=None,
-    timeout: float = 12.0,
-    retries: int = 2
+    timeout: float = 8.0,
+    retries: int = 1
 ) -> tuple[int, str, str, str]:
     """
-    Системний інваріант #1 та #2 + Виправлення R1/R3 (v23.3):
-    1. Повертає 4-елементний кортеж (status, html, final_url, err_msg).
-    2. Оскільки client тепер створюється без глобального проксі (для миттєвих S2S-запитів),
-       проксі призначається локально для кожного запиту до цільового сайту.
-    3. Якщо сторінка повертає HTTP 200, але містить антибот-заглушку Cloudflare ('Трохи зачекайте…'),
-       повертає статус 403 (waf:cf_challenge), щоб ніколи не труїти кеш.
+    v23.4 Store Release: Оптимізовані таймаути (8.0s, 1 ретрай) для швидкого виконання батчів.
     """
     last_status = 0
     last_err = ''
@@ -726,29 +699,32 @@ async def fetch_html_safely(
                 kwargs['proxy'] = proxy_url
             resp = await client.get(url, **kwargs)
             last_status = resp.status_code
-            final_url = str(resp.url) or url
+            final_url = str(resp.url) | url
             if 200 <= last_status < 400:
                 text = resp.text[:MAX_HTML_BYTES] if resp.text else ''
                 if is_waf_challenge_page(text):
                     last_status = 403
                     last_err = 'HTTP 403 (waf:cf_challenge)'
-                    if attempt < retries:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        continue
                     return 403, '', final_url, last_err
                 text = append_safe_headers_comment_v23_1(text, getattr(resp, 'headers', None))
                 return last_status, text, final_url, ''
             waf_tag = _detect_waf_vendor_from_response(resp)
             last_err = f'HTTP {last_status} ({waf_tag})' if waf_tag else f'HTTP {last_status}'
+            if 'waf:' in last_err or last_status in (403, 429, 503):
+                break
         except Exception as e:
             last_err = str(e)
         if attempt < retries:
-            await asyncio.sleep(0.5 * (attempt + 1))
+            await asyncio.sleep(0.4)
 
     return last_status, '', final_url, last_err
 
 
 async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str], str]:
+    """
+    Виправлено регресію weblium.com (v23.4):
+    Збільшено таймаут завантаження gtm.js до 8.0 с із 2 спробами (напряму і через проксі).
+    """
     gtm_ids = sorted({
         m.upper() for m in GTM_ID_REGEX.findall(html)
         if is_valid_gtm_id(m)
@@ -758,12 +734,16 @@ async def fetch_gtm_scripts(client: AsyncSession, html: str) -> tuple[list[str],
 
     async def _fetch_one(gid: str) -> str:
         gtm_url = f'https://www.googletagmanager.com/gtm.js?id={gid}'
-        try:
-            resp = await client.get(gtm_url, timeout=4.5)
-            if resp.status_code == 200 and resp.text:
-                return resp.text[:450_000]
-        except Exception:
-            pass
+        for attempt_g in range(2):
+            try:
+                kwargs: dict = {'timeout': 8.0}
+                if attempt_g == 0:
+                    kwargs['proxy'] = None
+                resp = await client.get(gtm_url, **kwargs)
+                if resp.status_code == 200 and resp.text:
+                    return resp.text[:450_000]
+            except Exception:
+                pass
         return ''
 
     scripts = await asyncio.gather(*(_fetch_one(gid) for gid in gtm_ids[:2]))
@@ -774,7 +754,7 @@ async def load_robots_rules(client: AsyncSession, base_root: str) -> tuple[list[
     disallowed: list[str] = []
     crawl_delay = 0.05
     try:
-        resp = await client.get(f'{base_root}/robots.txt', timeout=3.5)
+        resp = await client.get(f'{base_root}/robots.txt', timeout=3.0)
         if resp.status_code == 200 and resp.text:
             active_ua = False
             for line in resp.text.splitlines()[:200]:
@@ -809,7 +789,7 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
     found: list[str] = []
     for sm_path in ('/sitemap.xml', '/sitemap_index.xml', '/page-sitemap.xml'):
         try:
-            resp = await client.get(f'{base_root}{sm_path}', timeout=4.0)
+            resp = await client.get(f'{base_root}{sm_path}', timeout=3.5)
             if resp.status_code == 200 and resp.text:
                 locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', resp.text, re.I)
                 for loc in locs[:400]:
@@ -1008,6 +988,7 @@ async def _get_or_launch_browser():
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
                 '--no-sandbox',
+                '--js-flags=--max-old-space-size=512',
             ]
         )
         try:
@@ -1027,12 +1008,12 @@ async def _try_accept_cookie_banner(page) -> bool:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=150):
                 await loc.click(timeout=500)
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(1000)
                 return True
         except Exception:
             continue
     try:
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(500)
     except Exception:
         pass
     return False
@@ -1043,34 +1024,24 @@ async def fetch_html_playwright_fallback(
     proxy_url: str | None = None,
     locale: str = 'en-US',
     accept_consent: bool = True,
-    max_attempts: int = 2,
+    max_attempts: int = 1,
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
     """
-    Виправлено Проблему R2 (v23.3):
-    1. Логує точну причину помилки Playwright через Actor.log.warning.
-    2. Якщо перша спроба через проксі дає ERR_PROXY_CONNECTION_FAILED / ERR_TUNNEL_CONNECTION_FAILED,
-       автоматично повторює спробу без проксі (direct fallback), щоб живі сайти (ccc.eu, shafa.ua,
-       hiutdenim.co.uk, serpstat.com, westwing.de) гарантовано рендерилися.
+    v23.4 Store Release: Оптимізовані таймаути (14s) та 1 спроба для максимальної швидкості.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', False, 0
 
     attempts_made = 0
     last_status = 'launched_failed'
-    effective_max_attempts = 1 if start_residential else max_attempts
+    effective_max_attempts = 1
     force_direct_no_proxy = False
 
     async with _PW_SEMAPHORE:
         for attempt_idx in range(1, effective_max_attempts + 1):
             attempts_made += 1
-            use_res = start_residential or (attempt_idx > 1 and _ESCALATION_PROXY_CFG is not None)
             active_proxy = None if force_direct_no_proxy else proxy_url
-            if not force_direct_no_proxy and use_res and _ESCALATION_PROXY_CFG is not None:
-                try:
-                    active_proxy = await _ESCALATION_PROXY_CFG.new_url()
-                except Exception:
-                    active_proxy = proxy_url
 
             context = None
             try:
@@ -1126,38 +1097,28 @@ async def fetch_html_playwright_fallback(
 
                 nav_incomplete = False
                 try:
-                    resp = await page.goto(url, wait_until='domcontentloaded', timeout=18000)
+                    resp = await page.goto(url, wait_until='domcontentloaded', timeout=14000)
                     if resp and resp.status in (403, 429, 503):
                         last_status = f'launched_blocked_{resp.status}'
-                        if attempt_idx < effective_max_attempts:
-                            continue
+                        break
                 except Exception as nav_err:
                     nav_incomplete = True
                     err_str = str(nav_err)
-                    Actor.log.warning(f"[PW NAV WARN] {url} (try {attempt_idx}/{effective_max_attempts}): {err_str[:160]}")
-                    if any(p_err in err_str for p_err in ('ERR_PROXY_', 'ERR_TUNNEL_', 'ERR_SOCKS_')) and active_proxy:
+                    Actor.log.warning(f"[PW NAV WARN] {url}: {err_str[:120]}")
+                    if any(p_err in err_str for p_err in ('ERR_PROXY_', 'ERR_TUNNEL_')) and active_proxy:
                         force_direct_no_proxy = True
-                        if attempt_idx < effective_max_attempts:
-                            continue
-                    if 'timeout' in err_str.lower():
-                        last_status = 'launched_timeout'
-                    else:
-                        last_status = 'launched_error'
+                        continue
+                    last_status = 'launched_timeout' if 'timeout' in err_str.lower() else 'launched_error'
 
                 if accept_consent:
                     await _try_accept_cookie_banner(page)
-                else:
-                    try:
-                        await page.wait_for_timeout(600)
-                    except Exception:
-                        pass
 
                 content = ''
                 try:
                     content = await page.content()
                 except Exception:
                     try:
-                        await page.wait_for_timeout(500)
+                        await page.wait_for_timeout(400)
                         content = await page.content()
                     except Exception:
                         content = ''
@@ -1168,20 +1129,16 @@ async def fetch_html_playwright_fallback(
                     net_comments = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_tracker_urls)
                     content = f'{content}\n{net_comments}'
 
-                if content and len(content) >= 2500:
+                if content and len(content) >= 2000:
                     if is_waf_challenge_page(content):
                         last_status = 'launched_blocked_cloudflare'
-                        if attempt_idx < effective_max_attempts:
-                            continue
                     else:
                         return content[:MAX_HTML_BYTES], final_u, 'rendered', nav_incomplete, attempts_made
 
                 if last_status not in ('launched_timeout', 'launched_blocked_cloudflare') and not last_status.startswith('launched_blocked_'):
                     last_status = 'launched_empty_shell'
-                if start_residential:
-                    break
             except Exception as e:
-                Actor.log.warning(f"[PW LAUNCH ERROR] {url} (try {attempt_idx}): {e}")
+                Actor.log.warning(f"[PW LAUNCH ERROR] {url}: {e}")
                 last_status = 'launched_timeout' if 'timeout' in str(e).lower() else 'launched_error'
             finally:
                 if context is not None:
