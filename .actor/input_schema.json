@@ -1,12 +1,12 @@
 {
-  "title": "B2B Lead & MarTech Pixel Enricher (v23.1 Complete)",
+  "title": "B2B Lead & MarTech Pixel Enricher (v23.4 Store Release)",
   "description": "Deep MarTech stack audit (GTM macro unpacking, sGTM, GA4 duplicate detection, EU Consent Mode v2), 2-Wave OSINT DAG (X.509, DNS/DKIM/DMARC, Wikidata, Google Ads RPC), B2B contact classification, and GDPR/UWG §7 compliance.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "domains": {
       "sectionCaption": "1. Target Domains, Scan Mode & Output Format",
-      "sectionDescription": "Provide target company domains or URLs, select the scan speed/depth mode, and choose between the full engineering dataset or the 21-column SDR compact view.",
+      "sectionDescription": "Provide target company domains or URLs, select the scan speed/depth mode, and choose between the full 110-column engineering dataset or the SDR compact view.",
       "title": "Target Domains / URLs",
       "type": "array",
       "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de').",
@@ -36,7 +36,7 @@
     "outputView": {
       "title": "Output Dataset View",
       "type": "string",
-      "description": "Choose 'full_audit' for all 96 technical & compliance columns, or 'sdr_compact' for a clean 21-column CRM-ready table (includes pain_point_detected and predicted_dm_email).",
+      "description": "Choose 'full_audit' for all 110 technical & compliance columns, or 'sdr_compact' for a clean CRM-ready table.",
       "editor": "select",
       "default": "full_audit",
       "enum": [
@@ -44,16 +44,16 @@
         "sdr_compact"
       ],
       "enumTitles": [
-        "Full Engineering & Compliance Audit (96 Columns)",
-        "SDR / CRM Compact Outbound View (21 Columns)"
+        "Full Engineering & Compliance Audit (110 Columns)",
+        "SDR / CRM Compact Outbound View"
       ]
     },
     "enableDeepOsint": {
-      "title": "Enable 2-Wave Deep OSINT DAG (X.509, DNS/DKIM, Wikidata, Ads RPC, Port-443)",
+      "title": "Enable 2-Wave Deep OSINT DAG (X.509, DNS/DKIM/DMARC, Wikidata, Ads RPC, Port-443)",
       "type": "boolean",
       "description": "Runs time-budgeted browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SOA, Apple Pay PSPs, Google Ads Transparency RPC, Wikidata CEO fallback, and Port-443 M365/Gravatar verification.",
       "editor": "checkbox",
-      "default": false
+      "default": true
     },
     "defaultPhoneRegion": {
       "title": "Default Phone Region Fallback",
@@ -135,17 +135,17 @@
       "title": "Max HTTP Concurrency",
       "type": "integer",
       "description": "Maximum number of parallel fast HTTP workers (curl_cffi).",
-      "default": 30,
+      "default": 25,
       "minimum": 5,
       "maximum": 100
     },
     "maxBrowserConcurrency": {
       "title": "Max Playwright Browser Concurrency",
       "type": "integer",
-      "description": "Maximum number of parallel headless browser contexts for JS rendering.",
-      "default": 3,
+      "description": "Maximum number of parallel headless browser contexts for JS rendering (2 is optimal for 2048 MB RAM).",
+      "default": 2,
       "minimum": 1,
-      "maximum": 10
+      "maximum": 8
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
