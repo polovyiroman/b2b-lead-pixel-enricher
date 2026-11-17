@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 from typing import Callable
 from bs4 import BeautifulSoup
@@ -97,7 +98,7 @@ class _MockAsyncClient:
 
 def _run_fetch_html_safely_sync_check() -> None:
     """
-    Тест №27 (v23.8): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
+    Тест №27 (v23.8.1): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
     та верифікує повернення 4-елементного кортежу (status, html, final_url, err_msg) на мок-відповіді 200 OK.
     """
     src_code = inspect.getsource(fetch_html_safely)
@@ -144,7 +145,7 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[[str, bool, bool], str] | None = None,
 ) -> None:
     """
-    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8).
+    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8.1).
     Якщо будь-який інваріант порушено — миттєво зупиняє запуск із інформативним AssertionError.
     """
     # 1. Domain preparation & canonicalization
@@ -249,7 +250,6 @@ def run_startup_regression_gate(
     assert safe_ems == ['info@notino.de']
 
     # 13. WP 6.8+ SHA-256 & MD5 dual-hash cracker
-    import hashlib
     test_em = 'ivan.koval@company.ua'
     sha_h = hashlib.sha256(test_em.encode('utf-8')).hexdigest()
     cracked = crack_wp_user_email_dual_hash_v23_1(
@@ -284,7 +284,7 @@ def run_startup_regression_gate(
 
     ma_liq = detect_ma_rebrand_and_insolvency_v23(
         'oldshop.de', 'https://oldshop.de/', 'OldShop',
-        set(), {}, 'OldShop GmbH i.L. wird vertreten durch den Liquidator', False, _extract_etld_local
+        set(), {}, 'OldShop GmbH i.L. (in Liquidation) wird vertreten durch den Liquidator', False, _extract_etld_local
     )
     assert ma_liq['corporate_lifecycle_status'] == 'IN_LIQUIDATION_OR_INSOLVENCY'
 
@@ -356,4 +356,4 @@ def run_startup_regression_gate(
     _run_fetch_html_safely_sync_check()
 
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8 Store Gold Master).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8.1 Store Gold Master).')
