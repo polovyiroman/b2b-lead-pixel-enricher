@@ -31,13 +31,20 @@ from .contacts import (
     verify_person_email_match,
     verify_person_linkedin_match,
 )
+from .domain_helpers import (
+    derive_data_source_sensitivity,
+    derive_gdpr_jurisdiction,
+    derive_sales_actionability_class,
+)
 from .qualifier import (
     build_linkedin_xray_query,
     build_sales_hook,
     calculate_saas_spend_range_usd,
     classify_company_category,
     compute_account_change_triggers_v23,
+    compute_account_opportunity_score,
     compute_data_quality_score,
+    derive_contactability_level,
     detect_ma_rebrand_and_insolvency_v23,
     evaluate_qualification_v180,
     resolve_prospect_timezone_and_locale_v23,
@@ -98,7 +105,7 @@ class _MockAsyncClient:
 
 def _run_fetch_html_safely_sync_check() -> None:
     """
-    Тест №27 (v23.8.3): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
+    Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
     та верифікує повернення 4-елементного кортежу (status, html, final_url, err_msg) на мок-відповіді 200 OK.
     """
     src_code = inspect.getsource(fetch_html_safely)
@@ -145,8 +152,7 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8.3).
-    Якщо будь-який інваріант порушено — миттєво зупиняє запуск із інформативним AssertionError.
+    Виконує 30 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.0).
     """
     # 1. Domain preparation & canonicalization
     prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
@@ -168,7 +174,7 @@ def run_startup_regression_gate(
     assert classify_email_type('support@weblium.com', 'weblium') == 'customer_support_inbox'
     assert classify_email_type('apteka911@apteka911.com.ua', 'apteka911') == 'general_office_inbox'
 
-    # 4. Corporate inbox outranks Gmail rental inbox (apteka911 case)
+    # 4. Corporate inbox outranks Gmail rental inbox
     ranked_ems, _ = rank_and_clean_emails(
         {
             'arenda911ap@gmail.com': 'https://apteka911.ua/contacts',
@@ -186,7 +192,7 @@ def run_startup_regression_gate(
     assert is_valid_person_name('Privacy Policy', 'rozetka') is False
     assert is_valid_person_name('Berlin Germany', 'zalando') is False
 
-    # 6. Academic title & Ukrainian Patronymic stripping (Тест №28 — epicentrk.ua)
+    # 6. Academic title & Ukrainian Patronymic stripping
     sp = split_clean_executive_name('Prof. Dr. rer. nat. Christian Stegmann, MBA')
     assert sp['dm_first_name'] == 'Christian'
     assert sp['dm_last_name'] == 'Stegmann'
@@ -195,14 +201,15 @@ def run_startup_regression_gate(
     assert sp_ua['dm_first_name'] == 'Галина'
     assert sp_ua['dm_last_name'] == 'Герега'
 
-    # 7. Person email & LinkedIn matching + DM email hypothesis generation
+    # 7. Person email & LinkedIn matching (включно з форматом first@domain на прикладі Bergfreunde)
     assert verify_person_email_match('Oleh Hryshchenko', 'oleh.hryshchenko@moyo.ua') is True
+    assert verify_person_email_match('Matthias Gebhard', 'matthias@bergfreunde.de') is True
     assert verify_person_email_match('Андрій Чумаченко', 'n.koshel@netpeak.net') is False
     assert verify_person_linkedin_match('Bartosz Klis', 'https://www.linkedin.com/in/bartosz-klis-12345') is True
     hyps = generate_dm_email_pattern_candidates('Владислав Чечоткін', 'rozetka.com.ua')
     assert 'v.chechotkin@rozetka.com.ua' in hyps
 
-    # 8. Tech detection with GTM & duplicate GA4
+    # 8. Tech detection with 3-tier verification & duplicate GA4
     sample_html = """
     <html><head><title>Shop Online</title>
     <script src="https://www.googletagmanager.com/gtag/js?id=G-1A2B3C4D5E"></script>
@@ -218,15 +225,30 @@ def run_startup_regression_gate(
     assert t_info['has_klaviyo'] is True
     assert 'Stripe' in (t_info.get('payment_gateways') or [])
     assert 'G-1A2B3C4D5E' in (t_info.get('duplicate_ga4_ids') or [])
+    assert t_info['tech_verification_tiers'].get('Server-Side GTM (sGTM)') == 'runtime_verified'
+    assert t_info['tech_verification_tiers'].get('Google Tag Manager') == 'configured_in_code'
+
+    # 8b. CSP-only detection marks completeness as partial_csp_headers (Flaconi case)
+    csp_only_html = """
+    <html><head><title>Beauty Shop</title>
+    <!-- http_headers_json: {"content-security-policy": "script-src https://www.googletagmanager.com https://connect.facebook.net"} -->
+    </head><body></body></html>
+    """
+    t_csp = detect_tech_with_evidence(csp_only_html, '', [], 'https://beauty.example.de/')
+    assert t_csp['tech_scan_completeness'] == 'partial_csp_headers'
+    assert t_csp['tech_verification_tiers'].get('Meta Pixel') == 'allowlisted_in_csp'
 
     # 9. Broken attribution red flags
     flags = detect_broken_attribution_red_flags(t_info, 'E-commerce / Retail Brand', is_eu_gdpr=True, pw_used=True)
     assert any('Duplicate GA4 Tagging' in f for f in flags)
 
-    # 10. GA4 IDs cap
-    capped_str, total_c, _ = cap_ga4_ids_and_confidence('G-11111111; G-22222222; G-33333333; G-44444444; G-55555555; G-66666666')
+    # 10. GA4 IDs cap (supports up to 50 IDs in v24.0)
+    capped_str, total_c, _ = cap_ga4_ids_and_confidence(
+        'G-11111111; G-22222222; G-33333333; G-44444444; G-55555555; G-66666666',
+        max_display=50,
+    )
     assert total_c == 6
-    assert capped_str.count(';') == 4
+    assert capped_str.count(';') == 5
 
     # 11. Cloudflare cfemail deobfuscation & Honeypot pruning
     cf_html = '<a href="/cdn-cgi/l/email-protection#a0c9cec6cfe0c5d8c1cdd0ccc58ec3cfcd">mail</a>'
@@ -288,11 +310,11 @@ def run_startup_regression_gate(
     )
     assert ma_liq['corporate_lifecycle_status'] == 'IN_LIQUIDATION_OR_INSOLVENCY'
 
-    # 18. SaaS Spend Estimator
+    # 18. SaaS Spend Estimator (v24.0: BIMI VMC Seal виключено з витрат на SaaS)
     sp_est = calculate_saas_spend_range_usd({'Shopify Plus', 'Klaviyo'}, has_enterprise_cdn=True, has_vmc_seal=True)
-    assert sp_est['min_estimated_saas_spend_usd'] == 2300 + 150 + 1500 + 125
+    assert sp_est['min_estimated_saas_spend_usd'] == 2300 + 150 + 1500
 
-    # 19. Prospect Timezone & Outreach Lang (включно з фіксом для creatio.com та yakaboo.ua)
+    # 19. Prospect Timezone & Outreach Lang
     tz_res = resolve_prospect_timezone_and_locale_v23('notino.de', '+4989123456', 'DE', 'de')
     assert tz_res['prospect_iana_timezone'] == 'Europe/Berlin'
     assert tz_res['recommended_outreach_lang'] == 'de'
@@ -318,8 +340,8 @@ def run_startup_regression_gate(
     wa_num = normalize_whatsapp_number_safe('380671234567', 'UA')
     assert wa_num in ('+380671234567', None)
 
-    # 22. Qualification & Scoring
-    verdict, _, _, c_tier, _, _, _, _, _ = evaluate_qualification_v180(
+    # 22. Decoupled Qualification, Opportunity Score, Contactability & DSK Compliance (v24.0)
+    verdict, _, tech_sig_str, c_tier, _, _, _, _, _ = evaluate_qualification_v180(
         'E-commerce / Retail Brand', t_info, 'marketing@shop.de', 'marketing_or_exec_role',
         '+49 30 123456', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
         'https://www.linkedin.com/in/max-mustermann', False, 'impressum_page',
@@ -329,7 +351,25 @@ def run_startup_regression_gate(
     score = compute_data_quality_score(c_tier, 5, 'Max Mustermann', 'https://www.linkedin.com/in/max-mustermann', '+49 30 123456', 'full')
     assert score >= 75
 
-    # 23. Unmatched named inbox hook (netpeak case)
+    opp_score = compute_account_opportunity_score('E-commerce / Retail Brand', t_info, ads_active_last_30d=True, red_flags_count=1, min_saas_spend_usd=500, open_positions_total=4)
+    assert opp_score >= 70
+    assert derive_contactability_level('matthias@bergfreunde.de', 'personal_or_named_inbox', 'Matthias Gebhard', None, None, 'M365_AD_VERIFIED') == 'direct_dm_verified'
+    assert derive_contactability_level('partners@flaconi.de', 'b2b_partnerships', 'Bastian Siebers', None, None, 'OBSERVED_ON_SITE') == 'gatekeeper_only'
+
+    # Перевірка часткового CSP-скану (flaconi.de не отримує High Stack Maturity та sales_ready)
+    v_csp, _, sig_csp, _, _, _, _, _, _ = evaluate_qualification_v180(
+        'E-commerce / Retail Brand', t_csp, 'partners@flaconi.de', 'b2b_partnerships',
+        None, 'Bastian Siebers', 'Managing Director / CEO (Geschäftsführer)',
+        None, False, 'impressum_page', None, False, 'rendered'
+    )
+    assert 'Unverified Stack (CSP Allowlist Only' in sig_csp
+    assert derive_sales_actionability_class(v_csp, 'E-commerce / Retail Brand') == 'partnership'
+
+    # Перевірка EU GDPR для .com із цінами в EUR та DSK Impressum sensitivity
+    assert derive_gdpr_jurisdiction('global-brand.com', None, '', '<div>Subtotal: 129,00 € incl. VAT</div>') == 'EU_EEA_GDPR'
+    assert derive_data_source_sensitivity('impressum_page', 'contact_page', 'EU_EEA_GDPR') == 'impressum_statutory_disclosure_restricted'
+
+    # 23. Unmatched named inbox hook
     hook_str = build_sales_hook(
         'netpeak.net', 'B2B Agency / Marketing Media', t_info,
         'Андрій Чумаченко', 'Co-Founder', None, 'n.koshel@netpeak.net',
@@ -337,12 +377,17 @@ def run_startup_regression_gate(
     )
     assert 'Named Contact: n.koshel@netpeak.net' in hook_str
 
-    # 24. Optional callbacks from main.py
+    # 24. Optional callbacks from main.py (перевірка null при partial_csp_headers)
     if normalize_tech_fn is not None:
         dummy_tech = {'detected_technologies_list': ['Meta Pixel', 'Shopify'], 'detected_cms_list': ['Shopify']}
         normalize_tech_fn(dummy_tech)
         assert dummy_tech['has_meta_pixel'] is True
         assert dummy_tech['has_google_ads'] is False
+
+        dummy_csp = {'tech_scan_completeness': 'partial_csp_headers', 'detected_technologies_list': ['Meta Pixel']}
+        normalize_tech_fn(dummy_csp)
+        assert dummy_csp['has_meta_pixel'] is True
+        assert dummy_csp['has_linkedin_pixel'] is None
 
     if resolve_cache_comp_fn is not None:
         param_count = len(inspect.signature(resolve_cache_comp_fn).parameters)
@@ -355,10 +400,10 @@ def run_startup_regression_gate(
     # 25. Utility helpers
     assert sanitize_kv_key('https://rozetka.com.ua/') == 'https___rozetka.com.ua_'
     assert len(truncate_error_msg('x' * 200, max_len=50)) <= 50
-    assert CACHE_SCHEMA_VERSION >= 29
+    assert CACHE_SCHEMA_VERSION >= 30
 
-    # 26. Тест №27 (Інтеграційний мок-тест fetch_html_safely + антибот-детектор Cloudflare)
+    # 26. Інтеграційний мок-тест fetch_html_safely + антибот-детектор Cloudflare
     _run_fetch_html_safely_sync_check()
 
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8.3 Store Gold Master).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 30/30 unit & integration tests green (v24.0 Enterprise MarTech).')
