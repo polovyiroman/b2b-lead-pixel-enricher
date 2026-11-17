@@ -467,6 +467,8 @@ def format_record_for_output_view(record: dict, output_view: str = 'full_audit')
         note = str(record.get('email_source_note') or '')
         if 'DM Email Pattern Hypothesis (MX Valid): ' in note:
             compact['predicted_dm_email'] = note.split('DM Email Pattern Hypothesis (MX Valid): ', 1)[1].split(',')[0].strip()
+        elif 'DM Email Pattern Hypothesis (MX Unverified — Check via Verifier): ' in note:
+            compact['predicted_dm_email'] = note.split('DM Email Pattern Hypothesis (MX Unverified — Check via Verifier): ', 1)[1].split(',')[0].strip()
         else:
             compact['predicted_dm_email'] = None
         return compact
