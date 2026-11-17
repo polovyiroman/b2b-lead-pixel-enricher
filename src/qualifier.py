@@ -29,15 +29,6 @@ from .contacts import (
     verify_person_email_match,
     verify_person_linkedin_match,
 )
-from .domain_helpers import (
-    build_compliance_note,
-    derive_gdpr_jurisdiction,
-    derive_human_contact_tier,
-    derive_legal_basis_for_processing,
-    derive_pii_fields,
-    derive_sales_actionability_class,
-    detect_country_hint,
-)
 from .tech_detector import build_evidence_json_from_cached_record
 
 KNOWN_DTC_ECOM_DOMAINS = {
@@ -77,7 +68,7 @@ ENTERPRISE_REGISTRAR_MARKERS = (
     "safenames", "com laude", "nom-iq", "brandsight"
 )
 
-# v23.8.1: Використано (?!\w) замість фінального \b, оскільки 'gmbh i.l.' закінчується на крапку '.'
+# v23.8.2: Використано (?!\w) замість фінального \b, оскільки 'gmbh i.l.' закінчується на крапку '.'
 LIQUIDATION_MARKERS_RE = re.compile(
     r"\b(?:gmbh\s+i\.\s*l\.|gmbh\s+i\.\s*abw\.|in\s+liquidation|insolvenzverfahren|"
     r"w\s+likwidacji|w\s+upadłości|в\s+стані\s+припинення|в\s+процесі\s+ліквідації|"
@@ -109,7 +100,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v23.8.1 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta
+# v23.8.2 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -1243,6 +1234,17 @@ def build_manual_seed_record(
     checked_at: str,
     playwright_available: bool = True
 ) -> dict:
+    # Локальний імпорт усередині функції усуває циклічну залежність із src.domain_helpers
+    from .domain_helpers import (
+        build_compliance_note,
+        derive_gdpr_jurisdiction,
+        derive_human_contact_tier,
+        derive_legal_basis_for_processing,
+        derive_pii_fields,
+        derive_sales_actionability_class,
+        detect_country_hint,
+    )
+
     verified_at = seed.get('verified_at', checked_at)
     age_days = compute_snapshot_age_days(verified_at) or 0
     cat = seed.get('company_category', 'E-commerce / Retail Brand')
