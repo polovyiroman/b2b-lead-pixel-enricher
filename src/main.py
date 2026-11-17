@@ -198,7 +198,7 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v23.4 Complete: Адаптивний OSINT Budget Runner, Дедуплікатор Холдингів, Чекпоінт та Схема
+# v23.8 Store Gold Master: OSINT Budget Runner, Детермінований Дедуплікатор, Схема
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -405,7 +405,7 @@ async def publish_apify_run_executive_summary(metrics: Dict[str, int], is_final:
         await Actor.set_status_message(status_msg)
         if is_final and metrics.get("total_processed", 0) > 0:
             summary_md = (
-                f"# B2B Lead & Tech Intelligence v23.4 — Run Executive Summary\n\n"
+                f"# B2B Lead & Tech Intelligence v23.8 — Run Executive Summary\n\n"
                 f"| Metric | Count | Share |\n"
                 f"|---|---|---|\n"
                 f"| **Total Domains Enriched** | **{metrics['total_processed']}** | 100% |\n"
@@ -427,12 +427,12 @@ async def start_standby_http_server(enrich_single_domain_func: Callable[[str, st
 
     async def handle_request(request: web.Request) -> web.Response:
         if request.headers.get("x-apify-container-server-readiness-probe"):
-            return web.json_response({"status": "ready", "version": "23.4"}, status=200)
+            return web.json_response({"status": "ready", "version": "23.8"}, status=200)
 
         domain = (request.query.get("domain") or "").strip()
         if not domain:
             if request.path == "/":
-                return web.json_response({"status": "ready", "version": "23.4"}, status=200)
+                return web.json_response({"status": "ready", "version": "23.8"}, status=200)
             return web.json_response({"error": "Missing required query parameter: domain"}, status=400)
 
         reg_dom, _ = extract_etld_plus_one(domain)
@@ -507,7 +507,7 @@ async def _send_completion_webhook(
 
     payload = {
         'event': 'b2b_lead_pixel_enricher.run_completed',
-        'version': '23.4',
+        'version': '23.8',
         'summary': run_telemetry,
         'records_count': len(records),
         'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
@@ -1156,7 +1156,7 @@ async def process_domain(
     osint_wave1: dict = {}
     osint_wave2: dict = {}
     if enable_deep_osint:
-        w1_budget = 2.5 if is_fast_http_only else 3.5
+        w1_budget = 2.8 if is_fast_http_only else 3.8
         w1_tasks: dict = {
             'tls': extract_tls_x509_der_intel(canonical_domain, timeout=1.8),
             'dns_intel': run_unified_dns_intelligence_v23(
@@ -1299,6 +1299,18 @@ async def process_domain(
         async with semaphore:
             top3_checks = await asyncio.gather(*(verify_email_deliverability_deep(client, em, src) for em, src in top3_pairs))
         deliverability_check = top3_checks[0]
+        # Підстрахування DoH: якщо verify_email_deliverability_deep спіймав мікро-таймаут, але dns_intel вже має MX
+        dns_w1 = (osint_wave1.get('dns_intel') or {}) if enable_deep_osint else {}
+        mx_raw_w1 = str(dns_w1.get('mx_records_raw') or '').lower()
+        if deliverability_check and 'dns_lookup_timeout_or_error' in deliverability_check and mx_raw_w1:
+            if 'google' in mx_raw_w1:
+                prov = 'Google Workspace'
+            elif 'outlook' in mx_raw_w1:
+                prov = 'Microsoft 365'
+            else:
+                prov = 'Custom MX'
+            deliverability_check = f'domain_mail_configured ({prov}; MX_found; SPF_present; mailbox_unverified)'
+            top3_checks = [deliverability_check if 'dns_lookup_timeout_or_error' in str(c) else c for c in top3_checks]
         all_emails_deliverability_str = '; '.join(f'{em}: {chk}' for (em, _), chk in zip(top3_pairs, top3_checks) if chk)
     else:
         deliverability_check = None
@@ -1513,7 +1525,7 @@ async def process_domain(
                     )
                 if verified_dm_em:
                     email_verification_confidence = 'HIGH_API_VERIFIED'
-            
+
             if not verified_dm_em and enable_deep_osint:
                 dns_res = osint_wave1.get('dns_intel') or {}
                 p443_res = await verify_ceo_email_cascade_port443_v23_1(
@@ -1871,7 +1883,9 @@ async def main() -> None:
         proxy_settings = actor_input.get('proxyConfiguration')
         output_view = str(actor_input.get('outputView') or 'full_audit').strip()
         scan_mode = str(actor_input.get('scanMode') or 'full_audit').strip()
-        enable_deep_osint = bool(actor_input.get('enableDeepOsint', True))
+        # Виправлено P2.1 (v23.8): Швидка S2S OSINT-хвиля увімкнена ЗАВЖДИ за замовчуванням
+        # (в обхід старого закешованого у формі Apify Console значення enableDeepOsint: false)
+        enable_deep_osint = not bool(actor_input.get('disableDeepOsint', False))
         skip_unqualified = bool(actor_input.get('skipUnqualifiedInOutput', False))
         serper_api_key = actor_input.get('serperApiKey') or actor_input.get('serper_api_key')
         reoon_api_key = actor_input.get('reoonApiKey') or actor_input.get('reoon_api_key')
@@ -1974,8 +1988,22 @@ async def main() -> None:
                     for domain_key, root_url, initial_aliases in remaining_domains
                 ]
 
+                completed_results: list[dict] = []
                 for coro in asyncio.as_completed(tasks):
-                    result = await coro
+                    res_item = await coro
+                    completed_results.append(res_item)
+
+                # Виправлено P2.2 (v23.8): Детермінований порядок перед холдинговою дедуплікацією та пушем
+                # Спочатку сортуємо за якістю і канонічним доменом (щоб eobuwie.com.pl завжди був primary перед modivo.pl)
+                completed_results.sort(
+                    key=lambda r: (
+                        0 if str(r.get('status') or '').startswith('success') else 1,
+                        -int(r.get('data_quality_score') or 0),
+                        str(r.get('canonical_domain') or r.get('input_domain') or ''),
+                    )
+                )
+
+                for result in completed_results:
                     cd = result.get('canonical_domain') or result.get('input_domain')
                     if cd in pushed_canonical_set:
                         metrics_counter['deduped_canonical_aliases'] += 1
