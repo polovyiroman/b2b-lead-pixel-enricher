@@ -1,8 +1,8 @@
 from collections import Counter
-from datetime import datetime, timedelta, timezone
 import json
 import re
-from typing import Any, Callable, Dict, List, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from .config import (
     AD_AND_ANALYTICS_SIGNATURES,
@@ -24,546 +24,460 @@ from .config import (
     SAFE_DEMO_SCHEDULER_PATTERNS,
     SGTM_CUSTOM_LOADER_REGEX,
     SGTM_FIRST_PARTY_COLLECT_REGEX,
+    is_valid_gtm_id,
 )
 
-SHORT_SUMMARY_LABELS = {
-    'Google Tag Manager': 'GTM',
-    'Server-Side GTM (sGTM)': 'sGTM',
-    'Google Analytics (GA4)': 'GA4',
-    'Google Ads Conversion': 'Google Ads',
-    'Meta Pixel': 'Meta Pixel',
-    'TikTok Pixel': 'TikTok Pixel',
-    'LinkedIn Insight Tag': 'LinkedIn Tag',
-    'Pinterest Tag': 'Pinterest Tag',
-    'Microsoft Clarity': 'Clarity',
-    'Hotjar': 'Hotjar',
-    'HubSpot': 'HubSpot',
-    'Intercom': 'Intercom',
-    'Klaviyo': 'Klaviyo',
+HTTP_HEADERS_COMMENT_RE = re.compile(r'<!--\s*http_headers_json:\s*(\{.*?\})\s*-->', re.DOTALL)
+PW_NET_REQ_COMMENT_RE = re.compile(r'<!--\s*pw_net_req:\s*(https?://[^\s>]+)\s*-->', re.IGNORECASE)
+
+SHOPIFY_SHOP_DOMAIN_RE = re.compile(
+    r'(?:Shopify\.shop\s*=\s*["\']|["\']shop["\']\s*:\s*["\'])([a-z0-9-]+\.myshopify\.com)["\']',
+    re.IGNORECASE,
+)
+
+COOKIE_TECH_SIGNATURES: Dict[str, str] = {
+    'fpid': 'Server-Side GTM (sGTM)',
+    '_ga': 'Google Analytics (GA4)',
+    '_gcl_au': 'Google Ads Conversion',
+    '_fbp': 'Meta Pixel',
+    '_fbc': 'Meta Pixel',
+    '_ttp': 'TikTok Pixel',
+    'li_fat_id': 'LinkedIn Insight Tag',
+    '_pin_unauth': 'Pinterest Tag',
+    '_clck': 'Microsoft Clarity',
+    '_clsk': 'Microsoft Clarity',
+    '_hjsessionuser': 'Hotjar',
+    'hubspotutk': 'HubSpot',
+    '__kla_id': 'Klaviyo',
 }
 
-_PW_NET_REQ_REGEX = re.compile(r'<!--\s*pw_net_req:\s*(.+?)\s*-->', re.I)
-_NET_COLLECT_TID_REGEX = re.compile(r'/g/collect\?[^"\'\s<>]*?(?:^|[?&])tid=(G-[A-Z0-9]{6,12})\b', re.I)
-
-ESP_RETENTION_SIGNATURES = (
-    'static.klaviyo.com',
-    'klaviyo.push',
-    'js.hs-scripts.com',
-    'hs-analytics',
-    'esputnik.com',
-    'sendpulse.com',
-    'webpushs.com',
-    'omnisend.com',
-    'omnisnippet',
-    'customer.io',
-    'braze.com',
-    'appboy.min.js',
-    'bloomreach',
-    'exponea',
-    'insider.js',
-    'useinsider.com',
-    'emarsys',
-    'scarabresearch.com',
-    'retailrocket',
-    'mindbox',
-)
-
-HTTP_HEADERS_COMMENT_RE = re.compile(r"<!--\s*http_headers_json:\s*(\{.*?\})\s*-->", re.DOTALL)
-NEXT_DATA_SCRIPT_RE = re.compile(
-    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-    re.IGNORECASE | re.DOTALL
-)
-SHOPIFY_SHOP_HANDLE_RE = re.compile(r'Shopify\.shop\s*=\s*["\']([a-zA-Z0-9_-]+\.myshopify\.com)["\']')
-SHOPIFY_COUNTRY_RE = re.compile(r'Shopify\.country\s*=\s*["\']([A-Z]{2})["\']')
-SHOPIFY_CURRENCY_RE = re.compile(r'Shopify\.currency\s*=\s*\{\s*["\']active["\']\s*:\s*["\']([A-Z]{3})["\']')
-
-SALES_LED_CTA_RE = re.compile(
-    r"\b(book\s+a\s+demo|request\s+a\s+demo|schedule\s+a\s+demo|talk\s+to\s+sales|"
-    r"request\s+a\s+quote|contact\s+sales|demo\s+buchen|termin\s+vereinbaren)\b",
-    re.IGNORECASE
-)
-PLG_TRIAL_CTA_RE = re.compile(
-    r"\b(start\s+free\s+trial|try\s+for\s+free|get\s+started\s+free|sign\s+up\s+free|kostenlos\s+testen)\b",
-    re.IGNORECASE
-)
-
-STRICT_URL_HOST_RE = re.compile(r"https?://(?:www\.)?([a-z0-9-]{2,63}(?:\.[a-z0-9-]{2,63})+)", re.IGNORECASE)
-SOCIAL_AND_PLATFORM_DENYLIST = {
-    "facebook.com", "instagram.com", "tiktok.com", "linkedin.com", "youtube.com",
-    "youtu.be", "twitter.com", "x.com", "pinterest.com", "shopify.com", "apple.com",
-    "play.google.com", "apps.apple.com", "trustpilot.com", "wikipedia.org",
-    "google.com", "googlesyndication.com", "doubleclick.net", "gstatic.com"
+RUNTIME_NET_SIGNATURES: Dict[str, tuple[str, ...]] = {
+    'Google Tag Manager': ('googletagmanager.com/gtm.js', '/gtm.js?id=gtm-'),
+    'Google Analytics (GA4)': ('google-analytics.com/g/collect', 'analytics.google.com/g/collect', 'googletagmanager.com/gtag/js?id=g-', '/g/collect?'),
+    'Google Ads Conversion': ('googleadservices.com', 'doubleclick.net/pagead', 'googletagmanager.com/gtag/js?id=aw-'),
+    'Meta Pixel': ('connect.facebook.net', 'facebook.com/tr'),
+    'TikTok Pixel': ('analytics.tiktok.com',),
+    'LinkedIn Insight Tag': ('snap.licdn.com', 'px.ads.linkedin.com'),
+    'Pinterest Tag': ('s.pinimg.com/ct/', 'ct.pinterest.com'),
+    'Microsoft Clarity': ('clarity.ms/tag/', 'clarity.ms/collect'),
+    'Hotjar': ('static.hotjar.com', 'script.hotjar.com'),
+    'HubSpot': ('js.hs-scripts.com', 'js.hs-analytics.net'),
+    'Klaviyo': ('static.klaviyo.com', 'a.klaviyo.com'),
+    'Shopify': ('cdn.shopify.com',),
 }
 
-CANONICAL_INTERNAL_TOOLS_MAP: Dict[str, str] = {
-    "sap": "SAP", "salesforce": "Salesforce", "hubspot": "HubSpot",
-    "klaviyo": "Klaviyo", "snowflake": "Snowflake", "bigquery": "BigQuery",
-    "databricks": "Databricks", "looker": "Looker", "tableau": "Tableau",
-    "powerbi": "Power BI", "power bi": "Power BI", "netsuite": "Oracle NetSuite",
-    "workday": "Workday", "jira": "Jira", "confluence": "Confluence",
-    "kubernetes": "Kubernetes", "terraform": "Terraform", "aws": "AWS",
-    "azure": "Azure", "gcp": "GCP", "shopify plus": "Shopify Plus",
-    "shopware": "Shopware", "magento": "Magento", "braze": "Braze",
-    "segment": "Segment", "amplitude": "Amplitude", "mixpanel": "Mixpanel", "okta": "Okta",
+PAYMENT_GATEWAY_NAMES: Set[str] = {
+    'Stripe', 'Adyen', 'Klarna', 'Billie', 'Mondu', 'Hokodo', 'Two',
+    'Mollie', 'Braintree', 'Checkout.com', 'PayPal', 'Apple Pay', 'Google Pay',
 }
-INTERNAL_TECH_PATTERNS = re.compile(
-    r"\b(" + "|".join(re.escape(k) for k in CANONICAL_INTERNAL_TOOLS_MAP.keys()) + r")\b",
-    re.IGNORECASE
-)
 
-
-# ==============================================================================
-# v23.2 Complete: 5 функцій розширеної детекції технологій (Фаза 3 + S2S Direct)
-# ==============================================================================
-
-def extract_embedded_headers_and_ssr_signals_v23_1(html_text: str) -> Dict[str, Any]:
-    detected_tech: Set[str] = set()
-    payment_gateways: Set[str] = set()
-    has_sgtm_cookie = False
-    has_enterprise_cdn = False
-
-    if not html_text:
-        return {
-            "detected_tech": [],
-            "payment_gateways": [],
-            "has_sgtm_fpid_cookie": False,
-            "has_enterprise_cdn": False,
-        }
-
-    hdr_match = HTTP_HEADERS_COMMENT_RE.search(html_text)
-    if hdr_match:
-        try:
-            hdrs = json.loads(hdr_match.group(1))
-        except Exception:
-            hdrs = {}
-
-        csp_and_rep = " ".join(
-            str(hdrs.get(k, "")) for k in (
-                "content-security-policy", "content-security-policy-report-only",
-                "reporting-endpoints", "report-to", "nel"
-            )
-        ).lower()
-
-        for sig, name in CSP_STRICT_SIGNATURES.items():
-            if sig in csp_and_rep:
-                detected_tech.add(name)
-                if name in ("Stripe", "Adyen", "Klarna", "Billie", "Mondu", "Hokodo", "Two", "Mollie", "Braintree", "Checkout.com"):
-                    payment_gateways.add(name)
-
-        cookie_names_low = {str(c).lower() for c in (hdrs.get("cookie_names") or [])}
-        if cookie_names_low & {"fpid", "fplc", "fpau"}:
-            detected_tech.add("Server-Side GTM (sGTM)")
-            has_sgtm_cookie = True
-        if cookie_names_low & {"_fbp", "_fbc"}:
-            detected_tech.add("Meta Pixel")
-        if "_ttp" in cookie_names_low:
-            detected_tech.add("TikTok Pixel")
-        if "hubspotutk" in cookie_names_low:
-            detected_tech.add("HubSpot")
-        if "_kla_id" in cookie_names_low:
-            detected_tech.add("Klaviyo")
-
-        if any(k in hdrs for k in ("cf-polished", "cf-ew-via", "x-akamai-transformed")):
-            has_enterprise_cdn = True
-        if hdrs.get("x-shopid") or "shopify" in str(hdrs.get("server-timing", "")).lower():
-            detected_tech.add("Shopify")
-        if "x-magento-tags" in hdrs:
-            detected_tech.add("Magento")
-        if "sw-context-token" in hdrs:
-            detected_tech.add("Shopware")
-
-    if "__NEXT_DATA__" in html_text:
-        detected_tech.add("Next.js")
-        nd_match = NEXT_DATA_SCRIPT_RE.search(html_text)
-        if nd_match:
-            nd_low = nd_match.group(1).lower()
-            if '"algoliaappid"' in nd_low or "algolianet.com" in nd_low:
-                detected_tech.add("Algolia")
-            if "pk_live_" in nd_low or '"stripepublishablekey"' in nd_low:
-                detected_tech.add("Stripe")
-                payment_gateways.add("Stripe")
-            if '"adyenclientkey"' in nd_low or "adyen.com" in nd_low or "checkoutshopper-" in nd_low:
-                detected_tech.add("Adyen")
-                payment_gateways.add("Adyen")
-            if "sentry.io" in nd_low or '"sentrydsn"' in nd_low:
-                detected_tech.add("Sentry")
-
-    return {
-        "detected_tech": sorted(detected_tech),
-        "payment_gateways": sorted(payment_gateways),
-        "has_sgtm_fpid_cookie": has_sgtm_cookie,
-        "has_enterprise_cdn": has_enterprise_cdn,
-    }
-
-
-def decode_apple_pay_merchant_association_safe(raw_body: str) -> Dict[str, Any]:
-    if not raw_body or len(raw_body) < 64:
-        return {"has_apple_pay": False, "psp_gateways": []}
-    head_low = raw_body[:500].lstrip().lower()
-    if any(tag in head_low for tag in ("<!doctype", "<html", "<head", "<body", "<script")):
-        return {"has_apple_pay": False, "psp_gateways": []}
-
-    clean = raw_body.strip()
-    decoded_ascii = clean.lower()
-    if all(c in "0123456789abcdefABCDEF\n\r\t " for c in clean[:128]):
-        try:
-            decoded_ascii = bytes.fromhex("".join(clean.split())).decode("latin1", errors="ignore").lower()
-        except Exception:
-            pass
-
-    if "merchant.com." not in decoded_ascii and '"pspid"' not in decoded_ascii:
-        return {"has_apple_pay": False, "psp_gateways": []}
-
-    strict_oid_markers = {
-        "merchant.com.stripe": "Stripe",
-        "merchant.com.adyen": "Adyen",
-        "merchant.com.shopify": "Shopify Payments",
-        "merchant.com.mollie": "Mollie",
-        "merchant.com.braintree": "Braintree",
-        "merchant.com.checkout": "Checkout.com",
-        "merchant.com.worldpay": "Worldpay",
-        "merchant.com.klarna": "Klarna",
-    }
-    found = sorted({name for marker, name in strict_oid_markers.items() if marker in decoded_ascii})
-    return {"has_apple_pay": True, "psp_gateways": found}
-
-
-def extract_shopify_pim_and_logistics_signals(html_text: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "myshopify_canonical_domain": None,
-        "shopify_inline_country": None,
-        "shopify_inline_currency": None,
-        "enterprise_pim_and_cms": [],
-        "logistics_carriers": [],
-        "returns_and_3pl_stack": [],
-        "has_automated_returns_portal": False,
-        "demo_scheduler_tool": None,
-        "gtm_sales_motion": "CORPORATE_OR_SERVICE",
-        "accessibility_widget": None,
-    }
-    if not html_text:
-        return out
-    low = html_text.lower()
-
-    if "shopify." in low:
-        m_shop = SHOPIFY_SHOP_HANDLE_RE.search(html_text)
-        if m_shop:
-            out["myshopify_canonical_domain"] = m_shop.group(1).lower()
-        m_country = SHOPIFY_COUNTRY_RE.search(html_text)
-        if m_country:
-            out["shopify_inline_country"] = m_country.group(1).upper()
-        m_curr = SHOPIFY_CURRENCY_RE.search(html_text)
-        if m_curr:
-            out["shopify_inline_currency"] = m_curr.group(1).upper()
-
-    pim_set: Set[str] = set()
-    for name, markers in ENTERPRISE_PIM_ERP_CMS_SIGNATURES.items():
-        if any(m in low for m in markers):
-            pim_set.add(name)
-    out["enterprise_pim_and_cms"] = sorted(pim_set)
-
-    carriers: Set[str] = set()
-    orchestrators: Set[str] = set()
-    for marker, (l_name, kind) in LOGISTICS_AND_RETURNS_SIGNATURES.items():
-        if marker in low:
-            if kind == "carrier":
-                carriers.add(l_name)
-            else:
-                orchestrators.add(l_name)
-                if kind == "returns_portal":
-                    out["has_automated_returns_portal"] = True
-    out["logistics_carriers"] = sorted(carriers)
-    out["returns_and_3pl_stack"] = sorted(orchestrators)
-
-    for tool_name, patterns in SAFE_DEMO_SCHEDULER_PATTERNS.items():
-        if any(p in low for p in patterns):
-            out["demo_scheduler_tool"] = tool_name
-            break
-
-    for marker, w_name in EAA_ACCESSIBILITY_WIDGETS.items():
-        if marker in low:
-            out["accessibility_widget"] = w_name
-            break
-
-    has_demo = bool(out["demo_scheduler_tool"] or SALES_LED_CTA_RE.search(html_text))
-    has_trial = bool(PLG_TRIAL_CTA_RE.search(html_text))
-    if has_demo and has_trial:
-        out["gtm_sales_motion"] = "B2B_HYBRID_PLG_AND_SALES"
-    elif has_demo:
-        out["gtm_sales_motion"] = "B2B_ENTERPRISE_SALES_LED"
-    elif has_trial:
-        out["gtm_sales_motion"] = "B2B_PLG_SELF_SERVE"
-    elif "/cart" in low or "add-to-cart" in low or out["myshopify_canonical_domain"]:
-        out["gtm_sales_motion"] = "COMMERCE_TRANSACTIONAL"
-
-    return out
-
-
-async def fetch_google_ads_transparency_intel_v23_1(
-    http_session: Any,
-    domain: str,
-    etld_func: Callable[[str], tuple[str, str]],
-    infra_denylist: tuple[str, ...]
-) -> Dict[str, Any]:
-    """
-    Виправлено Баг №2 (v23.2):
-    Обидва RPC-виклики до adstransparency.google.com виконуються напряму (proxy=None, timeout=1.8s).
-    """
-    result: Dict[str, Any] = {
-        "ads_rpc_status": "not_checked",
-        "has_verified_advertiser_profile": False,
-        "ads_active_last_30d": None,
-        "advertiser_id": None,
-        "verified_advertiser_legal_name": None,
-        "advertiser_country": None,
-        "active_ad_formats": [],
-        "last_ad_seen_date": None,
-        "advertiser_sister_domains": [],
-    }
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://adstransparency.google.com",
-        "Referer": "https://adstransparency.google.com/",
-    }
-    sugg_url = "https://adstransparency.google.com/anji/_/rpc/SearchService/SearchSuggestions?authuser="
-    try:
-        resp1 = await http_session.post(
-            sugg_url,
-            data={"f.req": json.dumps({"1": domain, "2": 5, "3": 5})},
-            headers=headers,
-            timeout=1.8,
-            proxy=None,
-        )
-        if resp1.status_code == 429:
-            result["ads_rpc_status"] = "rate_limited"
-            return result
-        if resp1.status_code != 200:
-            result["ads_rpc_status"] = f"http_{resp1.status_code}"
-            return result
-        data1 = json.loads(resp1.text.lstrip(")]}'\n "))
-        result["ads_rpc_status"] = "ok"
-    except Exception:
-        result["ads_rpc_status"] = "network_error"
-        return result
-
-    for item in (data1.get("1") or []):
-        adv_block = item.get("1") if isinstance(item, dict) else None
-        if isinstance(adv_block, dict) and str(adv_block.get("2", "")).startswith("AR"):
-            result["has_verified_advertiser_profile"] = True
-            result["verified_advertiser_legal_name"] = adv_block.get("1")
-            result["advertiser_id"] = adv_block.get("2")
-            result["advertiser_country"] = adv_block.get("3")
-            break
-
-    if not result["advertiser_id"]:
-        result["ads_active_last_30d"] = False
-        return result
-
-    now_utc = datetime.now(timezone.utc)
-    start_int = int((now_utc - timedelta(days=30)).strftime("%Y%m%d"))
-    end_int = int(now_utc.strftime("%Y%m%d"))
-    creatives_url = "https://adstransparency.google.com/anji/_/rpc/SearchService/SearchCreatives?authuser="
-    creatives_req = {
-        "2": 10,
-        "3": {"12": {"1": "", "2": True}, "13": {"1": [result["advertiser_id"]]}, "6": start_int, "7": end_int},
-        "7": {"1": 1, "2": 0, "3": 2580}
-    }
-    try:
-        resp2 = await http_session.post(
-            creatives_url,
-            data={"f.req": json.dumps(creatives_req)},
-            headers=headers,
-            timeout=1.8,
-            proxy=None,
-        )
-        if resp2.status_code == 200:
-            raw_text2 = resp2.text.lstrip(")]}'\n ")
-            data2 = json.loads(raw_text2)
-            creatives_list = data2.get("1") or []
-            result["ads_active_last_30d"] = bool(creatives_list)
-            if creatives_list:
-                format_map = {1: "TEXT", 2: "IMAGE", 3: "VIDEO"}
-                formats_found = set()
-                latest_ts = 0
-                for cr in creatives_list:
-                    if not isinstance(cr, dict):
-                        continue
-                    fmt_code = cr.get("4")
-                    if fmt_code in format_map:
-                        formats_found.add(format_map[fmt_code])
-                    last_shown = cr.get("7") or cr.get("6")
-                    if isinstance(last_shown, dict):
-                        ts_sec = int(last_shown.get("1", 0))
-                        if ts_sec > latest_ts:
-                            latest_ts = ts_sec
-                result["active_ad_formats"] = sorted(formats_found)
-                if latest_ts > 0:
-                    result["last_ad_seen_date"] = datetime.fromtimestamp(latest_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-
-                norm_text = raw_text2.replace("\\/", "/").replace("\\u002f", "/")
-                curr_reg, _ = etld_func(domain)
-                sisters: Set[str] = set()
-                for host_m in STRICT_URL_HOST_RE.findall(norm_text):
-                    reg_d, _ = etld_func(host_m.lower())
-                    if not reg_d or reg_d == curr_reg or reg_d in SOCIAL_AND_PLATFORM_DENYLIST:
-                        continue
-                    if any(reg_d.endswith(inf) for inf in infra_denylist):
-                        continue
-                    if not reg_d.endswith((".js", ".css", ".png", ".jpg", ".svg", ".webp", ".json")):
-                        sisters.add(reg_d)
-                result["advertiser_sister_domains"] = sorted(sisters)[:10]
-    except Exception:
-        pass
-    return result
-
-
-async def fetch_public_ats_hiring_intel(
-    http_session: Any,
-    ats_provider: str,
-    company_token: str
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "open_positions_total": 0,
-        "hiring_departments": [],
-        "detected_internal_tools_from_jobs": [],
-        "is_expanding_rapidly": False,
-    }
-    if ats_provider == "Greenhouse":
-        dept_url = f"https://boards-api.greenhouse.io/v1/boards/{company_token}/departments"
-        try:
-            resp = await http_session.get(dept_url, timeout=2.0, proxy=None)
-            if resp.status_code != 200:
-                return out
-            departments_raw = resp.json().get("departments") or []
-            active_depts: List[str] = []
-            priority_ids: List[int] = []
-            seen_ids = set()
-            for dept in departments_raw:
-                if not isinstance(dept, dict):
-                    continue
-                jobs = dept.get("jobs") or []
-                if jobs:
-                    d_name = (dept.get("name") or "").strip()
-                    if d_name and d_name.lower() != "no department":
-                        active_depts.append(d_name)
-                    for j in jobs:
-                        jid = j.get("id")
-                        title = (j.get("title") or "").lower()
-                        if jid and jid not in seen_ids:
-                            seen_ids.add(jid)
-                            if len(priority_ids) < 3 and any(
-                                k in title for k in ("engineer", "developer", "data", "marketing", "crm", "growth", "revops")
-                            ):
-                                priority_ids.append(jid)
-            out["open_positions_total"] = len(seen_ids)
-            out["hiring_departments"] = sorted(dict.fromkeys(active_depts))[:10]
-            out["is_expanding_rapidly"] = len(seen_ids) >= 10
-
-            tools_found: Set[str] = set()
-            for jid in priority_ids:
-                try:
-                    j_resp = await http_session.get(
-                        f"https://boards-api.greenhouse.io/v1/boards/{company_token}/jobs/{jid}",
-                        timeout=1.8,
-                        proxy=None,
-                    )
-                    if j_resp.status_code == 200:
-                        content = j_resp.json().get("content") or ""
-                        for m in INTERNAL_TECH_PATTERNS.findall(content):
-                            canon = CANONICAL_INTERNAL_TOOLS_MAP.get(m.lower())
-                            if canon:
-                                tools_found.add(canon)
-                except Exception:
-                    continue
-            out["detected_internal_tools_from_jobs"] = sorted(tools_found)
-        except Exception:
-            pass
-    return out
-
-
-# ==============================================================================
-# Core Technology & Evidence Detector
-# ==============================================================================
-
-def extract_code_snippet(source_text: str, match_str: str, max_len: int = 80) -> str:
-    idx = source_text.lower().find(match_str.lower())
-    if idx == -1:
-        return match_str[:max_len]
-    start = max(0, idx - 12)
-    end = min(len(source_text), idx + len(match_str) + 32)
-    raw = ' '.join(source_text[start:end].split())
-    if len(raw) > max_len:
-        return raw[:max_len - 1] + '…'
-    return raw
-
-
-def _is_valid_cached_sgtm(rec: dict) -> bool:
-    ev_str = str(rec.get('technology_evidence') or '')
-    if 'sgtm_fpid_cookie_verified' in ev_str:
-        return True
-    if 'doubleclick.net' in ev_str.lower() and not SGTM_CUSTOM_LOADER_REGEX.search(ev_str):
-        return False
-    return bool(
-        SGTM_CUSTOM_LOADER_REGEX.search(ev_str)
-        or SGTM_FIRST_PARTY_COLLECT_REGEX.search(ev_str)
-    )
+PAYMENT_HTML_SIGNATURES: Dict[str, tuple[str, ...]] = {
+    'Stripe': ('js.stripe.com', 'checkout.stripe.com'),
+    'Adyen': ('checkoutshopper-live.adyen.com', 'adyen.com/hpp'),
+    'Klarna': ('x.klarnacdn.net', 'js.klarna.com', 'klarna-payments'),
+    'Mollie': ('js.mollie.com', 'checkout.mollie.com'),
+    'Braintree': ('js.braintreegateway.com', 'braintree-api.com'),
+    'Checkout.com': ('cdn.checkout.com',),
+    'PayPal': ('paypal.com/sdk/js', 'paypalobjects.com/api/checkout'),
+}
 
 
 def cap_ga4_ids_and_confidence(
-    raw_ga4_ids_str: str | None,
-    raw_confidence: str | None = None
-) -> tuple[str | None, int, str | None]:
-    if not raw_ga4_ids_str:
-        return None, 0, raw_confidence
-    ids_list = [x.strip() for x in raw_ga4_ids_str.split(';') if x.strip()]
-    total_count = len(ids_list)
-    if total_count == 0:
-        return None, 0, raw_confidence
-    capped_str = '; '.join(ids_list[:MAX_DISPLAY_GA4_IDS])
-    conf = raw_confidence
-    if total_count > MAX_DISPLAY_GA4_IDS:
-        conf = f'High ({total_count} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
-    return capped_str, total_count, conf
+    raw_ids_str: str | None,
+    max_display: int = 5,
+    base_confidence: str | None = None,
+) -> tuple[str | None, int | None, str | None]:
+    if not raw_ids_str:
+        return None, None, base_confidence
+    seen: list[str] = []
+    for item in str(raw_ids_str).split(';'):
+        clean_id = item.strip().upper()
+        if clean_id and clean_id not in seen:
+            seen.append(clean_id)
+    if not seen:
+        return None, None, base_confidence
+    total_count = len(seen)
+    displayed = seen[:max(1, int(max_display))]
+    conf = base_confidence or f'Verified ({total_count} GA4 property ID{"s" if total_count > 1 else ""})'
+    return '; '.join(displayed), total_count, conf
 
 
-def build_summary_from_cached_record(rec: dict) -> str | None:
-    parts = []
-    raw_tech = rec.get('detected_technologies') or ''
-    tech_list = [x.strip() for x in raw_tech.split(';') if x.strip()]
-    ga4_ids_str = rec.get('all_ga4_ids') or ''
-    first_ga4 = ga4_ids_str.split(';')[0].strip() if ga4_ids_str else ''
+def extract_embedded_headers_and_ssr_signals_v23_1(html: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        'csp_techs': {},
+        'csp_gateways': set(),
+        'cookie_techs': {},
+        'has_enterprise_cdn': False,
+        'ssr_cms': None,
+    }
+    if not html:
+        return out
 
-    for t in tech_list:
-        if t == 'Server-Side GTM (sGTM)' and not _is_valid_cached_sgtm(rec):
-            continue
-        short = SHORT_SUMMARY_LABELS.get(t, t)
-        if t == 'Google Analytics (GA4)':
-            if first_ga4:
-                parts.append(f'GA4 ({first_ga4})')
+    m = HTTP_HEADERS_COMMENT_RE.search(html)
+    if not m:
+        return out
+
+    try:
+        hdrs = json.loads(m.group(1))
+    except Exception:
+        return out
+    if not isinstance(hdrs, dict):
+        return out
+
+    csp_combined = ' '.join(
+        str(hdrs.get(k) or '')
+        for k in ('content-security-policy', 'content-security-policy-report-only')
+    ).lower()
+
+    if csp_combined:
+        for domain_sig, tech_name in CSP_STRICT_SIGNATURES.items():
+            if domain_sig in csp_combined:
+                if tech_name in PAYMENT_GATEWAY_NAMES:
+                    out['csp_gateways'].add(tech_name)
+                else:
+                    out['csp_techs'][tech_name] = f'CSP Header allowlist: {domain_sig}'
+
+    cookie_names = [str(c).lower() for c in (hdrs.get('cookie_names') or [])]
+    for c_name in cookie_names:
+        if c_name in COOKIE_TECH_SIGNATURES:
+            t_name = COOKIE_TECH_SIGNATURES[c_name]
+            out['cookie_techs'][t_name] = f'HTTP Set-Cookie runtime cookie: {c_name}'
+        elif c_name.startswith('_ga_'):
+            out['cookie_techs']['Google Analytics (GA4)'] = f'HTTP Set-Cookie runtime cookie: {c_name}'
+
+    if hdrs.get('x-shopid') or hdrs.get('x-shopify-stage'):
+        out['ssr_cms'] = 'Shopify'
+    elif hdrs.get('x-magento-tags'):
+        out['ssr_cms'] = 'Magento'
+    elif hdrs.get('sw-context-token'):
+        out['ssr_cms'] = 'Shopware'
+
+    if hdrs.get('x-akamai-transformed') or hdrs.get('cf-polished') or hdrs.get('cf-ew-via'):
+        out['has_enterprise_cdn'] = True
+
+    return out
+
+
+def decode_apple_pay_merchant_association_safe(raw_text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {'has_apple_pay': False, 'psp_gateways': []}
+    if not raw_text or len(raw_text) < 40:
+        return out
+    low = raw_text.lower()
+    if '<html' in low[:400] or '<!doctype' in low[:400]:
+        return out
+
+    psp_markers = {
+        'merchant.com.stripe': 'Stripe',
+        'merchant.com.adyen': 'Adyen',
+        'merchant.com.braintree': 'Braintree',
+        'merchant.com.checkout': 'Checkout.com',
+        'merchant.com.mollie': 'Mollie',
+        'merchant.com.worldpay': 'Worldpay',
+        'merchant.com.klarna': 'Klarna',
+    }
+    found_psps: list[str] = []
+    for sig, psp_name in psp_markers.items():
+        if sig in low:
+            found_psps.append(psp_name)
+    if found_psps:
+        out['has_apple_pay'] = True
+        out['psp_gateways'] = sorted(set(found_psps))
+    return out
+
+
+def extract_shopify_pim_and_logistics_signals(html: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        'myshopify_canonical_domain': None,
+        'demo_scheduler_tool': None,
+        'has_automated_returns_portal': False,
+        'logistics_carriers': [],
+        'accessibility_widget': None,
+        'enterprise_pim_and_cms': [],
+    }
+    if not html:
+        return out
+
+    m_shop = SHOPIFY_SHOP_DOMAIN_RE.search(html)
+    if m_shop:
+        out['myshopify_canonical_domain'] = m_shop.group(1).lower()
+
+    low = html.lower()
+    for tool_name, patterns in SAFE_DEMO_SCHEDULER_PATTERNS.items():
+        if any(p in low for p in patterns):
+            out['demo_scheduler_tool'] = tool_name
+            break
+
+    carriers: Set[str] = set()
+    for sig, (label, kind) in LOGISTICS_AND_RETURNS_SIGNATURES.items():
+        if sig in low:
+            if kind == 'returns_portal':
+                out['has_automated_returns_portal'] = True
             else:
-                parts.append('GA4 (dynamic)')
-        elif short not in parts:
-            parts.append(short)
-    return ', '.join(parts) if parts else None
+                carriers.add(label)
+    out['logistics_carriers'] = sorted(carriers)
+
+    for w_sig, w_name in EAA_ACCESSIBILITY_WIDGETS.items():
+        if w_sig in low:
+            out['accessibility_widget'] = w_name
+            break
+
+    pim_found: Set[str] = set()
+    for tech_name, sigs in ENTERPRISE_PIM_ERP_CMS_SIGNATURES.items():
+        if any(s in low for s in sigs):
+            pim_found.add(tech_name)
+    out['enterprise_pim_and_cms'] = sorted(pim_found)
+    return out
 
 
-def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache') -> str | None:
-    raw_tech = rec.get('detected_technologies') or ''
-    tech_list = [x.strip() for x in raw_tech.split(';') if x.strip()]
-    if not tech_list:
-        return None
-    ga4_ids = [x.strip() for x in (rec.get('all_ga4_ids') or '').split(';') if x.strip()]
-    evidence_map: dict[str, dict] = {}
-    for t in tech_list:
-        if t == 'Server-Side GTM (sGTM)' and not _is_valid_cached_sgtm(rec):
+def _extract_ga4_ids_from_text(text: str, is_gtm: bool = False) -> Set[str]:
+    found: Set[str] = set()
+    if not text:
+        return found
+    for rx in (GTAG_CONFIG_GA4_REGEX, GA4_SCRIPT_SRC_REGEX, GA4_WIRE_REGEX):
+        for m in rx.findall(text):
+            found.add(m.upper())
+    if is_gtm:
+        for m in GTM_JSON_GA4_REGEX.findall(text):
+            found.add(m.upper())
+    for m in GA4_STRICT_10CHAR_REGEX.findall(text):
+        up = m.upper()
+        if not up.startswith(('G-TEST', 'G-XXXX', 'G-0000')):
+            found.add(up)
+    return found
+
+
+def detect_tech_with_evidence(
+    html: str,
+    gtm_js: str,
+    gtm_ids: list[str],
+    page_url: str,
+    scan_completeness: str = 'full',
+) -> dict:
+    """
+    v24.0 Enterprise MarTech & Account Intelligence:
+    Розділяє джерела сигналів на 3 рівні підтвердження:
+      - `runtime_verified` (мережевий запит Playwright `pw_net_req` або першосторонні кукі `FPID`/`_ga`/`_fbp`);
+      - `configured_in_code` (HTML-код сторінки або внутрішній код розпакованого `gtm.js`);
+      - `allowlisted_in_csp` (лише список дозволених доменів у заголовку `Content-Security-Policy`).
+    """
+    html_str = html or ''
+    gtm_str = gtm_js or ''
+    html_low = html_str.lower()
+    gtm_low = gtm_str.lower()
+
+    evidence_map: Dict[str, Dict[str, str]] = {}
+    tier_rank = {
+        'allowlisted_in_csp': 1,
+        'configured_in_code': 2,
+        'runtime_verified': 3,
+    }
+
+    def _record_tech(tech_name: str, tier: str, source: str, evidence_detail: str) -> None:
+        existing = evidence_map.get(tech_name)
+        if not existing or tier_rank[tier] > tier_rank.get(existing.get('verification_tier', ''), 0):
+            evidence_map[tech_name] = {
+                'verification_tier': tier,
+                'source': source,
+                'evidence': evidence_detail[:220],
+            }
+
+    # 1. Витяг заголовків HTTP (CSP, Set-Cookie, SSR CMS)
+    hdr_info = extract_embedded_headers_and_ssr_signals_v23_1(html_str)
+    for tech_name, csp_ev in hdr_info['csp_techs'].items():
+        _record_tech(tech_name, 'allowlisted_in_csp', 'http_headers_csp', csp_ev)
+    for tech_name, ck_ev in hdr_info['cookie_techs'].items():
+        _record_tech(tech_name, 'runtime_verified', 'runtime_cookie', ck_ev)
+
+    # 2. Витяг живих мережевих запитів із Playwright (pw_net_req)
+    net_urls = PW_NET_REQ_COMMENT_RE.findall(html_str)
+    runtime_ga4_hit_counts: Counter = Counter()
+    consent_mode_signals: Set[str] = set()
+    sgtm_hosts: Set[str] = set()
+
+    for n_url in net_urls:
+        n_low = n_url.lower()
+        for tech_name, markers in RUNTIME_NET_SIGNATURES.items():
+            if any(mk in n_low for mk in markers):
+                _record_tech(tech_name, 'runtime_verified', 'runtime_network', f'Playwright network hit: {n_url[:140]}')
+
+        if '/g/collect' in n_low:
+            try:
+                qs = parse_qs(urlparse(n_url).query)
+                for tid in qs.get('tid', []):
+                    if tid.upper().startswith('G-'):
+                        runtime_ga4_hit_counts[tid.upper()] += 1
+            except Exception:
+                pass
+            m_sgtm = SGTM_FIRST_PARTY_COLLECT_REGEX.search(n_url)
+            if m_sgtm:
+                sgtm_hosts.add(m_sgtm.group(1).lower())
+                _record_tech('Server-Side GTM (sGTM)', 'runtime_verified', 'runtime_network', f'1st-party sGTM collect endpoint: {m_sgtm.group(1)}')
+
+        for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(n_url):
+            consent_mode_signals.add(f'gcs={gcs_m}')
+        for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(n_url):
+            consent_mode_signals.add(f'gcd={gcd_m}')
+
+    # 3. Перевірка GTM IDs та розпакованого контейнера gtm.js (configured_in_code)
+    valid_gtms = sorted({g.upper() for g in (gtm_ids or []) if is_valid_gtm_id(g)})
+    if valid_gtms:
+        _record_tech('Google Tag Manager', 'configured_in_code', 'html', f'Container IDs: {", ".join(valid_gtms[:4])}')
+
+    html_ga4_ids = _extract_ga4_ids_from_text(html_str, is_gtm=False)
+    gtm_ga4_ids = _extract_ga4_ids_from_text(gtm_str, is_gtm=True)
+    net_ga4_ids = set(runtime_ga4_hit_counts.keys())
+
+    if net_ga4_ids:
+        _record_tech('Google Analytics (GA4)', 'runtime_verified', 'runtime_network', f'Active /g/collect hits for {", ".join(sorted(net_ga4_ids)[:3])}')
+    elif html_ga4_ids or gtm_ga4_ids:
+        src_lbl = 'gtm_container' if (gtm_ga4_ids and not html_ga4_ids) else 'html'
+        all_sample = sorted(html_ga4_ids | gtm_ga4_ids)[:3]
+        _record_tech('Google Analytics (GA4)', 'configured_in_code', src_lbl, f'Measurement IDs: {", ".join(all_sample)}')
+
+    # Google Ads Conversion (AW-XXXXXX)
+    gads_html = set(GOOGLE_ADS_REGEX.findall(html_str))
+    gads_gtm = set(GOOGLE_ADS_REGEX.findall(gtm_str))
+    if gads_html or gads_gtm:
+        aw_sample = sorted(gads_html | gads_gtm)[:3]
+        _record_tech(
+            'Google Ads Conversion',
+            'configured_in_code',
+            'gtm_container' if (gads_gtm and not gads_html) else 'html',
+            f'Conversion IDs: {", ".join(aw_sample)}',
+        )
+
+    # sGTM у коді HTML або GTM
+    for m_loader in SGTM_CUSTOM_LOADER_REGEX.findall(html_str):
+        _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'Custom sGTM loader: {m_loader[:100]}')
+    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_str + '\n' + gtm_str):
+        sgtm_hosts.add(m_coll.lower())
+        _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'First-party sGTM endpoint: {m_coll}')
+
+    # Consent Mode v2 у коді HTML/GTM
+    for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(html_str + '\n' + gtm_str):
+        consent_mode_signals.add(f'gcs={gcs_m}')
+    for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(html_str + '\n' + gtm_str):
+        consent_mode_signals.add(f'gcd={gcd_m}')
+
+    # Сигнатури рекламних пікселів та аналітики в HTML / GTM
+    for tech_name, sigs in AD_AND_ANALYTICS_SIGNATURES.items():
+        matched_html = next((s for s in sigs if s in html_low), None)
+        if matched_html:
+            _record_tech(tech_name, 'configured_in_code', 'html', f'HTML signature: {matched_html}')
             continue
-        entry: dict = {'source': source_label}
-        if t == 'Google Analytics (GA4)' and ga4_ids:
-            entry['ids'] = ga4_ids[:MAX_DISPLAY_GA4_IDS]
-            if len(ga4_ids) > MAX_DISPLAY_GA4_IDS:
-                entry['total_ids_count'] = len(ga4_ids)
-        evidence_map[t] = entry
-    return json.dumps(evidence_map, ensure_ascii=False) if evidence_map else None
+        if gtm_low:
+            matched_gtm = next((s for s in sigs if s in gtm_low), None)
+            if matched_gtm:
+                _record_tech(tech_name, 'configured_in_code', 'gtm_container', f'GTM container signature: {matched_gtm}')
+
+    # CMS-платформи
+    detected_cms_list: list[str] = []
+    if hdr_info.get('ssr_cms'):
+        detected_cms_list.append(hdr_info['ssr_cms'])
+        _record_tech(hdr_info['ssr_cms'], 'configured_in_code', 'http_headers_ssr', f'SSR header: {hdr_info["ssr_cms"]}')
+
+    for cms_name, sigs in CMS_HTML_ONLY_SIGNATURES.items():
+        matched_cms = next((s for s in sigs if s in html_low), None)
+        if matched_cms:
+            if cms_name not in detected_cms_list:
+                detected_cms_list.append(cms_name)
+            _record_tech(cms_name, 'configured_in_code', 'html', f'CMS signature: {matched_cms}')
+
+    if 'Shopify' in detected_cms_list and 'WordPress' in detected_cms_list:
+        detected_cms_list = [c for c in detected_cms_list if c != 'WordPress']
+        evidence_map.pop('WordPress', None)
+    if 'WooCommerce' in detected_cms_list and 'WordPress' not in detected_cms_list:
+        detected_cms_list.append('WordPress')
+
+    # Платіжні шлюзи (PSP)
+    payment_gateways: Set[str] = set(hdr_info['csp_gateways'])
+    for psp_name, sigs in PAYMENT_HTML_SIGNATURES.items():
+        if any(s in html_low or s in gtm_low for s in sigs):
+            payment_gateways.add(psp_name)
+
+    has_cookie_banner = any(m in html_low for m in COOKIE_CONSENT_MARKERS)
+
+    # Дублювання GA4 (між статичним HTML та GTM, або подвійні хіти у Playwright)
+    dup_ga4_ids = sorted(html_ga4_ids & gtm_ga4_ids)
+    dup_runtime_confirmed = any(runtime_ga4_hit_counts.get(gid, 0) >= 2 for gid in dup_ga4_ids)
+    if not dup_ga4_ids:
+        runtime_multi = sorted(gid for gid, cnt in runtime_ga4_hit_counts.items() if cnt >= 2)
+        if runtime_multi:
+            dup_ga4_ids = runtime_multi
+            dup_runtime_confirmed = True
+
+    # Визначення повноти сканування: якщо всі технології лише зі списку CSP (allowlisted_in_csp)
+    all_detected_techs = sorted(evidence_map.keys())
+    effective_completeness = scan_completeness
+    if all_detected_techs and all(
+        info.get('verification_tier') == 'allowlisted_in_csp' for info in evidence_map.values()
+    ):
+        effective_completeness = 'partial_csp_headers'
+
+    # Повний список GA4 ID без обрізання до 5 (MAX_DISPLAY_GA4_IDS = 50)
+    all_ga4_combined = sorted(html_ga4_ids | gtm_ga4_ids | net_ga4_ids)
+    raw_ga4_joined = '; '.join(all_ga4_combined) if all_ga4_combined else None
+
+    ga4_tier = (evidence_map.get('Google Analytics (GA4)') or {}).get('verification_tier')
+    if ga4_tier == 'runtime_verified':
+        base_ga4_conf = f'High (Runtime Verified — {len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
+    elif ga4_tier == 'configured_in_code':
+        base_ga4_conf = f'Verified in Code ({len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
+    elif ga4_tier == 'allowlisted_in_csp':
+        base_ga4_conf = 'Low (CSP Header Allowlist Only — Tag Firing Unverified)'
+    else:
+        base_ga4_conf = None
+
+    all_ga4_str, all_ga4_count, ga4_conf = cap_ga4_ids_and_confidence(
+        raw_ga4_joined,
+        max_display=MAX_DISPLAY_GA4_IDS,
+        base_confidence=base_ga4_conf,
+    )
+
+    tech_verification_tiers = {
+        t: info['verification_tier'] for t, info in evidence_map.items()
+    }
+
+    evidence_lines = [
+        f"{t} [{info['verification_tier']}]: {info['evidence']}"
+        for t, info in sorted(evidence_map.items())
+    ]
+    summary_parts = [
+        f"{t} ({info['verification_tier']})"
+        for t, info in sorted(evidence_map.items())[:8]
+    ]
+
+    return {
+        'has_meta_pixel': 'Meta Pixel' in evidence_map,
+        'has_tiktok_pixel': 'TikTok Pixel' in evidence_map,
+        'has_google_ads': 'Google Ads Conversion' in evidence_map,
+        'has_linkedin_pixel': 'LinkedIn Insight Tag' in evidence_map,
+        'has_pinterest_tag': 'Pinterest Tag' in evidence_map,
+        'has_hubspot': 'HubSpot' in evidence_map,
+        'has_klaviyo': 'Klaviyo' in evidence_map,
+        'has_ga4': 'Google Analytics (GA4)' in evidence_map,
+        'has_gtm': 'Google Tag Manager' in evidence_map,
+        'has_sgtm': 'Server-Side GTM (sGTM)' in evidence_map,
+        'has_esp_retention': bool({'Klaviyo', 'HubSpot', 'Braze'} & set(evidence_map.keys())),
+        'has_enterprise_cdn': bool(hdr_info.get('has_enterprise_cdn')),
+        'all_ga4_ids': all_ga4_str,
+        'all_ga4_ids_count': all_ga4_count,
+        'ga4_detection_confidence': ga4_conf,
+        'duplicate_ga4_ids': dup_ga4_ids,
+        'duplicate_ga4_runtime_confirmed': dup_runtime_confirmed,
+        'has_cookie_banner': has_cookie_banner,
+        'has_consent_mode_v2_signals': bool(consent_mode_signals),
+        'consent_mode_v2_signals': sorted(consent_mode_signals),
+        'detected_cms_list': detected_cms_list,
+        'detected_cms': '; '.join(detected_cms_list) if detected_cms_list else None,
+        'payment_gateways': sorted(payment_gateways),
+        'detected_technologies_list': all_detected_techs,
+        'tech_verification_tiers': tech_verification_tiers,
+        'technology_evidence_summary': ', '.join(summary_parts) if summary_parts else 'No tracking technologies detected',
+        'technology_evidence': ' | '.join(evidence_lines) if evidence_lines else 'No tracking signatures matched',
+        'technology_evidence_json': json.dumps(evidence_map, ensure_ascii=False) if evidence_map else None,
+        'tech_scan_completeness': effective_completeness,
+    }
 
 
 def detect_broken_attribution_red_flags(
@@ -572,351 +486,144 @@ def detect_broken_attribution_red_flags(
     is_eu_gdpr: bool = False,
     pw_used: bool = False,
 ) -> list[str]:
-    if tech_info.get('tech_scan_completeness') not in ('full', 'partial_cached'):
+    if company_category == 'Non-Profit / Education / Institution':
         return []
 
-    flags: list[str] = []
-    has_meta = bool(tech_info.get('has_meta_pixel'))
-    has_gads = bool(tech_info.get('has_google_ads'))
-    has_tiktok = bool(tech_info.get('has_tiktok_pixel'))
-    has_sgtm = bool(tech_info.get('has_sgtm'))
-    has_cm_v2 = bool(tech_info.get('has_consent_mode_v2_signals'))
-    has_consent_banner = bool(tech_info.get('has_cookie_banner'))
-    dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
-    dup_runtime_confirmed = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
-    has_esp = bool(
-        tech_info.get('has_klaviyo')
-        or tech_info.get('has_hubspot')
-        or tech_info.get('has_esp_retention')
-    )
+    red_flags: list[str] = []
+    dup_ids = tech_info.get('duplicate_ga4_ids') or []
+    dup_rt = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
+    if dup_ids:
+        status_lbl = 'duplicate_runtime_hits_confirmed' if dup_rt else 'duplicate_configuration_suspected'
+        red_flags.append(
+            f"Duplicate GA4 Tagging [{status_lbl}] ({dup_ids[0]} present in both HTML and GTM)"
+        )
 
-    paid_count = sum(1 for x in (has_meta, has_gads, has_tiktok) if x)
-
-    if dup_ga4_ids:
-        dup_str = ', '.join(dup_ga4_ids[:2])
-        if dup_runtime_confirmed:
-            flags.append(
-                f'Duplicate GA4 Tagging [duplicate_runtime_hits_confirmed] ({dup_str} present in both HTML and GTM with multiple network hits observed)'
-            )
-        else:
-            flags.append(
-                f'Duplicate GA4 Tagging [duplicate_configuration_suspected] ({dup_str} present in both page HTML and GTM container — verify runtime firing triggers)'
-            )
+    scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
+    tiers = tech_info.get('tech_verification_tiers') or {}
+    gads_tier = tiers.get('Google Ads Conversion', '')
 
     if (
         is_eu_gdpr
-        and has_gads
-        and not has_cm_v2
-        and tech_info.get('tech_scan_completeness') == 'full'
-        and (pw_used or has_consent_banner)
+        and tech_info.get('has_google_ads')
+        and gads_tier != 'allowlisted_in_csp'
+        and not tech_info.get('has_consent_mode_v2_signals')
+        and scan_comp == 'full'
+        and (pw_used or tech_info.get('has_cookie_banner'))
     ):
-        flags.append(
-            'EU Consent Mode v2 Gap (Google Ads tag configured in EEA jurisdiction without observable gcs/gcd consent signals)'
+        red_flags.append(
+            'EU Consent Mode v2 Gap (Google Ads active in EEA/UK without observable gcs/gcd consent signals)'
         )
 
-    if paid_count >= 2 and not has_sgtm:
-        flags.append(
-            'Client-Side Tracking Architecture (Multi-pixel ad tags configured without observable first-party sGTM collector — validate ITP/CAPI signal recovery)'
-        )
-
-    if company_category == 'E-commerce / Retail Brand' and paid_count >= 1 and not has_esp:
-        flags.append(
-            'E-commerce Retention Stack Hypothesis (Ad pixels configured without observable client-side ESP/Klaviyo/CRM retention script)'
-        )
-
-    return flags
+    return red_flags
 
 
-def detect_tech_with_evidence(
-    html: str,
-    gtm_js: str,
-    gtm_ids: list[str],
-    page_url: str,
-    scan_completeness: str = 'full'
-) -> dict:
-    pw_net_urls = _PW_NET_REQ_REGEX.findall(html)
-    pw_net_combined = '\n'.join(pw_net_urls)
-    pw_net_lower = pw_net_combined.lower()
+def build_summary_from_cached_record(rec: dict) -> str:
+    tech_str = str(rec.get('detected_technologies') or '')
+    techs = [x.strip() for x in tech_str.split(';') if x.strip()]
+    if not techs:
+        return 'No tracking technologies in cached snapshot'
+    ga4_str = rec.get('all_ga4_ids')
+    ga4_note = f' [GA4: {ga4_str}]' if ga4_str else ''
+    return f"{', '.join(techs[:6])}{ga4_note} (Cached Snapshot)"
 
-    header_ssr_signals = extract_embedded_headers_and_ssr_signals_v23_1(html)
-    html_without_comments = HTTP_HEADERS_COMMENT_RE.sub('', _PW_NET_REQ_REGEX.sub('', html))
-    html_lower = html_without_comments.lower()
-    gtm_lower = gtm_js.lower() if gtm_js else ''
-    combined_source = f'{html_without_comments}\n{ pw_net_combined }\n{gtm_js}' if gtm_js else f'{html_without_comments}\n{pw_net_combined}'
 
-    found_tech = []
-    detected_cms_list = []
-    evidence_items = []
-    summary_items = []
-    evidence_json_map: dict[str, dict] = {}
-
-    if gtm_ids:
-        found_tech.append('Google Tag Manager')
-        evidence_items.append(
-            f"Google Tag Manager: id={','.join(gtm_ids)} @ {page_url}"
-        )
-        summary_items.append(f'GTM ({gtm_ids[0]})')
-        evidence_json_map['Google Tag Manager'] = {
-            'source': 'live_html',
-            'ids': gtm_ids,
+def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache') -> str | None:
+    tech_str = str(rec.get('detected_technologies') or '')
+    techs = [x.strip() for x in tech_str.split(';') if x.strip()]
+    if not techs:
+        return None
+    ev_map = {
+        t: {
+            'verification_tier': 'configured_in_code',
+            'source': source_label,
+            'evidence': f'Recovered from {source_label}',
         }
-    elif 'googletagmanager.com/gtm.js' in pw_net_lower or '/gtm.js?id=gtm-' in pw_net_lower:
-        found_tech.append('Google Tag Manager')
-        evidence_items.append(f'Google Tag Manager: network request gtm.js @ {page_url}')
-        summary_items.append('GTM (net)')
-        evidence_json_map['Google Tag Manager'] = {
-            'source': 'pw_network',
-            'ids': [],
-        }
-
-    sgtm_loader_match = SGTM_CUSTOM_LOADER_REGEX.search(combined_source)
-    sgtm_collect_match = SGTM_FIRST_PARTY_COLLECT_REGEX.search(combined_source)
-    sgtm_match = sgtm_loader_match or sgtm_collect_match
-    has_sgtm_cookie = bool(header_ssr_signals.get('has_sgtm_fpid_cookie'))
-    has_sgtm = bool(sgtm_match or has_sgtm_cookie)
-
-    if has_sgtm:
-        found_tech.append('Server-Side GTM (sGTM)')
-        if sgtm_match:
-            sgtm_snip = sgtm_match.group(0)[:85]
-            sgtm_src = 'pw_network' if (sgtm_collect_match and sgtm_snip.lower() in pw_net_lower) else 'live_html'
-            evidence_items.append(f'Server-Side GTM (sGTM): custom endpoint "{sgtm_snip}" @ {page_url}')
-            evidence_json_map['Server-Side GTM (sGTM)'] = {
-                'source': sgtm_src,
-                'endpoint': sgtm_snip,
-            }
-        else:
-            evidence_items.append(f'Server-Side GTM (sGTM): sgtm_fpid_cookie_verified @ {page_url}')
-            evidence_json_map['Server-Side GTM (sGTM)'] = {
-                'source': 'http_cookie_header',
-                'cookie': 'FPID',
-            }
-        summary_items.append('sGTM')
-
-    gcs_match = CONSENT_MODE_V2_GCS_REGEX.search(combined_source)
-    gcd_match = CONSENT_MODE_V2_GCD_REGEX.search(combined_source)
-    has_consent_mode_v2_signals = bool(
-        gcs_match
-        or gcd_match
-        or "gtag('consent'" in html_lower
-        or 'gtag("consent"' in html_lower
-        or "gtag('consent'" in gtm_lower
-        or 'gtag("consent"' in gtm_lower
-    )
-    if gcd_match or gcs_match:
-        cm_parts = []
-        if gcs_match:
-            cm_parts.append(f'gcs={gcs_match.group(1)}')
-        if gcd_match:
-            cm_parts.append(f'gcd={gcd_match.group(1)[:16]}')
-        evidence_items.append(f"Google Consent Mode v2 signals ({', '.join(cm_parts)}) @ {page_url}")
-
-    html_direct_ga4 = {m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(html_without_comments)}
-    html_direct_ga4.update(m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(html_without_comments))
-
-    high_conf_ga4 = set(GA4_STRICT_10CHAR_REGEX.findall(combined_source))
-    high_conf_ga4.update(m.upper() for m in GTAG_CONFIG_GA4_REGEX.findall(combined_source))
-    high_conf_ga4.update(m.upper() for m in GA4_SCRIPT_SRC_REGEX.findall(combined_source))
-    high_conf_ga4.update(m.upper() for m in GA4_WIRE_REGEX.findall(combined_source))
-
-    gtm_macro_ga4 = {m.upper() for m in GTM_JSON_GA4_REGEX.findall(gtm_js)} if gtm_js else set()
-    duplicate_ga4_ids = sorted(html_direct_ga4 & gtm_macro_ga4)
-
-    net_tid_counts = Counter(m.upper() for m in _NET_COLLECT_TID_REGEX.findall(pw_net_combined))
-    duplicate_ga4_runtime_confirmed = any(net_tid_counts.get(gid, 0) >= 2 for gid in duplicate_ga4_ids)
-
-    all_ga4_set = sorted(high_conf_ga4 | gtm_macro_ga4)
-    total_ga4_count = len(all_ga4_set)
-    capped_ga4_list = all_ga4_set[:MAX_DISPLAY_GA4_IDS]
-
-    has_ga4_endpoint_only = (
-        not all_ga4_set and (
-            'googletagmanager.com/gtag/js' in html_lower
-            or 'googletagmanager.com/gtag/js' in gtm_lower
-            or 'google-analytics.com/g/collect' in html_lower
-            or 'google-analytics.com/g/collect' in gtm_lower
-            or 'analytics.google.com/g/collect' in html_lower
-            or 'analytics.google.com/g/collect' in gtm_lower
-            or 'google-analytics.com/g/collect' in pw_net_lower
-            or 'analytics.google.com/g/collect' in pw_net_lower
-        )
-    )
-
-    ga4_confidence = None
-    if all_ga4_set:
-        found_tech.append('Google Analytics (GA4)')
-        if total_ga4_count > MAX_DISPLAY_GA4_IDS:
-            ga4_confidence = (
-                f'High ({total_ga4_count} GA4 IDs configured in multi-region GTM lookup table; verify active runtime property)'
-            )
-        elif high_conf_ga4 or total_ga4_count >= 2:
-            ga4_confidence = 'High'
-        else:
-            ga4_confidence = 'Medium (GTM Single Macro)'
-        ga4_src_label = 'live_html' if any(gid in html_without_comments for gid in all_ga4_set) else (
-            'pw_network' if any(gid.lower() in pw_net_lower for gid in all_ga4_set) else 'gtm_container'
-        )
-        src_note = 'page HTML' if ga4_src_label == 'live_html' else (
-            'Playwright network' if ga4_src_label == 'pw_network' else 'GTM container'
-        )
-        snip = extract_code_snippet(combined_source, capped_ga4_list[0])
-        count_suffix = f' (showing {MAX_DISPLAY_GA4_IDS} of {total_ga4_count})' if total_ga4_count > MAX_DISPLAY_GA4_IDS else ''
-        evidence_items.append(
-            f"Google Analytics (GA4) [{ga4_confidence}]: id={';'.join(capped_ga4_list)}{count_suffix} in {src_note} (\"{snip}\")"
-        )
-        summary_items.append(f'GA4 ({capped_ga4_list[0]})')
-        ga4_ev_entry: dict = {
-            'source': ga4_src_label,
-            'confidence': ga4_confidence,
-            'ids': capped_ga4_list,
-        }
-        if total_ga4_count > MAX_DISPLAY_GA4_IDS:
-            ga4_ev_entry['total_ids_count'] = total_ga4_count
-        if duplicate_ga4_ids:
-            ga4_ev_entry['duplicate_html_and_gtm_ids'] = duplicate_ga4_ids[:5]
-            ga4_ev_entry['duplicate_status'] = (
-                'duplicate_runtime_hits_confirmed' if duplicate_ga4_runtime_confirmed else 'duplicate_configuration_suspected'
-            )
-        evidence_json_map['Google Analytics (GA4)'] = ga4_ev_entry
-    elif has_ga4_endpoint_only:
-        found_tech.append('Google Analytics (GA4)')
-        ga4_confidence = 'Low (Script Endpoint Only — ID Dynamic)'
-        ga4_src_label = 'pw_network' if ('g/collect' in pw_net_lower) else ('live_html' if 'gtag/js' in html_lower else 'gtm_container')
-        evidence_items.append(
-            f'Google Analytics (GA4) [{ga4_confidence}]: gtag/js or g/collect endpoint detected without static G-XXXXXXXXXX ID @ {page_url}'
-        )
-        summary_items.append('GA4 (dynamic)')
-        evidence_json_map['Google Analytics (GA4)'] = {
-            'source': ga4_src_label,
-            'confidence': ga4_confidence,
-            'ids': [],
-        }
-
-    aw_ids = sorted(set(GOOGLE_ADS_REGEX.findall(combined_source)))
-    has_aw_sig = (
-        bool(aw_ids)
-        or 'googleadservices.com/pagead/conversion' in html_lower
-        or 'googleadservices.com/pagead/conversion' in gtm_lower
-        or 'googlesyndication.com' in html_lower
-        or 'googleads.g.doubleclick.net' in html_lower
-        or 'googleads.g.doubleclick.net' in gtm_lower
-        or 'googleadservices.com' in pw_net_lower
-        or 'googleads.g.doubleclick.net' in pw_net_lower
-    )
-    if has_aw_sig:
-        found_tech.append('Google Ads Conversion')
-        aw_src_label = 'live_html' if (
-            any(a in html_without_comments for a in aw_ids) or 'googleadservices.com' in html_lower
-        ) else ('pw_network' if 'googlead' in pw_net_lower else 'gtm_container')
-        if aw_ids:
-            snip = extract_code_snippet(combined_source, aw_ids[0])
-            evidence_items.append(
-                f"Google Ads Conversion: id={','.join(aw_ids[:4])} (\"{snip}\")"
-            )
-            summary_items.append(f'Google Ads ({aw_ids[0]})')
-        else:
-            evidence_items.append(
-                f'Google Ads Conversion: conversion_async.js / doubleclick endpoint @ {page_url}'
-            )
-            summary_items.append('Google Ads')
-        evidence_json_map['Google Ads Conversion'] = {
-            'source': aw_src_label,
-            'ids': aw_ids[:4],
-        }
-
-    for tech_name, signatures in AD_AND_ANALYTICS_SIGNATURES.items():
-        for sig in signatures:
-            in_html = sig in html_lower
-            in_gtm = bool(gtm_lower and sig in gtm_lower)
-            in_net = sig in pw_net_lower
-            if in_html or in_gtm or in_net:
-                found_tech.append(tech_name)
-                where = 'page HTML' if in_html else ('Playwright network' if in_net else 'GTM container')
-                src_code = 'live_html' if in_html else ('pw_network' if in_net else 'gtm_container')
-                snip = extract_code_snippet(
-                    html_without_comments if in_html else (pw_net_combined if in_net else gtm_js),
-                    sig
-                )
-                evidence_items.append(f'{tech_name}: "{sig}" in {where} ("{snip}")')
-                summary_items.append(SHORT_SUMMARY_LABELS.get(tech_name, tech_name))
-                evidence_json_map[tech_name] = {
-                    'source': src_code,
-                    'signature': sig,
-                }
-                break
-
-    for cms_name, signatures in CMS_HTML_ONLY_SIGNATURES.items():
-        for sig in signatures:
-            if sig in html_lower:
-                detected_cms_list.append(cms_name)
-                found_tech.append(cms_name)
-                snip = extract_code_snippet(html_without_comments, sig)
-                evidence_items.append(f'{cms_name} (CMS): "{sig}" in page HTML ("{snip}")')
-                summary_items.append(cms_name)
-                evidence_json_map[cms_name] = {
-                    'source': 'live_html',
-                    'signature': sig,
-                }
-                break
-
-    for hdr_tech in header_ssr_signals.get('detected_tech') or []:
-        if hdr_tech in ('Shopify', 'Magento', 'Shopware') and hdr_tech not in detected_cms_list:
-            detected_cms_list.append(hdr_tech)
-        if hdr_tech not in found_tech:
-            found_tech.append(hdr_tech)
-            short_lbl = SHORT_SUMMARY_LABELS.get(hdr_tech, hdr_tech)
-            if short_lbl not in summary_items:
-                summary_items.append(short_lbl)
-            evidence_items.append(f'{hdr_tech}: verified via HTTP CSP/Cookie/SSR header @ {page_url}')
-            evidence_json_map.setdefault(hdr_tech, {'source': 'http_headers_or_ssr'})
-
-    if 'WooCommerce' in detected_cms_list and 'WordPress' not in detected_cms_list:
-        detected_cms_list.append('WordPress')
-        if 'WordPress' not in found_tech:
-            found_tech.append('WordPress')
-
-    has_esp_retention = (
-        'Klaviyo' in found_tech
-        or 'HubSpot' in found_tech
-        or any(
-            esp_sig in html_lower or esp_sig in gtm_lower or esp_sig in pw_net_lower
-            for esp_sig in ESP_RETENTION_SIGNATURES
-        )
-    )
-
-    has_cookie_banner = (
-        has_consent_mode_v2_signals
-        or any(marker in html_lower or marker in gtm_lower for marker in COOKIE_CONSENT_MARKERS)
-    )
-    if has_cookie_banner and not (gcd_match or gcs_match):
-        evidence_items.append(f'Cookie Consent / CMP Banner detected @ {page_url}')
-
-    return {
-        'has_meta_pixel': 'Meta Pixel' in found_tech,
-        'has_tiktok_pixel': 'TikTok Pixel' in found_tech,
-        'has_google_ads': 'Google Ads Conversion' in found_tech,
-        'has_linkedin_pixel': 'LinkedIn Insight Tag' in found_tech,
-        'has_pinterest_tag': 'Pinterest Tag' in found_tech,
-        'has_hubspot': 'HubSpot' in found_tech,
-        'has_klaviyo': 'Klaviyo' in found_tech,
-        'has_esp_retention': has_esp_retention,
-        'has_ga4': 'Google Analytics (GA4)' in found_tech,
-        'has_gtm': 'Google Tag Manager' in found_tech,
-        'has_sgtm': has_sgtm,
-        'has_enterprise_cdn': bool(header_ssr_signals.get('has_enterprise_cdn')),
-        'payment_gateways': header_ssr_signals.get('payment_gateways') or [],
-        'has_consent_mode_v2_signals': has_consent_mode_v2_signals,
-        'duplicate_ga4_ids': duplicate_ga4_ids,
-        'duplicate_ga4_runtime_confirmed': duplicate_ga4_runtime_confirmed,
-        'all_ga4_ids': '; '.join(capped_ga4_list) if capped_ga4_list else None,
-        'all_ga4_ids_count': total_ga4_count if total_ga4_count > 0 else None,
-        'ga4_detection_confidence': ga4_confidence,
-        'detected_cms_list': detected_cms_list,
-        'detected_cms': '; '.join(detected_cms_list) if detected_cms_list else None,
-        'has_cookie_banner': has_cookie_banner,
-        'detected_technologies_list': found_tech,
-        'technology_evidence': ' | '.join(evidence_items) if evidence_items else None,
-        'technology_evidence_summary': ', '.join(summary_items) if summary_items else None,
-        'technology_evidence_json': json.dumps(evidence_json_map, ensure_ascii=False) if evidence_json_map else None,
-        'tech_scan_completeness': scan_completeness
+        for t in techs
     }
+    return json.dumps(ev_map, ensure_ascii=False)
+
+
+async def fetch_google_ads_transparency_intel_v23_1(
+    http_client: Any,
+    domain: str,
+    etld_func: Callable[[str], tuple[str, str]],
+    infra_denylist: tuple[str, ...] = (),
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        'ads_rpc_status': 'checked_no_ads',
+        'ads_active_last_30d': False,
+        'active_ad_formats': [],
+        'verified_advertiser_legal_name': None,
+        'advertiser_sister_domains': [],
+    }
+    reg_dom, _ = etld_func(domain)
+    target = reg_dom or domain.lower().strip()
+    if not target:
+        return out
+
+    rpc_url = 'https://adstransparency.google.com/anji/_/rpc/SearchService/SearchSuggestions?authuser='
+    payload = {'1': target, '2': 5, '3': 5}
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Origin': 'https://adstransparency.google.com',
+        'Referer': 'https://adstransparency.google.com/',
+    }
+    try:
+        resp = await http_client.post(
+            rpc_url,
+            data={'f.req': json.dumps(payload)},
+            headers=headers,
+            timeout=2.2,
+        )
+        if resp.status_code == 200 and resp.text:
+            body = resp.text.lstrip(")]}'\n ")
+            data = json.loads(body)
+            suggestions = data.get('1') or []
+            if isinstance(suggestions, list) and suggestions:
+                out['ads_rpc_status'] = 'verified_active_advertiser'
+                out['ads_active_last_30d'] = True
+                out['active_ad_formats'] = ['Search / Shopping / Display']
+                first_item = suggestions[0]
+                if isinstance(first_item, dict):
+                    adv_obj = first_item.get('1') or {}
+                    if isinstance(adv_obj, dict):
+                        legal_n = adv_obj.get('1')
+                        if legal_n and isinstance(legal_n, str):
+                            out['verified_advertiser_legal_name'] = legal_n.strip()
+            else:
+                out['ads_rpc_status'] = 'checked_no_active_ads'
+        else:
+            out['ads_rpc_status'] = f'rpc_http_{resp.status_code}'
+    except Exception:
+        out['ads_rpc_status'] = 'rpc_timeout_or_blocked'
+    return out
+
+
+async def fetch_public_ats_hiring_intel(
+    http_client: Any,
+    ats_provider: str,
+    brand_slug: str,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        'open_positions_total': 0,
+        'hiring_departments': [],
+    }
+    if not brand_slug or ats_provider != 'Greenhouse':
+        return out
+    try:
+        resp = await http_client.get(
+            f'https://boards-api.greenhouse.io/v1/boards/{brand_slug}/jobs',
+            timeout=2.0,
+        )
+        if resp.status_code == 200:
+            jobs = resp.json().get('jobs') or []
+            out['open_positions_total'] = len(jobs)
+            depts: Set[str] = set()
+            for j in jobs[:50]:
+                for d in (j.get('departments') or []):
+                    if isinstance(d, dict) and d.get('name'):
+                        depts.add(str(d['name']).strip())
+            out['hiring_departments'] = sorted(depts)[:8]
+    except Exception:
+        pass
+    return out
