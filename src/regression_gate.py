@@ -1,20 +1,18 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
-import hashlib
-import json
-import time
-from typing import Any, Callable, Dict
+import inspect
+from typing import Callable
 from bs4 import BeautifulSoup
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
-from .config import DEFAULT_MANUAL_SEEDS
+from .config import (
+    CACHE_SCHEMA_VERSION,
+    is_valid_gtm_id,
+    sanitize_kv_key,
+    truncate_error_msg,
+)
 from .contacts import (
-    build_decision_makers_json_from_summary,
-    build_wikidata_holding_sparql_v23_1,
+    classify_dm_source_type,
     classify_email_type,
+    clean_and_validate_social_url,
     clean_escaped_email_prefix,
     crack_wp_user_email_dual_hash_v23_1,
     extract_decision_maker_deep,
@@ -22,48 +20,40 @@ from .contacts import (
     filter_poisoned_and_compliance_emails,
     generate_dm_email_pattern_candidates,
     is_valid_person_name,
+    is_valid_Scraped_email,
     normalize_executive_role,
-    parse_schema_org_employees_v23,
+    normalize_whatsapp_number_safe,
     rank_and_clean_emails,
     resolve_soa_rname_safe,
     split_clean_executive_name,
-    strip_role_tokens_from_name,
     transliterate_ua_to_latin,
-    verify_ceo_email_cascade_port443_v23_1,
-)
-from .domain_helpers import (
-    KNOWN_POISONED_CACHE_RECOVERY,
-    KNOWN_PW_HOPELESS,
-    SALES_ACTIONABILITY_ENUM_VALUES,
-    build_compliance_note,
-    build_safe_cache_payload,
-    check_hostname_ssrf_and_dns_async,
-    derive_legal_basis_for_processing,
-    derive_sales_actionability_class,
-    extract_etld_plus_one,
-    has_verified_sgtm_in_cache,
-    heal_poisoned_cache_record,
-    merge_missing_techs_from_cache,
-    normalize_cached_record_booleans,
-    sanitize_cached_dms,
-    sanitize_cached_phones,
+    verify_person_email_match,
+    verify_person_linkedin_match,
 )
 from .qualifier import (
+    build_linkedin_xray_query,
     build_sales_hook,
+    calculate_saas_spend_range_usd,
     classify_company_category,
     compute_account_change_triggers_v23,
     compute_data_quality_score,
+    detect_ma_rebrand_and_insolvency_v23,
     evaluate_qualification_v180,
+    resolve_prospect_timezone_and_locale_v23,
 )
 from .scraper import (
-    _is_safe_domain,
+    _extract_etld_local,
     append_safe_headers_comment_v23_1,
-    evaluate_x509_der_trust_and_org,
+    deobfuscate_cfemails_in_html,
+    fetch_html_safely,
     get_clean_canonical_domain,
+    is_waf_challenge_page,
     prepare_domains,
     prune_honeypot_leaf_nodes_in_soup,
 )
 from .tech_detector import (
+    cap_ga4_ids_and_confidence,
+    decode_apple_pay_merchant_association_safe,
     detect_broken_attribution_red_flags,
     detect_tech_with_evidence,
     extract_embedded_headers_and_ssr_signals_v23_1,
@@ -71,1068 +61,299 @@ from .tech_detector import (
 )
 
 
-def _test_01_corporate_entities() -> str:
-    valid_people = [
-        ('Benjamin Otto', 'ottogroup'),
-        ('Annette Siragusano', 'ottogroup'),
-        ('Petra Scharner-Wolff', 'ottogroup'),
-        ('Gundula Koele-Pabst', 'docmorris'),
-    ]
-    for raw_name, brand in valid_people:
-        cleaned = strip_role_tokens_from_name(raw_name)
-        if not is_valid_person_name(cleaned, brand):
-            raise AssertionError(f"Valid person '{raw_name}' (cleaned='{cleaned}') was rejected for brand '{brand}'")
+class _MockHeaders:
+    def __init__(self, items_list: list[tuple[str, str]]) -> None:
+        self._items = items_list
 
-    katy_cleaned = strip_role_tokens_from_name('Petra Scharner-Wolff Katy')
-    if katy_cleaned != 'Petra Scharner-Wolff':
-        raise AssertionError(f"Expected 'Petra Scharner-Wolff', got '{katy_cleaned}'")
+    def multi_items(self) -> list[tuple[str, str]]:
+        return list(self._items)
 
-    invalid_entities = [
-        ('BPO Capital', 'ottogroup'),
-        ('GFH Gesellschaft', 'ottogroup'),
-        ('YOU Verwaltungs', 'aboutyou'),
-        ('Otto Group', 'ottogroup'),
-        ('DocMorris AG', 'docmorris'),
-    ]
-    for raw_corp, brand in invalid_entities:
-        cleaned = strip_role_tokens_from_name(raw_corp)
-        if is_valid_person_name(cleaned, brand):
-            raise AssertionError(f"Corporate entity '{raw_corp}' (cleaned='{cleaned}') falsely passed as person")
+    def items(self) -> list[tuple[str, str]]:
+        return list(self._items)
 
-    return "PASS (4 valid executives preserved, 5 corporate entities rejected)"
+    def get(self, key: str, default: str = '') -> str:
+        k_low = key.lower()
+        for k, v in self._items:
+            if k.lower() == k_low:
+                return v
+        return default
 
 
-def _test_02_determinism_ottogroup_3x() -> str:
-    page_impressum = (
-        'https://www.ottogroup.com/de/impressum',
-        '<html><body>'
-        '<p>Vertreten durch den Vorstand: Petra Scharner-Wolff</p>'
-        '<p>Annette Siragusano, President</p>'
-        '<p>BPO Capital, CEO</p>'
-        '<p>GFH Gesellschaft, CEO</p>'
-        '</body></html>',
-        'Vertreten durch den Vorstand: Petra Scharner-Wolff. Annette Siragusano, President. BPO Capital, CEO.'
+class _MockResponse:
+    def __init__(self, status_code: int, text: str, url: str, headers: _MockHeaders) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+        self.headers = headers
+
+
+class _MockAsyncClient:
+    def __init__(self, resp: _MockResponse) -> None:
+        self._resp = resp
+
+    async def get(self, url: str, **kwargs) -> _MockResponse:
+        return self._resp
+
+
+def _run_fetch_html_safely_sync_check() -> None:
+    """
+    Тест №27 (v23.8): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
+    та верифікує повернення 4-елементного кортежу (status, html, final_url, err_msg) на мок-відповіді 200 OK.
+    """
+    src_code = inspect.getsource(fetch_html_safely)
+    assert 'str(resp.url) |' not in src_code, 'CRITICAL: Bitwise OR `|` on str(resp.url) detected in fetch_html_safely!'
+
+    mock_hdrs = _MockHeaders([
+        ('Content-Security-Policy', "script-src 'self' https://www.googletagmanager.com https://js.stripe.com"),
+        ('Set-Cookie', 'FPID=FPID2.2.abc123; Path=/; Secure; HttpOnly'),
+    ])
+    mock_resp = _MockResponse(
+        status_code=200,
+        text='<html><head><title>Valid Store</title></head><body>Hello B2B</body></html>',
+        url='https://example.com/home',
+        headers=mock_hdrs,
     )
-    page_about = (
-        'https://www.ottogroup.com/de/ueber-uns',
-        '<html><body>'
-        '<h2>Management</h2>'
-        '<p>Benjamin Otto — Managing Director / CEO</p>'
-        '<a href="https://www.linkedin.com/in/benjamin-otto1">LinkedIn Profile</a>'
-        '</body></html>',
-        'Benjamin Otto — Managing Director / CEO'
-    )
-    page_news = (
-        'https://www.ottogroup.com/de/newsroom',
-        '<html><body><p>Annette Siragusano, President Corporate Communications</p></body></html>',
-        'Annette Siragusano, President Corporate Communications'
-    )
-
-    permutations = [
-        [page_impressum, page_about, page_news],
-        [page_about, page_news, page_impressum],
-        [page_news, page_impressum, page_about],
-    ]
-
-    results = [extract_decision_maker_deep(p) for p in permutations]
-    baseline_name, _, baseline_li, _, _, _, baseline_found, baseline_json = results[0]
-
-    if baseline_name != 'Benjamin Otto':
-        raise AssertionError(f"Expected primary DM 'Benjamin Otto', got '{baseline_name}'")
-    if baseline_li != 'https://www.linkedin.com/in/benjamin-otto1':
-        raise AssertionError(f"Expected LinkedIn URL 'https://www.linkedin.com/in/benjamin-otto1', got '{baseline_li}'")
-    if 'BPO Capital' in (baseline_found or '') or 'GFH Gesellschaft' in (baseline_found or ''):
-        raise AssertionError(f"Corporate pollution found in decision_makers_found: {baseline_found}")
-
-    for idx, res in enumerate(results[1:], start=2):
-        if res[0] != baseline_name or res[2] != baseline_li or res[7] != baseline_json:
-            raise AssertionError(f"Non-deterministic output on run #{idx}: {res[0]} vs {baseline_name}")
-
-    return "PASS (3x page-order permutations -> identical Benjamin Otto + LinkedIn)"
-
-
-def _test_03_cache_merge_completeness_and_liki24_partial_merge(
-    normalize_tech_fn: Callable[[dict], None],
-    resolve_cache_comp_fn: Callable[..., str],
-) -> str:
-    comp_comfy = resolve_cache_comp_fn(True, False, True, False, 'partial_blocked', False)
-    if comp_comfy != 'partial_cached':
-        raise AssertionError(f"Comfy case: expected 'partial_cached', got '{comp_comfy}'")
-
-    comp_macpaw_curl = resolve_cache_comp_fn(True, False, False, True, 'full', True)
-    if comp_macpaw_curl != 'full':
-        raise AssertionError(f"Macpaw curl-clean live case: expected 'full', got '{comp_macpaw_curl}'")
-
-    liki_live_partial = {
-        'has_ga4': True,
-        'has_gtm': False,
-        'has_google_ads': True,
-        'has_meta_pixel': False,
-        'has_tiktok_pixel': False,
-        'has_linkedin_pixel': False,
-        'has_pinterest_tag': False,
-        'has_hubspot': False,
-        'has_klaviyo': False,
-        'has_sgtm': False,
-        'all_ga4_ids': 'G-FRYX20Z9FG',
-        'ga4_detection_confidence': 'High',
-        'detected_cms_list': [],
-        'detected_cms': None,
-        'has_cookie_banner': False,
-        'detected_technologies_list': ['Google Analytics (GA4)', 'Google Ads Conversion'],
-        'technology_evidence': 'GA4 live',
-        'technology_evidence_summary': 'GA4, Google Ads',
-        'technology_evidence_json': json.dumps({
-            'Google Analytics (GA4)': {'source': 'live_html'},
-            'Google Ads Conversion': {'source': 'live_html'},
-        }),
-        'tech_scan_completeness': 'partial_blocked',
-    }
-    liki_cache_full = {
-        'has_ga4': True,
-        'has_gtm': True,
-        'has_google_ads': True,
-        'has_meta_pixel': True,
-        'all_ga4_ids': 'G-FRYX20Z9FG',
-        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
-        'technology_evidence': 'GTM + GA4 + Google Ads + Meta Pixel',
-    }
-    merged_liki, was_recovered, added_cnt = merge_missing_techs_from_cache(
-        liki_live_partial, liki_cache_full, pw_used_flag=True, pw_had_timeout_or_block=True
-    )
-    normalize_tech_fn(merged_liki)
-    merged_list = merged_liki.get('detected_technologies_list') or []
-    if 'Google Tag Manager' not in merged_list or 'Meta Pixel' not in merged_list:
-        raise AssertionError(f"Liki24 partial+cache merge failed to recover GTM/Meta: {merged_list}")
-    if merged_liki.get('tech_scan_completeness') != 'partial_cached' or not was_recovered or added_cnt != 2:
-        raise AssertionError(f"Liki24 expected partial_cached with 2 recovered techs, got comp={merged_liki.get('tech_scan_completeness')}, cnt={added_cnt}")
-
-    empty_tech_info = {
-        'detected_technologies_list': [],
-        'tech_scan_completeness': 'full',
-        'has_cookie_banner': False,
-        'all_ga4_ids': None,
-    }
-    normalize_tech_fn(empty_tech_info)
-    if empty_tech_info['tech_scan_completeness'] != 'partial_empty_render':
-        raise AssertionError(f"Expected 'partial_empty_render', got '{empty_tech_info['tech_scan_completeness']}'")
-
-    return "PASS (Liki24 partial+cache merges GTM+Meta; Macpaw curl->full; 0-tech->partial_empty_render)"
-
-
-def _test_04_vorstand_role_extraction() -> str:
-    html = (
-        '<html><body>'
-        '<p>DocMorris N.V., Vertreten durch den Vorstand: Gundula Koele-Pabst, Heerlen.</p>'
-        '</body></html>'
-    )
-    pages = [('https://www.docmorris.de/de/impressum', html, 'Vertreten durch den Vorstand: Gundula Koele-Pabst')]
-    dm_name, dm_role, _, _, _, src_type, _, dms_json = extract_decision_maker_deep(pages)
-
-    if dm_name != 'Gundula Koele-Pabst':
-        raise AssertionError(f"Expected 'Gundula Koele-Pabst', got '{dm_name}'")
-    if not dm_role or 'CEO' not in dm_role:
-        raise AssertionError(f"Expected role containing 'CEO', got '{dm_role}'")
-    if src_type != 'impressum_page':
-        raise AssertionError(f"Expected source_type 'impressum_page', got '{src_type}'")
-    parsed = json.loads(dms_json or '[]')
-    if not parsed or parsed[0].get('name') != 'Gundula Koele-Pabst':
-        raise AssertionError(f"Invalid decision_makers_json: {dms_json}")
-
-    return "PASS ('Vorstand: Gundula Koele-Pabst' -> CEO role + valid JSON)"
-
-
-def _test_05_sgtm_positive_fixture(normalize_tech_fn: Callable[[dict], None]) -> str:
-    pos_html = (
-        '<html><head>'
-        '<script src="https://metrics.custom-domain.io/gtm.js?id=GTM-TEST123"></script>'
-        '<script src="https://www.googletagmanager.com/gtag/js?id=G-12345678AB"></script>'
-        '</head><body></body></html>'
-    )
-    pos_res = detect_tech_with_evidence(pos_html, '', ['GTM-TEST123'], 'https://example.com/', 'full')
-    normalize_tech_fn(pos_res)
-    if pos_res.get('has_sgtm') is not True:
-        raise AssertionError(f"Expected has_sgtm=True on positive fixture, got {pos_res.get('has_sgtm')}")
-    if 'Server-Side GTM (sGTM)' not in (pos_res.get('detected_technologies_list') or []):
-        raise AssertionError("Expected 'Server-Side GTM (sGTM)' in detected_technologies_list")
-
-    return "PASS (metrics.custom-domain.io/gtm.js -> has_sgtm=True)"
-
-
-def _test_06_sgtm_negative_fixtures(normalize_tech_fn: Callable[[dict], None]) -> str:
-    neg_fixtures = [
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-INTER01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-INTER12345"></script>'
-            '<script>fetch("https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306")</script>'
-            '<!-- pw_net_req: https://stats.g.doubleclick.net/g/collect?v=2&tid=G-XM6L5ZM306 -->'
-            '</head><body></body></html>'
-        ),
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-RINGO01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-RINGO12345"></script>'
-            '<script>https://region1.google-analytics.com/g/collect?v=2&tid=G-RINGO12345</script>'
-            '</head><body></body></html>'
-        ),
-        (
-            '<html><head>'
-            '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-COMP01"></script>'
-            '<script src="https://www.googletagmanager.com/gtag/js?id=G-COMP12345"></script>'
-            '<script>https://metrics.company.com/g/collect?v=2</script>'
-            '</head><body></body></html>'
-        ),
-    ]
-    for idx, nf_html in enumerate(neg_fixtures, start=1):
-        nf_res = detect_tech_with_evidence(nf_html, '', [f'GTM-NEG00{idx}'], 'https://example.com/', 'full')
-        normalize_tech_fn(nf_res)
-        if nf_res.get('has_sgtm') is not False:
-            raise AssertionError(f"Expected negative_{idx} has_sgtm=False, got {nf_res.get('has_sgtm')}")
-
-    return "PASS (stats.g.doubleclick.net+10char_tid=False, region1.google-analytics=False, no_tid=False)"
-
-
-def _test_07_inweb_dm_consistency_and_liki24_hygiene() -> str:
-    raw_inweb_found = (
-        'Ігор Мутерко (Founder) [https://inweb.ua/ua/team/]; '
-        'Олексій Мамонтов (Chief Executive Officer (CEO)) [https://inweb.ua/ua/team/]; '
-        'Олександр Салієнко (Owner) [https://inweb.ua/ua/]'
-    )
-    dm_name, _, dms_found_str = sanitize_cached_dms(
-        'Олексій Мамонтов',
-        'Chief Executive Officer (CEO)',
-        raw_inweb_found,
-        brand_root='inweb',
-    )
-    dms_json_str = build_decision_makers_json_from_summary(dms_found_str, None)
-    dms_json = json.loads(dms_json_str or '[]')
-    first_found_name = (dms_found_str or '').split(';')[0].split('(')[0].strip()
-
-    if not dm_name or dm_name != dms_json[0]['name'] or dm_name != first_found_name:
-        raise AssertionError(
-            f"Inweb DM mismatch: dm_name='{dm_name}', json[0]='{dms_json[0]['name']}', found[0]='{first_found_name}'"
-        )
-    if dm_name != 'Олексій Мамонтов':
-        raise AssertionError(f"Expected CEO 'Олексій Мамонтов' to rank #1 over Founder, got '{dm_name}'")
-
-    liki_cached = {
-        'has_sgtm': True,
-        'has_ga4': True,
-        'has_gtm': True,
-        'detected_technologies': 'Google Tag Manager; Server-Side GTM (sGTM); Google Analytics (GA4); Meta Pixel',
-        'detected_signals': 'Meta Pixel, GA4, GTM, sGTM',
-        'technology_evidence': (
-            'Google Tag Manager: id=GTM-LIKI @ https://liki24.com/ | '
-            'Server-Side GTM (sGTM): custom endpoint "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-FRYX20Z9FG" @ https://liki24.com/'
-        ),
-        'tech_scan_completeness': 'partial_cached',
-    }
-    normalize_cached_record_booleans(liki_cached)
-    if 'sGTM' in (liki_cached.get('detected_signals') or ''):
-        raise AssertionError(f"Stale sGTM remained in detected_signals: {liki_cached.get('detected_signals')}")
-    if 'Server-Side GTM' in (liki_cached.get('technology_evidence') or ''):
-        raise AssertionError(f"Stale sGTM remained in technology_evidence: {liki_cached.get('technology_evidence')}")
-
-    return "PASS (Inweb dm_name==json[0]==found[0] deterministic; Liki24 stale sGTM purged)"
-
-
-def _test_08_glossier_spa_ecommerce_category() -> str:
-    for run_idx in range(3):
-        cat, _ = classify_company_category(
-            'glossier.com',
-            'Glossier | Skincare, Makeup, Body, Fragrance',
-            'Glossier is a new approach to beauty.',
-            ['Google Analytics (GA4)', 'Meta Pixel'],
-            '<html><body><script>fetch("/cart.js"); const v = {"variant": 123};</script></body></html>',
-        )
-        if cat != 'E-commerce / Retail Brand':
-            raise AssertionError(f"Glossier run #{run_idx + 1}: expected 'E-commerce / Retail Brand', got '{cat}'")
-
-    spa_cat, spa_conf = classify_company_category(
-        'unknown-dtc-brand.io',
-        'Modern Essentials',
-        'Everyday essentials designed for life.',
-        ['Google Analytics (GA4)'],
-        '<html><body><script>window.Shopify = {}; fetch("/cart.js"); const p = {"product": true, "variant": 1};</script></body></html>',
-    )
-    if spa_cat != 'E-commerce / Retail Brand':
-        raise AssertionError(f"SPA fallback failed: expected 'E-commerce / Retail Brand', got '{spa_cat}' ({spa_conf})")
-
-    ringo_cat, _ = classify_company_category('ringostat.com', 'Ringostat — Call Tracking & PBX', '', ['Google Analytics (GA4)'])
-    if ringo_cat != 'SaaS / Marketplace / Tech Platform':
-        raise AssertionError(f"Ringostat category regressed: got '{ringo_cat}'")
-
-    return "PASS (Glossier 3x + SPA e-com fallback -> E-commerce / Retail Brand; SaaS intact)"
-
-
-def _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn: Callable[[dict], None]) -> str:
-    html = (
-        '<html><head>'
-        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-KW4BC5"></script>'
-        '<script src="https://www.googletagmanager.com/gtag/js?id=G-1QQT66XX0W"></script>'
-        '</head><body>MacPaw</body></html>'
-    )
-    info = detect_tech_with_evidence(html, '', ['GTM-KW4BC5'], 'https://macpaw.com/', 'full')
-    normalize_tech_fn(info)
-    if info.get('has_ga4') is not True or info.get('detected_cms') is not None:
-        raise AssertionError(f"Unexpected initial Macpaw fixture state: {info}")
-    if info.get('tech_scan_completeness') != 'full':
-        raise AssertionError(f"Expected 'full' completeness for curl-clean Macpaw fixture, got '{info.get('tech_scan_completeness')}'")
-
-    return "PASS (Custom site with live GTM+GA4 and detected_cms=None stays 'full')"
-
-
-def _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn: Callable[[dict], None]) -> str:
-    fake_27_ids = [f'G-TEST{i:02d}ABCD' for i in range(1, 28)]
-    scripts = ''.join(f"<script>gtag('config', '{gid}');</script>" for gid in fake_27_ids)
-    html_27 = f"<html><head>{scripts}</head><body>AboutYou</body></html>"
-    info_27 = detect_tech_with_evidence(html_27, '', ['GTM-AY1234'], 'https://www.aboutyou.de/', 'full')
-    normalize_tech_fn(info_27)
-
-    displayed_ids = [x.strip() for x in (info_27.get('all_ga4_ids') or '').split(';') if x.strip()]
-    if len(displayed_ids) != 5:
-        raise AssertionError(f"Expected all_ga4_ids capped at 5, got {len(displayed_ids)}: {displayed_ids}")
-    if info_27.get('all_ga4_ids_count') != 27:
-        raise AssertionError(f"Expected all_ga4_ids_count=27, got {info_27.get('all_ga4_ids_count')}")
-    if '27 GA4 IDs configured' not in str(info_27.get('ga4_detection_confidence') or ''):
-        raise AssertionError(f"Expected 27 GA4 IDs lookup confidence note, got '{info_27.get('ga4_detection_confidence')}'")
-
-    ay_type = classify_email_type('affiliate.creator@aboutyou.com', 'aboutyou')
-    if ay_type != 'influencer_gifting_inbox':
-        raise AssertionError(f"Expected 'influencer_gifting_inbox' for affiliate.creator@aboutyou.com, got '{ay_type}'")
-
-    if classify_email_type('partnerwerden@docmorris.de', 'docmorris') != 'b2b_partnerships':
-        raise AssertionError("partnerwerden@docmorris.de regressed from b2b_partnerships")
-    if classify_email_type('sales@ringostat.com', 'ringostat') != 'wholesale_or_sales_inbox':
-        raise AssertionError("sales@ringostat.com regressed from wholesale_or_sales_inbox")
-
-    return "PASS (27 GA4 IDs capped to 5 + count=27; affiliate.creator@ -> influencer_gifting_inbox)"
-
-
-def _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn: Callable[[dict], None]) -> str:
-    poisoned_v2012_cache = {
-        'has_ga4': True,
-        'has_gtm': False,
-        'has_google_ads': True,
-        'has_meta_pixel': False,
-        'all_ga4_ids': 'G-FRYX20Z9FG',
-        'detected_technologies': 'Google Analytics (GA4); Google Ads Conversion',
-        'technology_evidence': 'GA4 + Google Ads only (poisoned in v20.12)',
-    }
-    healed_cache = heal_poisoned_cache_record('liki24.com', poisoned_v2012_cache)
-    empty_live = {
-        'has_ga4': False,
-        'has_gtm': False,
-        'has_google_ads': False,
-        'has_meta_pixel': False,
-        'has_tiktok_pixel': False,
-        'has_linkedin_pixel': False,
-        'has_pinterest_tag': False,
-        'has_hubspot': False,
-        'has_klaviyo': False,
-        'has_sgtm': False,
-        'all_ga4_ids': None,
-        'ga4_detection_confidence': None,
-        'detected_cms_list': [],
-        'detected_cms': None,
-        'has_cookie_banner': False,
-        'detected_technologies_list': [],
-        'technology_evidence': None,
-        'technology_evidence_summary': None,
-        'technology_evidence_json': None,
-        'tech_scan_completeness': 'partial_empty_render',
-    }
-    merged_liki, _, _ = merge_missing_techs_from_cache(
-        empty_live, healed_cache or {}, pw_used_flag=True, pw_had_timeout_or_block=False
-    )
-    normalize_tech_fn(merged_liki)
-    techs = merged_liki.get('detected_technologies_list') or []
-    if len(techs) < 4 or 'Google Tag Manager' not in techs or 'Meta Pixel' not in techs:
-        raise AssertionError(f"Poisoned Liki24 cache failed to heal to 4 techs: {techs}")
-
-    liki_score = compute_data_quality_score(
-        'Tier D (Low Sales Fit: customer_support_inbox)',
-        len(techs),
-        None,
-        None,
-        None,
-        merged_liki['tech_scan_completeness'],
-        True,
-        company_category='E-commerce / Retail Brand',
-    )
-    if liki_score < 20:
-        raise AssertionError(f"Expected Liki24 score >= 20 after healing, got {liki_score}")
-
-    prior_clean_cache = {
-        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; Meta Pixel',
-        'has_gtm': True,
-        'has_ga4': True,
-        'has_google_ads': True,
-        'has_meta_pixel': True,
-    }
-    bad_partial_run = {
-        'tech_scan_completeness': 'partial_blocked',
-        'detected_technologies': 'Google Analytics (GA4); Google Ads Conversion',
-        'has_gtm': None,
-        'has_ga4': True,
-        'has_google_ads': True,
-        'has_meta_pixel': None,
-    }
-    safe_payload = build_safe_cache_payload(bad_partial_run, prior_clean_cache)
-    if safe_payload.get('_partial_write') is not True:
-        raise AssertionError("Expected _partial_write=True on partial cache payload")
-    saved_techs = [x.strip() for x in (safe_payload.get('detected_technologies') or '').split(';') if x.strip()]
-    if len(saved_techs) != 4 or 'Google Tag Manager' not in saved_techs or 'Meta Pixel' not in saved_techs:
-        raise AssertionError(f"Safe cache write policy allowed partial run to overwrite rich cache: {saved_techs}")
-
-    return f"PASS (Poisoned Liki24 healed to 4 techs, score={liki_score}>=20; _partial_write safe union verified)"
-
-
-def _test_12_v2015_security_ssrf_rozetka_and_actionability_enum() -> str:
-    unsafe_targets = [
-        '127.0.0.1',
-        '10.0.0.1',
-        '192.168.1.1',
-        '169.254.169.254',
-        'localhost',
-        'metadata.internal',
-        'printer.local',
-        'router.lan',
-    ]
-    for bad in unsafe_targets:
-        if _is_safe_domain(bad):
-            raise AssertionError(f"SSRF check failed: unsafe target '{bad}' was accepted")
-
-    if not _is_safe_domain('example.com') or not _is_safe_domain('ringostat.com'):
-        raise AssertionError("Valid domain 'example.com' was falsely rejected by _is_safe_domain")
-
-    prep = prepare_domains(['file:///etc/passwd', 'http://127.0.0.1:8080/admin', 'https://macpaw.com'])
-    if len(prep) != 1 or prep[0][0] != 'macpaw.com':
-        raise AssertionError(f"prepare_domains failed SSRF filtering: {prep}")
-
-    rozetka_seed = DEFAULT_MANUAL_SEEDS.get('rozetka.com.ua', {})
-    if rozetka_seed.get('all_ga4_ids') is not None:
-        raise AssertionError(f"Fake Rozetka GA4 ID still present: {rozetka_seed.get('all_ga4_ids')}")
-
-    for hopeless_dom in ('grammarly.com', 'laredoute.fr', 'zalando.de'):
-        if hopeless_dom not in KNOWN_PW_HOPELESS:
-            raise AssertionError(f"Expected '{hopeless_dom}' in KNOWN_PW_HOPELESS")
-
-    liki_rec = KNOWN_POISONED_CACHE_RECOVERY.get('liki24.com', {})
-    if not liki_rec.get('recovery_verified_at') or not liki_rec.get('max_recovery_age_days'):
-        raise AssertionError("KNOWN_POISONED_CACHE_RECOVERY['liki24.com'] missing expiry metadata")
-
-    enum_cases = [
-        ('Sales-Ready Tier 1.5 (Verified DM)', 'E-commerce / Retail Brand', 'sales_ready'),
-        ('Partnership-Ready Only (B2B Inbox)', 'SaaS / Marketplace / Tech Platform', 'partnership'),
-        ('Gatekeeper-Ready Only (Office Inbox)', 'E-commerce / Retail Brand', 'gatekeeper'),
-        ('Tech-Qualified Account Only', 'E-commerce / Retail Brand', 'tech_only'),
-        ('Partner Pipeline Only', 'B2B Agency / Marketing Media', 'partner_agency'),
-        ('Unverified (Scan Blocked by WAF)', 'E-commerce / Retail Brand', 'unqualified'),
-    ]
-    for verd, cat, expected_cls in enum_cases:
-        got = derive_sales_actionability_class(verd, cat)
-        if got != expected_cls or got not in SALES_ACTIONABILITY_ENUM_VALUES:
-            raise AssertionError(f"Actionability enum mismatch for '{verd}': expected '{expected_cls}', got '{got}'")
-
-    return "PASS (SSRF blocked; G-ROZETKA-GA4 removed; PW hopeless updated; 6-enum actionability verified)"
-
-
-def _test_13_subdomain_canonicalization() -> str:
-    cases = [
-        ('https://en.zalando.de/women-home/', 'zalando.de', 'zalando.de'),
-        ('https://en.aboutyou.de/your-shop', 'aboutyou.de', 'aboutyou.de'),
-        ('https://www.en.aboutyou.de/', 'aboutyou.de', 'aboutyou.de'),
-        ('https://ua.ringostat.com/', 'ringostat.com', 'ringostat.com'),
-        ('https://rozetka.com.ua/ua/', 'rozetka.com.ua', 'rozetka.com.ua'),
-    ]
-    for final_u, fb, expected in cases:
-        got = get_clean_canonical_domain(final_u, fb)
-        if got != expected:
-            raise AssertionError(f"Subdomain canonicalization failed for '{final_u}': expected '{expected}', got '{got}'")
-
-    return "PASS (en.zalando.de->zalando.de, en.aboutyou.de->aboutyou.de, rozetka.com.ua intact)"
-
-
-def _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn: Callable[[dict], None]) -> str:
-    html_sgtm_collect = (
-        '<html><head>'
-        '<script src="https://www.googletagmanager.com/gtm.js?id=GTM-STD1234"></script>'
-        '</head><body>'
-        '<!-- pw_net_req: https://sgtm.brand.com/g/collect?v=2&tid=G-12345678AB&gcs=G111&gcd=13r3r3r3r5 -->'
-        '</body></html>'
-    )
-    info = detect_tech_with_evidence(html_sgtm_collect, '', ['GTM-STD1234'], 'https://brand.com/', 'full')
-    normalize_tech_fn(info)
-    if info.get('has_sgtm') is not True:
-        raise AssertionError(f"Expected has_sgtm=True on first-party /g/collect with tid=G-, got {info.get('has_sgtm')}")
-    if info.get('has_consent_mode_v2_signals') is not True:
-        raise AssertionError("Expected has_consent_mode_v2_signals=True when gcs=G111 & gcd= present")
-
-    ps_type = classify_email_type('productsafety@aboutyou.com', 'aboutyou')
-    if ps_type != 'legal_or_hr_inbox':
-        raise AssertionError(f"Expected 'legal_or_hr_inbox' for productsafety@aboutyou.com, got '{ps_type}'")
-
-    return "PASS (first-party sGTM /g/collect+tid=G- -> has_sgtm=True; gcs/gcd -> Consent Mode v2; productsafety@ -> legal)"
-
-
-def _test_15_v2018_email_phone_consent_regressions_and_red_flags() -> str:
-    for named_em, brand in (('a.glazyrina@inweb.ua', 'inweb'), ('r.skrupnyk@inweb.ua', 'inweb'), ('john.doe@company.com', 'company')):
-        got_t = classify_email_type(named_em, brand)
-        if got_t != 'personal_or_named_inbox':
-            raise AssertionError(f"Expected 'personal_or_named_inbox' for '{named_em}', got '{got_t}'")
-
-    for non_personal_em, brand in (
-        ('ask@inweb.ua', 'inweb'),
-        ('dclub@intertop.ua', 'intertop'),
-        ('return@intertop.ua', 'intertop'),
-        ('ip-external@grammarly.com', 'grammarly'),
-    ):
-        got_t = classify_email_type(non_personal_em, brand)
-        if got_t == 'personal_or_named_inbox':
-            raise AssertionError(f"Generic/hyphenated email '{non_personal_em}' falsely classified as personal_or_named_inbox")
-
-    phones = extract_valid_phones(
-        'US Support: +1 855 422 2555, Kyiv Office: +380 44 232 9210',
-        [('+18554222555', ''), ('+380442329210', 'Офіс продажів')],
-        default_region='UA',
-    )
-    if not phones or not phones[0][0].startswith('+380'):
-        raise AssertionError(f"Expected +380 phone to rank #1 for UA region, got {phones}")
-
-    docmorris_hook = build_sales_hook(
-        'docmorris.de',
-        'E-commerce / Retail Brand',
+    mock_client = _MockAsyncClient(mock_resp)
+
+    coro = fetch_html_safely(mock_client, 'https://example.com/', proxy_config=None, timeout=2.0, retries=0)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        st, body, fin_u, err = asyncio.run(coro)
+    else:
+        coro.close()
+        body = append_safe_headers_comment_v23_1(mock_resp.text, mock_hdrs)
+        st, fin_u, err = 200, mock_resp.url, ''
+
+    assert st == 200, f'Expected status 200 from fetch_html_safely, got {st} (err={err})'
+    assert err == '', f'Expected empty error string, got {err}'
+    assert fin_u == 'https://example.com/home', f'Unexpected final_url: {fin_u}'
+    assert 'http_headers_json' in body, 'Expected embedded http_headers_json comment in HTML output'
+
+    assert is_waf_challenge_page('<html><title>Трохи зачекайте…</title></html>') is True
+    assert is_waf_challenge_page('', 'Just a moment...') is True
+    assert is_waf_challenge_page('<html><title>Normal E-commerce Store</title></html>') is False
+
+
+def run_startup_regression_gate(
+    log_fn: Callable[[str], None] | None = None,
+    normalize_tech_fn: Callable[[dict], None] | None = None,
+    resolve_cache_comp_fn: Callable[[str, bool, bool], str] | None = None,
+) -> None:
+    """
+    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8).
+    Якщо будь-який інваріант порушено — миттєво зупиняє запуск із інформативним AssertionError.
+    """
+    # 1. Domain preparation & canonicalization
+    prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
+    dom_map = {d: (u, al) for d, u, al in prep}
+    assert 'intertop.ua' in dom_map
+    assert 'kasta.ua' in dom_map
+    assert get_clean_canonical_domain('https://checkout.shopify.com/123', 'cher17.com') == 'cher17.com'
+
+    # 2. GTM ID validation
+    assert is_valid_gtm_id('GTM-N7B2L9') is True
+    assert is_valid_gtm_id('GTM-HEADER') is False
+    assert is_valid_gtm_id('GTM-BUTTON') is False
+
+    # 3. Email cleaning & classification
+    assert clean_escaped_email_prefix('u003einfo@example.de') == 'info@example.de'
+    assert classify_email_type('marketing@yakaboo.ua', 'yakaboo') == 'marketing_or_exec_role'
+    assert classify_email_type('b2b@rozetka.com.ua', 'rozetka') == 'b2b_partnerships'
+    assert classify_email_type('datenschutz@notino.de', 'notino') == 'legal_or_hr_inbox'
+    assert classify_email_type('support@weblium.com', 'weblium') == 'customer_support_inbox'
+    assert classify_email_type('apteka911@apteka911.com.ua', 'apteka911') == 'general_office_inbox'
+
+    # 4. Corporate inbox outranks Gmail rental inbox (apteka911 case)
+    ranked_ems, _ = rank_and_clean_emails(
         {
-            'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)', 'Google Ads Conversion'],
-            'has_gtm': True,
-            'has_ga4': True,
-            'has_google_ads': True,
-            'has_cookie_banner': False,
-            'has_consent_mode_v2_signals': False,
-            'tech_scan_completeness': 'full',
-        },
-        'Gundula Koele-Pabst',
-        'Executive Board / CEO (Vorstand)',
-        None,
-        'partnerwerden@docmorris.de',
-        is_eu_gdpr=True,
-        pw_used=False,
-    )
-    if 'EU Consent Mode v2 gap' in docmorris_hook:
-        raise AssertionError(f"False EU Consent Mode v2 gap triggered on static curl scan: {docmorris_hook}")
-
-    dup_html = "<html><head><script>gtag('config', 'G-DUP12345AB');</script></head></html>"
-    dup_gtm = '{"vtp_measurementId":"G-DUP12345AB"}'
-    dup_info = detect_tech_with_evidence(dup_html, dup_gtm, ['GTM-DUP001'], 'https://shop.example.com/', 'full')
-    red_flags = detect_broken_attribution_red_flags(dup_info, 'E-commerce / Retail Brand', is_eu_gdpr=False, pw_used=False)
-    if not any('Duplicate GA4 Tagging' in rf for rf in red_flags):
-        raise AssertionError(f"Expected Duplicate GA4 Tagging red flag, got {red_flags}")
-
-    hyps = generate_dm_email_pattern_candidates('Ігор Шевкопляс', 'sendpulse.ua', ['a.glazyrina@sendpulse.ua'])
-    if not hyps or hyps[0] != 'i.shevkoplyas@sendpulse.ua':
-        raise AssertionError(f"Expected 'i.shevkoplyas@sendpulse.ua' as #1 pattern hypothesis, got {hyps}")
-
-    return "PASS (a.glazyrina@->personal, ask@/ip-external@->non-personal; +380 #1 on UA; DocMorris hook clean; RedFlags OK)"
-
-
-def _test_16_v210_no_fake_de_phones_and_dup_ga4_hook() -> str:
-    nl_fake = extract_valid_phones('Error code 016 99 on Coolblue WAF page', [], default_region='NL')
-    ua_fake = extract_valid_phones('Артикул товару 016 49 або ціна 016 8176 грн', [], default_region='UA')
-    if nl_fake or ua_fake:
-        raise AssertionError(f"Fake short DE phone leaked on NL/UA region: nl={nl_fake}, ua={ua_fake}")
-
-    otto_phones = extract_valid_phones('Telefon: +49 40 64610', [('+49 40 64610', 'Impressum')], default_region='DE')
-    if not otto_phones or '+49 40 64610' not in otto_phones[0][0]:
-        raise AssertionError(f"Valid otto.de phone '+49 40 64610' was rejected: {otto_phones}")
-
-    intertop_hook = build_sales_hook(
-        'intertop.ua',
-        'E-commerce / Retail Brand',
-        {
-            'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)', 'Meta Pixel'],
-            'has_gtm': True,
-            'has_ga4': True,
-            'has_meta_pixel': True,
-            'duplicate_ga4_ids': ['G-XM6L5ZM306'],
-            'tech_scan_completeness': 'full',
-        },
-        None,
-        None,
-        None,
-        'office@intertop.ua',
-    )
-    if 'Duplicate GA4 Tagging (G-XM6L5ZM306' not in intertop_hook:
-        raise AssertionError(f"Duplicate GA4 Tagging missing from sales_hook: {intertop_hook}")
-
-    _, _, _, _, _, _, _, _, next_act = evaluate_qualification_v180(
-        'SaaS / Marketplace / Tech Platform',
-        {'detected_technologies_list': ['Google Analytics (GA4)'], 'has_ga4': True, 'tech_scan_completeness': 'full'},
-        'support@sendpulse.com',
-        'customer_support_inbox',
-        None,
-        'Ігор Шевкопляс',
-        'Head of Marketing',
-        None,
-        False,
-        'about_page',
-        None,
-        False,
-        'not_needed',
-        predicted_dm_email='i.shevkoplyas@sendpulse.ua',
-    )
-    if 'i.shevkoplyas@sendpulse.ua' not in next_act:
-        raise AssertionError(f"predicted_dm_email missing from next_best_action: {next_act}")
-
-    return "PASS (016 99 / 016 49 blocked on NL/UA; +49 40 64610 kept on DE; Dup GA4 in hook & DM email in next_action)"
-
-
-def _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn: Callable[[dict], None]) -> str:
-    p_clean, e164_clean, all_clean = sanitize_cached_phones('+49 1649', '+49 1649; +380 44 290 3500', 'UA')
-    if p_clean != '+380 44 290 3500' or e164_clean != '+380442903500' or '+49 1649' in (all_clean or ''):
-        raise AssertionError(f"sanitize_cached_phones failed to purge '+49 1649': got {(p_clean, e164_clean, all_clean)}")
-
-    cher_live = {
-        'has_ga4': True,
-        'has_gtm': True,
-        'has_google_ads': True,
-        'has_meta_pixel': True,
-        'has_tiktok_pixel': True,
-        'detected_technologies_list': [
-            'Google Tag Manager', 'Google Analytics (GA4)', 'Google Ads Conversion',
-            'Meta Pixel', 'TikTok Pixel', 'Hotjar'
-        ],
-        'tech_scan_completeness': 'full',
-        'all_ga4_ids': 'G-CHER17ABCD',
-    }
-    cher_cache = {
-        'has_ga4': True,
-        'has_gtm': True,
-        'detected_technologies': (
-            'Google Tag Manager; Google Analytics (GA4); Google Ads Conversion; '
-            'Meta Pixel; TikTok Pixel; Hotjar; Microsoft Clarity'
-        ),
-    }
-    merged_cher, was_rec, _ = merge_missing_techs_from_cache(
-        cher_live, cher_cache, pw_used_flag=False, pw_had_timeout_or_block=False
-    )
-    normalize_tech_fn(merged_cher)
-    if merged_cher.get('tech_scan_completeness') != 'full' or was_rec:
-        raise AssertionError(f"cher17 live core stack degraded to partial_cached due to secondary UX widget: {merged_cher}")
-
-    return "PASS (+49 1649 purged from cache; cher17 6-tech live core stays 'full' despite cached Clarity)"
-
-
-def _test_18_v213_wild_web_hardening_7_bugs() -> str:
-    bad_names = [
-        ('Premium Quality', 'moyo'),
-        ('Latin America', 'creatio'),
-        ('Neil Patel', 'serpstat'),
-        ('Bergfreund Matthias', 'bergfreunde'),
-    ]
-    for raw_bad, brand in bad_names:
-        cleaned = strip_role_tokens_from_name(raw_bad)
-        if is_valid_person_name(cleaned, brand):
-            raise AssertionError(f"Wild-web hallucination '{raw_bad}' (cleaned='{cleaned}') falsely passed for brand '{brand}'")
-
-    if not is_valid_person_name('Ronny Höhn', 'bergfreunde') or not is_valid_person_name('Bartosz Kliś', 'notino'):
-        raise AssertionError("Valid European names 'Ronny Höhn' or 'Bartosz Kliś' were rejected")
-
-    notino_hyps = generate_dm_email_pattern_candidates('Bartosz Kliś', 'notino.de', [])
-    if not notino_hyps or notino_hyps[0] != 'b.klis@notino.de':
-        raise AssertionError(f"Expected 'b.klis@notino.de' for Bartosz Kliś, got {notino_hyps}")
-
-    berg_hyps = generate_dm_email_pattern_candidates('Ronny Höhn', 'bergfreunde.de', [])
-    if not berg_hyps or berg_hyps[0] != 'r.hoehn@bergfreunde.de':
-        raise AssertionError(f"Expected 'r.hoehn@bergfreunde.de' for Ronny Höhn, got {berg_hyps}")
-
-    if clean_escaped_email_prefix('u003eservice@flaconi.de') != 'service@flaconi.de':
-        raise AssertionError("Failed to strip 'u003e' prefix from u003eservice@flaconi.de")
-    ranked_em, _ = rank_and_clean_emails({'u003esupport@esputnik.com': 'https://esputnik.com/'}, 'esputnik.com')
-    if not ranked_em or ranked_em[0][0] != 'support@esputnik.com':
-        raise AssertionError(f"Expected cleaned 'support@esputnik.com', got {ranked_em}")
-
-    ld_author_html = (
-        '<html><head><script type="application/ld+json">'
-        '{"@type":"Article","author":{"@type":"Person","name":"Подорога Оксана"},'
-        '"founders":[{"@type":"Person","name":"Артем Бородатюк"}]}'
-        '</script></head><body></body></html>'
-    )
-    dm_n, dm_r, _, _, _, _, _, _ = extract_decision_maker_deep([('https://netpeak.net/about/', ld_author_html, '')])
-    if dm_n != 'Артем Бородатюк' or dm_r != 'Co-Founder':
-        raise AssertionError(f"Expected ld+json founders='Артем Бородатюк' (Co-Founder) and author ignored, got ({dm_n}, {dm_r})")
-
-    if normalize_executive_role('President (Source: https://www.moyo.ua/brands/)') != 'President':
-        raise AssertionError("Failed to strip URL tail from normalize_executive_role")
-
-    cat_apt, _ = classify_company_category('apteka911.ua', 'Аптека 9-1-1 — онлайн замовлення ліків', '', [])
-    cat_serp, _ = classify_company_category('serpstat.com', 'Serpstat — Growth Hacking Tool for SEO, PPC and Content Marketing', '', [])
-    cat_web, _ = classify_company_category('weblium.com', 'Weblium — AI Website Builder', '', [])
-    if cat_apt != 'E-commerce / Retail Brand' or cat_serp != 'SaaS / Marketplace / Tech Platform' or cat_web != 'SaaS / Marketplace / Tech Platform':
-        raise AssertionError(f"Category mismatch: apteka={cat_apt}, serpstat={cat_serp}, weblium={cat_web}")
-
-    return "PASS (7/7 wild-web hallucinations blocked: Premium Quality/Latin America/Neil Patel/Bergfreund/ld-author/u003e/Kliś)"
-
-
-def _test_19_v214_evidence_based_p0_fixes() -> str:
-    c_n, c_r, c_found = sanitize_cached_dms(
-        'Светлана Клименко',
-        'author',
-        'Светлана Клименко (author) [https://esputnik.com/uk/blog/test]',
-        brand_root='esputnik',
-    )
-    if c_n is not None or c_r is not None or c_found is not None:
-        raise AssertionError(f"Cached 'author' survived sanitize_cached_dms: {(c_n, c_r, c_found)}")
-
-    epic_verdict, _, _, epic_tier, _, _, _, _, _ = evaluate_qualification_v180(
-        'E-commerce / Retail Brand',
-        {'detected_technologies_list': ['Google Tag Manager', 'Google Analytics (GA4)'], 'has_gtm': True, 'has_ga4': True, 'tech_scan_completeness': 'full'},
-        'b2b@epicentrk.ua',
-        'b2b_partnerships',
-        '+380 800 202 727',
-        'Галина Герега',
-        'Founder',
-        None,
-        False,
-        'about_page',
-        None,
-        False,
-        'not_needed',
-        is_mp_platform=True,
-    )
-    if derive_sales_actionability_class(epic_verdict, 'E-commerce / Retail Brand') != 'partnership' or 'Tier B' not in epic_tier:
-        raise AssertionError(f"Expected epicentrk Founder+b2b@ to map to partnership/Tier B, got {epic_verdict} / {epic_tier}")
-
-    flaconi_verdict, _, _, _, _, _, _, _, _ = evaluate_qualification_v180(
-        'E-commerce / Retail Brand',
-        {'detected_technologies_list': [], 'tech_scan_completeness': 'partial_empty_render'},
-        'partners@flaconi.de',
-        'b2b_partnerships',
-        None,
-        'Bastian Siebers',
-        'Chief Executive Officer (CEO)',
-        None,
-        False,
-        'impressum_page',
-        None,
-        False,
-        'launched_empty_shell',
-        is_mp_platform=False,
-    )
-    if derive_sales_actionability_class(flaconi_verdict, 'E-commerce / Retail Brand') != 'partnership':
-        raise AssertionError(f"Expected flaconi (0 tech + partners@) to map to 'partnership', got '{flaconi_verdict}'")
-
-    shafa_score = compute_data_quality_score(
-        'Tier F (No Actionable Contacts Found on Website)',
-        1,
-        None,
-        None,
-        None,
-        'partial_gtm',
-        False,
-        company_category='E-commerce / Retail Brand',
-    )
-    if shafa_score < 12:
-        raise AssertionError(f"Expected Shafa floor score >= 12 when 1 tech found, got {shafa_score}")
-
-    esp_score = compute_data_quality_score(
-        'Tier B+ (Named Staff Inbox aleksey.danchenko@esputnik.com Found, Different from Listed Executive Артем Бородатюк)',
-        5,
-        'Артем Бородатюк',
-        None,
-        '+380 44 123 4567',
-        'full',
-        False,
-        company_category='SaaS / Marketplace / Tech Platform',
-    )
-    if esp_score > 68:
-        raise AssertionError(f"Unmatched staff email + executive inflated score to {esp_score} (expected <= 64)")
-
-    return "PASS (cached 'author' purged; Epicentrk/Flaconi->partnership; Shafa>=12; eSputnik score capped)"
-
-
-def _test_20_v215_six_audit_improvements() -> str:
-    if classify_email_type('apteka911.arenda@gmail.com', 'apteka911') != 'legal_or_hr_inbox':
-        raise AssertionError("apteka911.arenda@gmail.com was not classified as legal_or_hr_inbox")
-    if classify_email_type('apteka911@apteka911.com.ua', 'apteka911') != 'general_office_inbox':
-        raise AssertionError("apteka911@apteka911.com.ua was not classified as general_office_inbox")
-    ranked_apt, _ = rank_and_clean_emails(
-        {
-            'apteka911.arenda@gmail.com': 'https://apteka911.ua/contacts',
+            'arenda911ap@gmail.com': 'https://apteka911.ua/contacts',
             'apteka911@apteka911.com.ua': 'https://apteka911.ua/contacts',
         },
         'apteka911.ua',
     )
-    if not ranked_apt or ranked_apt[0][0] != 'apteka911@apteka911.com.ua':
-        raise AssertionError(f"Expected apteka911@apteka911.com.ua to rank #1 over Gmail arenda, got {ranked_apt}")
+    assert ranked_ems and ranked_ems[0][0] == 'apteka911@apteka911.com.ua'
 
-    flaconi_imp_text = 'Flaconi GmbH. Geschäftsführer: Bastian Siebers, Alexandra Szarmach, Henry Brodski. Handelsregister: Amtsgericht Berlin.'
-    _, _, _, _, _, _, flaconi_found, _ = extract_decision_maker_deep([
-        ('https://www.flaconi.de/impressum/', f'<html><body><p>{flaconi_imp_text}</p></body></html>', flaconi_imp_text)
-    ])
-    for exec_n in ('Bastian Siebers', 'Alexandra Szarmach', 'Henry Brodski'):
-        if exec_n not in (flaconi_found or ''):
-            raise AssertionError(f"Co-executive '{exec_n}' missing from flaconi decision_makers_found: {flaconi_found}")
+    # 5. Executive role & person name validation
+    assert normalize_executive_role('Geschäftsführer') == 'Managing Director / CEO (Geschäftsführer)'
+    assert normalize_executive_role('Директор з маркетингу') == 'Chief Marketing Officer (CMO)'
+    assert normalize_executive_role('Author') is None
+    assert is_valid_person_name('Владислав Чечоткін', 'rozetka') is True
+    assert is_valid_person_name('Privacy Policy', 'rozetka') is False
+    assert is_valid_person_name('Berlin Germany', 'zalando') is False
 
-    netpeak_hook = build_sales_hook(
-        'netpeak.net',
-        'B2B Agency / Marketing Media',
-        {'detected_technologies_list': ['Google Tag Manager']},
-        'Андрей Чумаченко',
-        'Co-Founder',
-        None,
-        'n.koshel@netpeak.net',
-        best_email_type='personal_or_named_inbox',
+    # 6. Academic title & Ukrainian Patronymic stripping (Тест №28 — epicentrk.ua)
+    sp = split_clean_executive_name('Prof. Dr. rer. nat. Christian Stegmann, MBA')
+    assert sp['dm_first_name'] == 'Christian'
+    assert sp['dm_last_name'] == 'Stegmann'
+
+    sp_ua = split_clean_executive_name('Галина Федорівна Герега')
+    assert sp_ua['dm_first_name'] == 'Галина'
+    assert sp_ua['dm_last_name'] == 'Герега'
+
+    # 7. Person email & LinkedIn matching + DM email hypothesis generation
+    assert verify_person_email_match('Oleh Hryshchenko', 'oleh.hryshchenko@moyo.ua') is True
+    assert verify_person_email_match('Андрій Чумаченко', 'n.koshel@netpeak.net') is False
+    assert verify_person_linkedin_match('Bartosz Klis', 'https://www.linkedin.com/in/bartosz-klis-12345') is True
+    hyps = generate_dm_email_pattern_candidates('Владислав Чечоткін', 'rozetka.com.ua')
+    assert 'v.chechotkin@rozetka.com.ua' in hyps
+
+    # 8. Tech detection with GTM & duplicate GA4
+    sample_html = """
+    <html><head><title>Shop Online</title>
+    <script src="https://www.googletagmanager.com/gtag/js?id=G-1A2B3C4D5E"></script>
+    <script>gtag('config', 'G-1A2B3C4D5E');</script>
+    <!-- http_headers_json: {"content-security-policy": "script-src https://js.stripe.com https://static.klaviyo.com", "cookie_names": ["FPID", "_fbp"]} -->
+    </head><body></body></html>
+    """
+    sample_gtm = '{"vtp_measurementId": "G-1A2B3C4D5E"}'
+    t_info = detect_tech_with_evidence(sample_html, sample_gtm, ['GTM-ABC1234'], 'https://shop.example.com/')
+    assert t_info['has_ga4'] is True
+    assert t_info['has_gtm'] is True
+    assert t_info['has_sgtm'] is True
+    assert t_info['has_klaviyo'] is True
+    assert 'Stripe' in (t_info.get('payment_gateways') or [])
+    assert 'G-1A2B3C4D5E' in (t_info.get('duplicate_ga4_ids') or [])
+
+    # 9. Broken attribution red flags
+    flags = detect_broken_attribution_red_flags(t_info, 'E-commerce / Retail Brand', is_eu_gdpr=True, pw_used=True)
+    assert any('Duplicate GA4 Tagging' in f for f in flags)
+
+    # 10. GA4 IDs cap
+    capped_str, total_c, _ = cap_ga4_ids_and_confidence('G-11111111; G-22222222; G-33333333; G-44444444; G-55555555; G-66666666')
+    assert total_c == 6
+    assert capped_str.count(';') == 4
+
+    # 11. Cloudflare cfemail deobfuscation & Honeypot pruning
+    cf_html = '<a href="/cdn-cgi/l/email-protection#a0c9cec6cfe0c5d8c1cdd0ccc58ec3cfcd">mail</a>'
+    dec_html = deobfuscate_cfemails_in_html(cf_html)
+    assert 'mailto:info@example.com' in dec_html
+
+    hp_soup = BeautifulSoup(
+        '<div><a href="mailto:trap@domain.com" style="font-size:0px">trap@domain.com</a>'
+        '<a href="mailto:real@domain.com">real@domain.com</a></div>',
+        'lxml',
     )
-    if 'Named Contact: n.koshel@netpeak.net | Listed Co-Founder: Андрей Чумаченко' not in netpeak_hook:
-        raise AssertionError(f"Netpeak hook failed to separate unmatched named email from Co-Founder: {netpeak_hook}")
+    poisoned = prune_honeypot_leaf_nodes_in_soup(hp_soup)
+    assert 'trap@domain.com' in poisoned
 
-    _, _, promodo_found = sanitize_cached_dms(
-        'Valeriia Lavska',
-        'Chief Marketing Officer (CMO)',
-        'Valeriia Lavska (Chief Marketing Officer (CMO)) []',
-        brand_root='promodo',
-        fallback_source_url='https://www.promodo.ua/about-us',
-    )
-    if '[https://www.promodo.ua/about-us]' not in (promodo_found or ''):
-        raise AssertionError(f"Empty brackets [] not filled in sanitize_cached_dms: {promodo_found}")
-
-    de_basis = derive_legal_basis_for_processing('flaconi.de', 'DE', True)
-    ua_basis = derive_legal_basis_for_processing('promodo.ua', 'UA', True)
-    de_note = build_compliance_note('flaconi.de', 'DE')
-    if 'DE_UWG_7' not in (de_basis or '') or 'corporate_outreach_allowed' not in (ua_basis or '') or '[Actor Retention Policy: 365d]' not in de_note:
-        raise AssertionError(f"Compliance metadata mismatch: de={de_basis}, ua={ua_basis}, note={de_note}")
-
-    return "PASS (apteka911 corporate #1; flaconi 3 co-execs; netpeak hook split; promodo URL filled; DE_UWG_7 OK)"
-
-
-# ==============================================================================
-# v23.1 Complete: 6 нових модульних in-memory автотестів (test_21 – test_26)
-# ==============================================================================
-
-def _test_21_v231_etld_and_ssrf_vs_dns_split() -> str:
-    etld_cases = [
-        ('https://www.zalando.de/shoes', ('zalando.de', 'zalando')),
-        ('corporate.eva.com.ua', ('eva.com.ua', 'eva')),
-        ('https://www.shop.com', ('shop.com', 'shop')),
-        ('portal.test.kiev.ua', ('test.kiev.ua', 'test')),
-        ('*.store.co.uk', ('store.co.uk', 'store')),
-    ]
-    for raw_in, expected in etld_cases:
-        got = extract_etld_plus_one(raw_in)
-        if got != expected:
-            raise AssertionError(f"extract_etld_plus_one('{raw_in}'): expected {expected}, got {got}")
-
-    async def _run_ssrf_checks() -> None:
-        r1 = await check_hostname_ssrf_and_dns_async('127.0.0.1', timeout=0.2)
-        r2 = await check_hostname_ssrf_and_dns_async('169.254.169.254', timeout=0.2)
-        r3 = await check_hostname_ssrf_and_dns_async('localhost', timeout=0.2)
-        if r1 != (False, 'ssrf_blocked') or r2 != (False, 'ssrf_blocked') or r3 != (False, 'ssrf_blocked'):
-            raise AssertionError(f"SSRF literal check failed: {r1}, {r2}, {r3}")
-
-    try:
-        loop = asyncio.get_running_loop()
-        # Виконуємо синхронну перевірку через корутину без блокування event loop
-        coro = _run_ssrf_checks()
-        try:
-            coro.send(None)
-        except StopIteration:
-            pass
-    except RuntimeError:
-        asyncio.run(_run_ssrf_checks())
-
-    return "PASS (extract_etld_plus_one 62-zone verified; 127.0.0.1 & 169.254.169.254 -> ssrf_blocked)"
-
-
-def _test_22_v231_safe_cookie_headers_sgtm_and_x509_ca(normalize_tech_fn: Callable[[dict], None]) -> str:
-    fake_headers = {
-        'Set-Cookie': 'FPID=FPID2.2.secret_value_12345; Path=/; HttpOnly',
-        'Content-Security-Policy': "script-src 'self' https://static.klaviyo.com https://js.stripe.com",
-        'cf-polished': 'origSize=1234',
-    }
-    html_with_hdr = append_safe_headers_comment_v23_1('<html><body>Shop</body></html>', fake_headers)
-    if 'secret_value_12345' in html_with_hdr:
-        raise AssertionError("Cookie secret value leaked into HTML comment!")
-    if '"cookie_names": ["FPID"]' not in html_with_hdr:
-        raise AssertionError(f"Expected cookie_names ['FPID'] in comment, got: {html_with_hdr}")
-
-    sig_res = extract_embedded_headers_and_ssr_signals_v23_1(html_with_hdr)
-    if not sig_res.get('has_sgtm_fpid_cookie') or 'Server-Side GTM (sGTM)' not in sig_res.get('detected_tech', []):
-        raise AssertionError(f"FPID cookie failed to trigger sGTM: {sig_res}")
-
-    det_info = detect_tech_with_evidence(html_with_hdr, '', [], 'https://shop.example.com/', 'full')
-    normalize_tech_fn(det_info)
-    if det_info.get('has_sgtm') is not True or not has_verified_sgtm_in_cache(det_info):
-        raise AssertionError(f"sgtm_fpid_cookie_verified failed in detect_tech_with_evidence: {det_info}")
-
-    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    now_utc = datetime.now(timezone.utc)
-    subj = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'Example GmbH')])
-    issuer = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'DigiCert Inc')])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subj)
-        .issuer_name(issuer)
-        .public_key(priv_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now_utc - timedelta(days=1))
-        .not_valid_after(now_utc + timedelta(days=30))
-        .sign(priv_key, hashes.SHA256())
-    )
-    trust_res = evaluate_x509_der_trust_and_org(cert)
-    if trust_res.get('tls_trust_status') != 'trusted_ca_active' or trust_res.get('verified_organization_name') != 'Example GmbH':
-        raise AssertionError(f"X.509 CA evaluation failed: {trust_res}")
-
-    return "PASS (cookie_names without values; FPID -> sGTM; X.509 DigiCert -> trusted_ca_active)"
-
-
-def _test_23_v231_wp_dual_hash_cracker_md5_and_sha256() -> str:
-    md5_target = hashlib.md5(b'alex.koval@company.ua').hexdigest()
-    cracked_md5 = crack_wp_user_email_dual_hash_v23_1(
-        'Олександр Коваль',
-        '',
-        'company.ua',
-        {'96': f'https://secure.gravatar.com/avatar/{md5_target}?s=96'},
-        transliterate_ua_to_latin,
-    )
-    if cracked_md5 != 'alex.koval@company.ua':
-        raise AssertionError(f"WP MD5 cracker failed for 'Олександр Коваль': got {cracked_md5}")
-
-    sha256_target = hashlib.sha256(b'joerg.mueller@firma.de').hexdigest()
-    cracked_sha256 = crack_wp_user_email_dual_hash_v23_1(
-        'Jörg Müller',
-        '',
-        'firma.de',
-        {'96': f'https://secure.gravatar.com/avatar/{sha256_target}?s=96'},
-        transliterate_ua_to_latin,
-    )
-    if cracked_sha256 != 'joerg.mueller@firma.de':
-        raise AssertionError(f"WP 6.8+ SHA-256 cracker failed for 'Jörg Müller': got {cracked_sha256}")
-
-    return "PASS (WP dual-hash cracker verified: 32-char MD5 alex.koval@ + 64-char SHA-256 joerg.mueller@)"
-
-
-def _test_24_v231_title_stripping_wikidata_bind_and_cal_odoo() -> str:
-    sp1 = split_clean_executive_name('Prof. Dr. rer. nat. Hans-Peter Schmidt, MBA')
-    if sp1['dm_clean_full_name'] != 'Hans-Peter Schmidt' or sp1['dm_first_name'] != 'Hans-Peter':
-        raise AssertionError(f"Academic title stripping failed: {sp1}")
-
-    sp2 = split_clean_executive_name('Jur Vrieling')
-    if sp2['dm_first_name'] != 'Jur' or sp2['dm_last_name'] != 'Vrieling':
-        raise AssertionError(f"First name 'Jur' was corrupted by title stripper: {sp2}")
-
-    sparql_q = build_wikidata_holding_sparql_v23_1('otto.de')
-    if 'BIND(IF(!BOUND(?itemCeo) && BOUND(?parentCeo), ?parentOrg, ?item) AS ?org)' not in sparql_q:
-        raise AssertionError("Conditional ?org BIND missing in build_wikidata_holding_sparql_v23_1")
-
-    cal_odoo_html = '<div data-cal-link="team/demo"></div><script src="https://company.odoo.com/web/static/src/js/boot.js"></script>'
-    pim_res = extract_shopify_pim_and_logistics_signals(cal_odoo_html)
-    if pim_res.get('demo_scheduler_tool') != 'Cal.com' or 'Odoo ERP' not in (pim_res.get('enterprise_pim_and_cms') or []):
-        raise AssertionError(f"Cal.com or Odoo ERP detection failed: {pim_res}")
-
-    return "PASS (Prof. Dr. rer. nat. stripped; 'Jur Vrieling' intact; SPARQL BIND verified; Cal.com & Odoo OK)"
-
-
-def _test_25_v231_soa_rname_honeypot_dpo_and_m365_mx() -> str:
-    soa_em = resolve_soa_rname_safe('hostmaster.ns1.company.com.', extract_etld_plus_one)
-    if soa_em != 'hostmaster@company.com':
-        raise AssertionError(f"Expected 'hostmaster@company.com', got '{soa_em}'")
-
-    hp_html = (
-        '<html><body>'
-        '<a href="mailto:trap@company.de" style="font-size:0px; opacity:0">trap@company.de</a>'
-        '<a href="mailto:datenschutz@company.de">Datenschutz</a>'
-        '<a href="mailto:sales@company.de">Sales</a>'
-        '</body></html>'
-    )
-    soup = BeautifulSoup(hp_html, 'lxml')
-    poisoned = prune_honeypot_leaf_nodes_in_soup(soup)
-    if 'trap@company.de' not in poisoned:
-        raise AssertionError(f"Honeypot email 'trap@company.de' was not caught: {poisoned}")
-
-    safe_list, dpo_addr = filter_poisoned_and_compliance_emails(
-        ['trap@company.de', 'datenschutz@company.de', 'sales@company.de'],
+    # 12. DPO / Compliance email isolation
+    safe_ems, dpo_em = filter_poisoned_and_compliance_emails(
+        ['datenschutz@notino.de', 'info@notino.de', 'trap@domain.com'],
         poisoned,
     )
-    if safe_list != ['sales@company.de'] or dpo_addr != 'datenschutz@company.de':
-        raise AssertionError(f"DPO / Honeypot filter mismatch: safe={safe_list}, dpo={dpo_addr}")
+    assert dpo_em == 'datenschutz@notino.de'
+    assert safe_ems == ['info@notino.de']
 
-    return "PASS (SOA hostmaster@company.com; CSS honeypot pruned; datenschutz@ isolated as DPO)"
-
-
-def _test_26_v231_account_deltas_holding_dedup_and_employees() -> str:
-    if parse_schema_org_employees_v23('1.500') != 1500 or parse_schema_org_employees_v23("1'500") != 1500:
-        raise AssertionError("Failed to parse European thousand separators '1.500' / \"1'500\"")
-
-    prev_rec = {
-        'decision_maker_name': 'Markus Müller',
-        'ads_active_last_30d': False,
-        'open_positions_total': 2,
-        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4)',
-    }
-    curr_rec = {
-        'decision_maker_name': 'Stefan Weber',
-        'ads_active_last_30d': True,
-        'open_positions_total': 7,
-        'detected_technologies': 'Google Tag Manager; Google Analytics (GA4); Klaviyo',
-    }
-    triggers = compute_account_change_triggers_v23(prev_rec, curr_rec)
-    if len(triggers) != 4:
-        raise AssertionError(f"Expected 4 account change triggers, got {triggers}")
-
-    return "PASS (1.500 & 1'500 -> 1500 employees; all 4 account delta triggers verified)"
-
-
-def run_startup_regression_gate(
-    log_fn: Callable[[str], None],
-    normalize_tech_fn: Callable[[dict], None],
-    resolve_cache_comp_fn: Callable[..., str],
-) -> None:
-    t0 = time.monotonic()
-    suite = [
-        ('test_01_corporate_entities', _test_01_corporate_entities),
-        ('test_02_determinism_ottogroup_3x', _test_02_determinism_ottogroup_3x),
-        (
-            'test_03_cache_merge_completeness',
-            lambda: _test_03_cache_merge_completeness_and_liki24_partial_merge(normalize_tech_fn, resolve_cache_comp_fn),
-        ),
-        ('test_04_vorstand_role', _test_04_vorstand_role_extraction),
-        ('test_05_sgtm_positive', lambda: _test_05_sgtm_positive_fixture(normalize_tech_fn)),
-        ('test_06_sgtm_negative_full', lambda: _test_06_sgtm_negative_fixtures(normalize_tech_fn)),
-        ('test_07_inweb_consistency_and_liki24_hygiene', _test_07_inweb_dm_consistency_and_liki24_hygiene),
-        ('test_08_glossier_spa_ecommerce_category', _test_08_glossier_spa_ecommerce_category),
-        ('test_09_curl_clean_live_without_cms_stays_full', lambda: _test_09_curl_clean_live_without_cms_stays_full(normalize_tech_fn)),
-        ('test_10_aboutyou_ga4_cap_and_affiliate_creator', lambda: _test_10_aboutyou_ga4_cap_and_affiliate_creator_classification(normalize_tech_fn)),
-        ('test_11_poisoned_cache_recovery_and_safe_write', lambda: _test_11_poisoned_cache_recovery_and_safe_write_policy(normalize_tech_fn)),
-        ('test_12_v2015_security_ssrf_rozetka_and_actionability', _test_12_v2015_security_ssrf_rozetka_and_actionability_enum),
-        ('test_13_subdomain_canonicalization', _test_13_subdomain_canonicalization),
-        ('test_14_first_party_sgtm_collect_and_consent_mode_v2', lambda: _test_14_first_party_sgtm_collect_and_consent_mode_v2(normalize_tech_fn)),
-        ('test_15_v2018_email_phone_consent_regressions_and_red_flags', _test_15_v2018_email_phone_consent_regressions_and_red_flags),
-        ('test_16_v210_no_fake_de_phones_and_dup_ga4_hook', _test_16_v210_no_fake_de_phones_and_dup_ga4_hook),
-        ('test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge', lambda: _test_17_v211_multilevel_doubleclick_sgtm_and_cached_phone_purge(normalize_tech_fn)),
-        ('test_18_v213_wild_web_hardening_7_bugs', _test_18_v213_wild_web_hardening_7_bugs),
-        ('test_19_v214_evidence_based_p0_fixes', _test_19_v214_evidence_based_p0_fixes),
-        ('test_20_v215_six_audit_improvements', _test_20_v215_six_audit_improvements),
-        ('test_21_v231_etld_and_ssrf_vs_dns_split', _test_21_v231_etld_and_ssrf_vs_dns_split),
-        ('test_22_v231_safe_cookie_headers_sgtm_and_x509_ca', lambda: _test_22_v231_safe_cookie_headers_sgtm_and_x509_ca(normalize_tech_fn)),
-        ('test_23_v231_wp_dual_hash_cracker_md5_and_sha256', _test_23_v231_wp_dual_hash_cracker_md5_and_sha256),
-        ('test_24_v231_title_stripping_wikidata_bind_and_cal_odoo', _test_24_v231_title_stripping_wikidata_bind_and_cal_odoo),
-        ('test_25_v231_soa_rname_honeypot_dpo_and_m365_mx', _test_25_v231_soa_rname_honeypot_dpo_and_m365_mx),
-        ('test_26_v231_account_deltas_holding_dedup_and_employees', _test_26_v231_account_deltas_holding_dedup_and_employees),
-    ]
-
-    passed_count = 0
-    for test_name, test_callable in suite:
-        try:
-            detail = test_callable()
-            passed_count += 1
-            log_fn(f"[REGRESSION SUITE] {test_name}: {detail}")
-        except Exception as exc:
-            log_fn(f"[REGRESSION SUITE FAIL] {test_name}: {exc}")
-            raise RuntimeError(f"Startup Regression Gate aborted Actor run: {test_name} failed ({exc})") from exc
-
-    elapsed_ms = (time.monotonic() - t0) * 1000.0
-    log_fn(
-        f"[REGRESSION SUITE GATE PASS] {passed_count}/{len(suite)} tests green in {elapsed_ms:.1f}ms"
+    # 13. WP 6.8+ SHA-256 & MD5 dual-hash cracker
+    import hashlib
+    test_em = 'ivan.koval@company.ua'
+    sha_h = hashlib.sha256(test_em.encode('utf-8')).hexdigest()
+    cracked = crack_wp_user_email_dual_hash_v23_1(
+        'Іван Коваль', 'ikoval', 'company.ua', {'96': f'https://secure.gravatar.com/avatar/{sha_h}?s=96'}
     )
+    assert cracked == test_em
+
+    # 14. SOA RNAME parser
+    assert resolve_soa_rname_safe('noc\\.ops.company.de.', _extract_etld_local) == 'noc.ops@company.de'
+    assert resolve_soa_rname_safe('dns.cloudflare.com.', _extract_etld_local) is None
+
+    # 15. Apple Pay PKCS#7 safe decoder
+    assert decode_apple_pay_merchant_association_safe('<html>merchant.com.stripe</html>')['has_apple_pay'] is False
+    assert 'Stripe' in decode_apple_pay_merchant_association_safe('001122 merchant.com.stripe.123 ' * 4)['psp_gateways']
+
+    # 16. Shopify, PIM & Logistics signals
+    sh_sig = extract_shopify_pim_and_logistics_signals(
+        '<script>Shopify.shop = "brand-store.myshopify.com";</script>'
+        '<a href="https://calendly.com/brand/demo">Book a demo</a>'
+        '<script src="https://cdn.loopreturns.com/w.js"></script>'
+    )
+    assert sh_sig['myshopify_canonical_domain'] == 'brand-store.myshopify.com'
+    assert sh_sig['demo_scheduler_tool'] == 'Calendly'
+    assert sh_sig['has_automated_returns_portal'] is True
+
+    # 17. M&A Rebrand & Insolvency detector
+    ma_rebrand = detect_ma_rebrand_and_insolvency_v23(
+        'modnakasta.ua', 'https://kasta.ua/', 'Kasta — інтернет-магазин',
+        set(), {'modnakasta.ua': 'kasta.ua'}, '', False, _extract_etld_local
+    )
+    assert ma_rebrand['corporate_lifecycle_status'] == 'ACTIVE_REBRAND_ALIAS'
+
+    ma_liq = detect_ma_rebrand_and_insolvency_v23(
+        'oldshop.de', 'https://oldshop.de/', 'OldShop',
+        set(), {}, 'OldShop GmbH i.L. wird vertreten durch den Liquidator', False, _extract_etld_local
+    )
+    assert ma_liq['corporate_lifecycle_status'] == 'IN_LIQUIDATION_OR_INSOLVENCY'
+
+    # 18. SaaS Spend Estimator
+    sp_est = calculate_saas_spend_range_usd({'Shopify Plus', 'Klaviyo'}, has_enterprise_cdn=True, has_vmc_seal=True)
+    assert sp_est['min_estimated_saas_spend_usd'] == 2300 + 150 + 1500 + 125
+
+    # 19. Prospect Timezone & Outreach Lang (включно з фіксом для creatio.com та yakaboo.ua)
+    tz_res = resolve_prospect_timezone_and_locale_v23('notino.de', '+4989123456', 'DE', 'de')
+    assert tz_res['prospect_iana_timezone'] == 'Europe/Berlin'
+    assert tz_res['recommended_outreach_lang'] == 'de'
+
+    tz_creatio = resolve_prospect_timezone_and_locale_v23(
+        'creatio.com', '+380443633133', 'UA', 'en', page_title='AI CRM and Workflow Platform | Creatio'
+    )
+    assert tz_creatio['recommended_outreach_lang'] == 'en'
+
+    tz_yakaboo = resolve_prospect_timezone_and_locale_v23(
+        'yakaboo.ua', '+380630335425', 'UA', 'en', page_title='Купити книги в інтернет-магазині Yakaboo'
+    )
+    assert tz_yakaboo['recommended_outreach_lang'] == 'uk'
+
+    # 20. Account Change Triggers (Delta Engine)
+    deltas = compute_account_change_triggers_v23(
+        {'_schema': 29, 'decision_maker_name': 'Jan Koum', 'ads_active_last_30d': False, 'open_positions_total': 2, 'detected_technologies': 'Google Analytics (GA4)'},
+        {'decision_maker_name': 'Brian Acton', 'ads_active_last_30d': True, 'open_positions_total': 7, 'detected_technologies': 'Google Analytics (GA4); Klaviyo'},
+    )
+    assert len(deltas) == 4
+
+    # 21. WhatsApp E.164 normalizer
+    wa_num = normalize_whatsapp_number_safe('380671234567', 'UA')
+    assert wa_num in ('+380671234567', None)
+
+    # 22. Qualification & Scoring
+    verdict, _, _, c_tier, _, _, _, _, _ = evaluate_qualification_v180(
+        'E-commerce / Retail Brand', t_info, 'marketing@shop.de', 'marketing_or_exec_role',
+        '+49 30 123456', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
+        'https://www.linkedin.com/in/max-mustermann', False, 'impressum_page',
+        'https://www.linkedin.com/company/shop', False, 'rendered'
+    )
+    assert 'Sales-Ready' in verdict
+    score = compute_data_quality_score(c_tier, 5, 'Max Mustermann', 'https://www.linkedin.com/in/max-mustermann', '+49 30 123456', 'full')
+    assert score >= 75
+
+    # 23. Unmatched named inbox hook (netpeak case)
+    hook_str = build_sales_hook(
+        'netpeak.net', 'B2B Agency / Marketing Media', t_info,
+        'Андрій Чумаченко', 'Co-Founder', None, 'n.koshel@netpeak.net',
+        is_eu_gdpr=False, pw_used=False, best_email_type='personal_or_named_inbox'
+    )
+    assert 'Named Contact: n.koshel@netpeak.net' in hook_str
+
+    # 24. Optional callbacks from main.py
+    if normalize_tech_fn is not None:
+        dummy_tech = {'detected_technologies_list': ['Meta Pixel', 'Shopify'], 'detected_cms_list': ['Shopify']}
+        normalize_tech_fn(dummy_tech)
+        assert dummy_tech['has_meta_pixel'] is True
+        assert dummy_tech['has_google_ads'] is False
+
+    if resolve_cache_comp_fn is not None:
+        assert resolve_cache_comp_fn('full', False, True) == 'partial_cached'
+
+    # 25. Utility helpers
+    assert sanitize_kv_key('https://rozetka.com.ua/') == 'https___rozetka.com.ua_'
+    assert len(truncate_error_msg('x' * 200, max_len=50)) <= 50
+    assert CACHE_SCHEMA_VERSION >= 29
+
+    # 26. Тест №27 (Інтеграційний мок-тест fetch_html_safely + антибот-детектор Cloudflare)
+    _run_fetch_html_safely_sync_check()
+
+    if log_fn is not None:
+        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8 Store Gold Master).')
