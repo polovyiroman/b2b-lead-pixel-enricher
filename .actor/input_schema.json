@@ -1,15 +1,15 @@
 {
-  "title": "B2B Lead & MarTech Pixel Enricher (v23.4 Store Release)",
-  "description": "Deep MarTech stack audit (GTM macro unpacking, sGTM, GA4 duplicate detection, EU Consent Mode v2), 2-Wave OSINT DAG (X.509, DNS/DKIM/DMARC, Wikidata, Google Ads RPC), B2B contact classification, and GDPR/UWG §7 compliance.",
+  "title": "B2B MarTech & Account Intelligence Enricher (v24.0)",
+  "description": "Deep MarTech stack audit (GTM container unpacking, runtime GA4 duplicate detection, sGTM, EU Consent Mode v2 gaps), active ad spend intelligence (Google Ads Transparency RPC), 3-tier verification (CSP vs Code vs Runtime), decoupled Opportunity Score & Contactability, and GDPR / German §7 UWG compliance.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "domains": {
       "sectionCaption": "1. Target Domains, Scan Mode & Output Format",
-      "sectionDescription": "Provide target company domains or URLs, select the scan speed/depth mode, and choose between the full 110-column engineering dataset or the SDR compact view.",
+      "sectionDescription": "Provide target company domains or URLs to audit their MarTech stack, ad activity, decision-makers, and compliance status.",
       "title": "Target Domains / URLs",
       "type": "array",
-      "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de').",
+      "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de', 'bergfreunde.de').",
       "editor": "stringList",
       "prefill": [
         "intertop.ua",
@@ -36,7 +36,7 @@
     "outputView": {
       "title": "Output Dataset View",
       "type": "string",
-      "description": "Choose 'full_audit' for all 110 technical & compliance columns, or 'sdr_compact' for a clean CRM-ready table.",
+      "description": "Choose 'full_audit' for all 132 technical & compliance columns, or 'sdr_compact' for a clean 34-column CRM-ready outbound view.",
       "editor": "select",
       "default": "full_audit",
       "enum": [
@@ -44,16 +44,23 @@
         "sdr_compact"
       ],
       "enumTitles": [
-        "Full Engineering & Compliance Audit (110 Columns)",
-        "SDR / CRM Compact Outbound View"
+        "Full MarTech & Compliance Audit (132 Columns)",
+        "SDR / Agency Outbound View (34 Columns)"
       ]
     },
-    "enableDeepOsint": {
-      "title": "Enable 2-Wave Deep OSINT DAG (X.509, DNS/DKIM/DMARC, Wikidata, Ads RPC, Port-443)",
+    "disableDeepOsint": {
+      "title": "Disable 2-Wave Deep OSINT DAG (Minimal HTTP Mode)",
       "type": "boolean",
-      "description": "Runs time-budgeted browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SOA, Apple Pay PSPs, Google Ads Transparency RPC, Wikidata CEO fallback, and Port-443 M365/Gravatar verification.",
+      "description": "By default (false), runs fast browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SEG, Google Ads Transparency RPC, Wikidata, VIES/GLEIF, RDAP, and M365 AD email verification. Check to disable.",
       "editor": "checkbox",
-      "default": true
+      "default": false
+    },
+    "skipUnqualifiedInOutput": {
+      "title": "Exclude Unreachable / NXDOMAIN Domains from Output Dataset",
+      "type": "boolean",
+      "description": "If enabled, domains that fail DNS resolution or SSRF checks with zero data quality score are omitted from the output dataset.",
+      "editor": "checkbox",
+      "default": false
     },
     "defaultPhoneRegion": {
       "title": "Default Phone Region Fallback",
@@ -63,34 +70,34 @@
       "default": "US"
     },
     "serperApiKey": {
-      "sectionCaption": "2. External Enrichment & Email Verifier Keys (Optional)",
-      "sectionDescription": "Connect Serper.dev (Google SERP X-Ray) to locate CMO / Head of Marketing LinkedIn profiles, and Reoon / MillionVerifier to validate predicted DM emails to 'mailbox_verified_deliverable'.",
-      "title": "Serper.dev API Key (LinkedIn CMO X-Ray)",
+      "sectionCaption": "2. Optional LinkedIn X-Ray & Email Verifier Keys",
+      "sectionDescription": "Connect Serper.dev to discover operational CMO / Head of Marketing LinkedIn profiles, and Reoon / MillionVerifier for live SMTP verification of predicted DM emails.",
+      "title": "Serper.dev API Key (CMO / Head of Marketing LinkedIn X-Ray)",
       "type": "string",
-      "description": "Optional API key from serper.dev. Automatically finds CMO / Head of Digital / Marketing Director on LinkedIn when the website only lists legal CEOs or no executives.",
+      "description": "Optional API key from serper.dev. Automatically finds CMO / Head of Digital / Marketing Director on LinkedIn when the website only lists legal CEOs or general inboxes.",
       "editor": "textfield",
       "isSecret": true
     },
     "reoonApiKey": {
       "title": "Reoon Email Verifier API Key",
       "type": "string",
-      "description": "Optional API key from reoon.com. Verifies generated DM email hypotheses in real time and promotes safe addresses to best_email.",
+      "description": "Optional API key from reoon.com. Verifies predicted DM email patterns in real time and promotes deliverable addresses to best_email.",
       "editor": "textfield",
       "isSecret": true
     },
     "millionVerifierApiKey": {
       "title": "MillionVerifier API Key",
       "type": "string",
-      "description": "Optional API key from millionverifier.com (alternative to Reoon for live SMTP/API verification of predicted DM emails).",
+      "description": "Optional API key from millionverifier.com (alternative to Reoon for live verification of predicted DM emails).",
       "editor": "textfield",
       "isSecret": true
     },
     "forceFreshScan": {
       "sectionCaption": "3. Cache Freshness, Anti-Bot WAF & Webhook Integration",
-      "sectionDescription": "Control cache TTL, force Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
+      "sectionDescription": "Control snapshot cache TTL, force Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
       "title": "Force 100% Fresh Live Scan (Ignore Cache)",
       "type": "boolean",
-      "description": "If enabled, completely bypasses prior cached snapshots in Key-Value Store and performs a strictly live scan today.",
+      "description": "If enabled, completely bypasses prior cached snapshots in Key-Value Store and performs a strictly live scan.",
       "editor": "checkbox",
       "default": false
     },
@@ -112,7 +119,7 @@
     "webhookUrl": {
       "title": "Outbound Webhook URL (n8n / Make / Clay / CRM / Slack)",
       "type": "string",
-      "description": "Optional HTTPS URL. When the run finishes, the Actor automatically sends a JSON POST payload containing run telemetry and enriched lead records.",
+      "description": "Optional HTTPS URL. When the run finishes, the Actor automatically sends a JSON POST payload containing run telemetry and enriched account records.",
       "editor": "textfield"
     },
     "scanContactPages": {
