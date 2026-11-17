@@ -86,7 +86,6 @@ ACADEMIC_SUFFIX_TITLES_RE = re.compile(
     re.IGNORECASE
 )
 
-# Виправлено Проблему R8 (epicentrk.ua): суфікси українських/слов'янських по батькові
 PATRONYMIC_SUFFIX_RE = re.compile(
     r"^(?:[А-ЯІЇЄҐA-Z][а-яіїєґa-z']+)(?:ович|івна|ївна|йович|ич|овна|евна|ична)$"
 )
@@ -130,17 +129,10 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
 
 
 # ==============================================================================
-# v23.3 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад (Фаза 2)
+# v24.0 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
 # ==============================================================================
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
-    """
-    Виправлено Проблему R8 (v23.3):
-    Якщо в ПІБ 3 токени (напр., 'Галина Федорівна Герега') і середній токен є по батькові
-    (-ович, -івна, -ївна, -ич), прибирає по батькові з dm_last_name, залишаючи чисте прізвище ('Герега').
-    Якщо першим токеном стоїть прізвище перед ім'ям та по батькові ('Герега Галина Федорівна'),
-    коректно розпізнає ім'я та прізвище.
-    """
     if not raw_full_name:
         return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
     clean = raw_full_name.strip()
@@ -268,7 +260,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/23.3 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.0 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -527,13 +519,13 @@ async def verify_ceo_email_cascade_port443_v23_1(
                 return {
                     "verified_email": m365_res["verified_email"],
                     "verification_status": "mailbox_verified_m365_active_directory",
-                    "email_verification_confidence": "HIGH_IDENTITY_AND_MX",
+                    "email_verification_confidence": "M365_AD_VERIFIED",
                     "detected_federated_idp": fed_idp,
                 }
             return {
                 "verified_email": m365_res["verified_email"],
                 "verification_status": "identity_verified_m365_external_mx",
-                "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+                "email_verification_confidence": "M365_AD_VERIFIED",
                 "detected_federated_idp": fed_idp,
             }
 
@@ -542,7 +534,7 @@ async def verify_ceo_email_cascade_port443_v23_1(
         return {
             "verified_email": grav_res["verified_email"],
             "verification_status": "identity_verified_gravatar_profile",
-            "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+            "email_verification_confidence": "API_VERIFIED",
             "detected_federated_idp": fed_idp,
         }
 
@@ -554,7 +546,7 @@ async def verify_ceo_email_cascade_port443_v23_1(
                 return {
                     "verified_email": cand.strip().lower(),
                     "verification_status": "identity_verified_openpgp_key",
-                    "email_verification_confidence": "MEDIUM_PUBLIC_IDENTITY",
+                    "email_verification_confidence": "API_VERIFIED",
                     "detected_federated_idp": fed_idp,
                 }
         except Exception:
@@ -878,18 +870,25 @@ def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
 
 
 def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
+    """
+    Виправлено (v24.0): Підтримує формат `first@domain` (напр. `matthias@bergfreunde.de` для `Matthias Gebhard`),
+    коли ім'я має >= 3 літер і не є службовим префіксом.
+    """
     if not dm_name or not email or '@' not in email:
         return False
     local = clean_escaped_email_prefix(email).split('@', 1)[0].lower()
     if local in NON_PERSON_TOKENS or local in GENERIC_SINGLE_WORD_LOCALS:
         return False
-    raw_tokens = [p for p in dm_name.split() if len(p) >= 2]
+    cleaned_exec = split_clean_executive_name(dm_name).get("dm_clean_full_name") or dm_name
+    raw_tokens = [p for p in cleaned_exec.split() if len(p) >= 2]
     if len(raw_tokens) < 2:
         return False
     first_variants = generate_phonetic_token_variants_v23(raw_tokens[0], transliterate_ua_to_latin)
     last_variants = generate_phonetic_token_variants_v23(raw_tokens[-1], transliterate_ua_to_latin)
     norm_local = re.sub(r'[^a-z]', '', local)
     for first_n in first_variants:
+        if len(first_n) >= 3 and norm_local == first_n:
+            return True
         for last_n in last_variants:
             if len(first_n) >= 3 and len(last_n) >= 3:
                 if first_n in norm_local and last_n in norm_local:
@@ -904,7 +903,8 @@ def verify_person_linkedin_match(dm_name: str | None, linkedin_url: str | None) 
         return False
     slug = linkedin_url.lower().split('linkedin.com/in/', 1)[1].split('/')[0].split('?')[0]
     slug_clean = re.sub(r'[^a-z]', '', slug)
-    raw_tokens = [p for p in dm_name.split() if len(p) >= 2]
+    cleaned_exec = split_clean_executive_name(dm_name).get("dm_clean_full_name") or dm_name
+    raw_tokens = [p for p in cleaned_exec.split() if len(p) >= 2]
     if len(raw_tokens) < 2:
         return False
     first_variants = generate_phonetic_token_variants_v23(raw_tokens[0], transliterate_ua_to_latin)
@@ -1202,11 +1202,6 @@ async def query_doh_json(
     domain: str,
     record_type: str = 'MX'
 ) -> tuple[bool, list[dict]]:
-    """
-    Виправлено Проблему R1 та R7 (v23.3):
-    Оскільки сесія client тепер ініціалізується без проксі, S2S-запити до Cloudflare та Google DoH
-    дійсно йдуть напряму з контейнера й відповідають за 15–30 мс.
-    """
     doh_endpoints = (
         f'https://cloudflare-dns.com/dns-query?name={domain}&type={record_type}',
         f'https://dns.google/resolve?name={domain}&type={record_type}',
@@ -1472,17 +1467,23 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
 
 
 def _dm_role_priority_weight(role_str: str | None) -> int:
+    """
+    Виправлено (v24.0): Операційні керівники маркетингу / e-commerce / growth отримують
+    найвищий пріоритет (38 балів), випереджаючи засновників холдингів (14–16 балів).
+    """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
         return -30
-    if any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'growth', 'digital', 'performance')):
-        return 24
+    if any(k in r_low for k in ('cmo', 'chief marketing', 'head of marketing', 'marketing director', 'head of e-commerce', 'e-commerce director', 'head of growth', 'head of digital', 'performance')):
+        return 38
+    if 'marketing' in r_low or 'digital' in r_low:
+        return 32
     if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
         return 20
     if any(k in r_low for k in ('founder', 'co-founder')):
-        return 18
+        return 15
     if 'owner' in r_low:
-        return 16
+        return 14
     return 10
 
 
