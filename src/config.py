@@ -3,10 +3,10 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 29
+CACHE_SCHEMA_VERSION = 30
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
-MAX_DISPLAY_GA4_IDS = 5
+MAX_DISPLAY_GA4_IDS = 50
 
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 HEX_HASH_LOCAL_REGEX = re.compile(r'^[a-f0-9]{20,}$', re.IGNORECASE)
@@ -113,7 +113,7 @@ GTM_FALSE_POSITIVES = {
 ROLES_REGEX_PART = (
     r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
     r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
-    r'Head of Digital|Commercial Director|Managing Partner|Managing Director|General Manager|President|'
+    r'Head of Digital|Performance Lead|Commercial Director|Managing Partner|Managing Director|General Manager|President|'
     r'Засновник|Засновниця|Співзасновник|Співзасновниця|Співзасновники|Власник|Власниця|'
     r'Генеральний директор|Директор з маркетингу|Керівник відділу маркетингу|'
     r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор|'
@@ -331,6 +331,7 @@ ROLE_NORMALIZATION_MAP = {
     'e-commerce director': 'E-commerce Director',
     'head of growth': 'Head of Growth',
     'head of digital': 'Head of Digital',
+    'performance lead': 'Performance Marketing Lead',
     'ceo': 'Chief Executive Officer (CEO)',
     'генеральний директор': 'Chief Executive Officer (CEO)',
     'директор': 'Managing Director / CEO',
@@ -547,6 +548,8 @@ KNOWN_JURISDICTION_HINTS: dict[str, str] = {
     'coolblue.nl': 'EU_EEA_GDPR',
     'laredoute.fr': 'EU_EEA_GDPR',
     'unicredit.it': 'EU_EEA_GDPR',
+    'gymshark.com': 'UK_GDPR',
+    'allbirds.com': 'US_CAN_SPAM',
 }
 
 JUNK_EMAIL_LOCALS = {
@@ -889,7 +892,7 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
 
 
 # ==============================================================================
-# v23.2 Complete: Константні структури даних (Фаза 1 + Google/Meta CSP)
+# v24.0 Enterprise MarTech & Account Intelligence: Константні структури
 # ==============================================================================
 
 MULTI_PART_TLDS: set[str] = {
