@@ -25,8 +25,18 @@ from .contacts import (
     classify_dm_source_type,
     classify_email_type,
     is_marketing_or_digital_role,
+    split_clean_executive_name,
     verify_person_email_match,
     verify_person_linkedin_match,
+)
+from .domain_helpers import (
+    build_compliance_note,
+    derive_gdpr_jurisdiction,
+    derive_human_contact_tier,
+    derive_legal_basis_for_processing,
+    derive_pii_fields,
+    derive_sales_actionability_class,
+    detect_country_hint,
 )
 from .tech_detector import build_evidence_json_from_cached_record
 
@@ -67,10 +77,11 @@ ENTERPRISE_REGISTRAR_MARKERS = (
     "safenames", "com laude", "nom-iq", "brandsight"
 )
 
+# v23.8.1: Використано (?!\w) замість фінального \b, оскільки 'gmbh i.l.' закінчується на крапку '.'
 LIQUIDATION_MARKERS_RE = re.compile(
-    r"\b(gmbh\s+i\.\s*l\.|gmbh\s+i\.\s*abw\.|in\s+liquidation|insolvenzverfahren|"
+    r"\b(?:gmbh\s+i\.\s*l\.|gmbh\s+i\.\s*abw\.|in\s+liquidation|insolvenzverfahren|"
     r"w\s+likwidacji|w\s+upadłości|в\s+стані\s+припинення|в\s+процесі\s+ліквідації|"
-    r"in\s+administration|in\s+receivership)\b",
+    r"in\s+administration|in\s+receivership)(?!\w)",
     re.IGNORECASE
 )
 FOR_SALE_TITLE_RE = re.compile(
@@ -98,7 +109,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v23.4 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta (Фаза 3)
+# v23.8.1 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -1347,6 +1358,11 @@ def build_manual_seed_record(
         is_same_person_email=verify_person_email_match(dm_name, best_email),
     )
 
+    c_hint = detect_country_hint(canonical_domain, '', '', primary_phone, '')
+    tz_info = resolve_prospect_timezone_and_locale_v23(
+        canonical_domain, primary_phone, c_hint, '', page_title=seed.get('page_title') or ''
+    )
+
     return {
         'input_domain': domain_key,
         'canonical_domain': canonical_domain,
@@ -1378,12 +1394,12 @@ def build_manual_seed_record(
             f'(age={age_days}d, verified_at={verified_at}).'
         ),
         'gdpr_eu_domain': is_eu_gdpr,
-        'gdpr_jurisdiction': derive_gdpr_jurisdiction(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), ''),
-        'legal_basis_for_processing': derive_legal_basis_for_processing(canonical_domain, detect_country_hint(canonical_domain, '', '', primary_phone, ''), bool(best_email or dm_name or primary_phone)),
+        'gdpr_jurisdiction': derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, ''),
+        'legal_basis_for_processing': derive_legal_basis_for_processing(canonical_domain, c_hint, bool(best_email or dm_name or primary_phone)),
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, seed.get('decision_maker_linkedin_url')),
-        'compliance_note': build_compliance_note(canonical_domain, detect_country_hint(canonical_domain, '', '', primary_phone, '')),
+        'compliance_note': build_compliance_note(canonical_domain, c_hint),
         'playwright_available': playwright_available,
         'playwright_used': False,
         'playwright_status': 'not_attempted_manual_seed',
@@ -1467,8 +1483,8 @@ def build_manual_seed_record(
         'email_security_gateway': None,
         'plain_text_outreach_required': False,
         'tls_trust_status': 'not_checked',
-        'prospect_iana_timezone': resolve_prospect_timezone_and_locale_v23(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), '', page_title=seed.get('page_title') or '')['prospect_iana_timezone'],
-        'recommended_outreach_lang': resolve_prospect_timezone_and_locale_v23(canonical_domain, primary_phone, detect_country_hint(canonical_domain, '', '', primary_phone, ''), '', page_title=seed.get('page_title') or '')['recommended_outreach_lang'],
+        'prospect_iana_timezone': tz_info['prospect_iana_timezone'],
+        'recommended_outreach_lang': tz_info['recommended_outreach_lang'],
         'corporate_lifecycle_status': 'ACTIVE_INDEPENDENT',
         'outreach_dedup_status': 'PRIMARY_OUTREACH_TARGET',
         'recent_change_triggers': [],
