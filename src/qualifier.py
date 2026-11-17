@@ -68,7 +68,6 @@ ENTERPRISE_REGISTRAR_MARKERS = (
     "safenames", "com laude", "nom-iq", "brandsight"
 )
 
-# v23.8.2: Використано (?!\w) замість фінального \b, оскільки 'gmbh i.l.' закінчується на крапку '.'
 LIQUIDATION_MARKERS_RE = re.compile(
     r"\b(?:gmbh\s+i\.\s*l\.|gmbh\s+i\.\s*abw\.|in\s+liquidation|insolvenzverfahren|"
     r"w\s+likwidacji|w\s+upadłości|в\s+стані\s+припинення|в\s+процесі\s+ліквідації|"
@@ -100,7 +99,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v23.8.2 Complete: VIES+GLEIF, RDAP, M&A/Insolvency, SaaS Spend, TZ & Delta
+# v24.0 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -271,6 +270,10 @@ def calculate_saas_spend_range_usd(
     has_enterprise_cdn: bool = False,
     has_vmc_seal: bool = False
 ) -> Dict[str, Any]:
+    """
+    Виправлено (v24.0): BIMI VMC Seal виключено з оцінки витрат на SaaS-продукти,
+    оскільки це сертифікат поштового логотипу бренду, а не MarTech/SaaS-підписка.
+    """
     min_total = 0
     max_total = 0
     basis: List[str] = []
@@ -279,15 +282,11 @@ def calculate_saas_spend_range_usd(
             lo, hi = SAAS_PRICING_RANGE_USD[tech]
             min_total += lo
             max_total += hi
-            basis.append(f"{tech} (${lo}-${hi})")
+            basis.append(f"{tech} (est. ${lo}-${hi}/mo)")
     if has_enterprise_cdn:
         min_total += 1500
         max_total += 4000
-        basis.append("Enterprise CDN ($1500-$4000)")
-    if has_vmc_seal:
-        min_total += 125
-        max_total += 150
-        basis.append("BIMI VMC Seal ($125-$150)")
+        basis.append("Enterprise CDN (est. $1500-$4000/mo)")
     return {
         "min_estimated_saas_spend_usd": min_total,
         "estimated_saas_spend_min_usd": min_total,
@@ -400,7 +399,8 @@ def compute_account_change_triggers_v23(
                 if isinstance(ev_map, dict):
                     added_candidates = {
                         t for t in added_candidates
-                        if (ev_map.get(t) or {}).get("source") != "http_headers_or_ssr"
+                        if (ev_map.get(t) or {}).get("verification_tier") != "allowlisted_in_csp"
+                        and (ev_map.get(t) or {}).get("source") != "http_headers_or_ssr"
                     }
             except Exception:
                 pass
@@ -409,6 +409,107 @@ def compute_account_change_triggers_v23(
     if added:
         triggers.append(f"ADDED_TECH: {', '.join(added[:3])}")
     return triggers
+
+
+# ==============================================================================
+# v24.0 Decoupled Qualification Axes: Account Opportunity Score & Contactability
+# ==============================================================================
+
+def compute_account_opportunity_score(
+    company_category: str,
+    tech_info: dict,
+    ads_active_last_30d: bool | None = None,
+    red_flags_count: int = 0,
+    min_saas_spend_usd: int = 0,
+    open_positions_total: int = 0,
+) -> int:
+    """
+    Нова вісь v24.0: Оцінює суто комерційну цінність та MarTech-прогалини акаунта (0–100)
+    незалежно від того, чи знайдено на сайті прямий email керівника.
+    """
+    if company_category == 'Non-Profit / Education / Institution':
+        return 5
+
+    score = 0
+    if company_category == 'E-commerce / Retail Brand':
+        score += 25
+    elif company_category == 'SaaS / Marketplace / Tech Platform':
+        score += 22
+    elif company_category == 'General Business / Corporate':
+        score += 15
+    elif company_category == 'B2B Agency / Marketing Media':
+        score += 18
+
+    scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
+    tech_list = tech_info.get('detected_technologies_list') or []
+    ad_pixels = sum(
+        1 for k in ('has_meta_pixel', 'has_google_ads', 'has_tiktok_pixel', 'has_linkedin_pixel', 'has_pinterest_tag')
+        if tech_info.get(k) is True
+    )
+
+    if scan_comp == 'partial_csp_headers':
+        score += min(12, len(tech_list) * 2)
+    else:
+        if ad_pixels >= 2:
+            score += 20
+        elif ad_pixels == 1:
+            score += 12
+        if tech_info.get('has_ga4') or tech_info.get('has_gtm'):
+            score += 8
+
+    # Активні оголошення в Google Ads Transparency + відсутність Server-Side GTM
+    if ads_active_last_30d is True:
+        score += 18
+        if not tech_info.get('has_sgtm'):
+            score += 10
+    elif ad_pixels >= 1 and not tech_info.get('has_sgtm') and scan_comp == 'full':
+        score += 8
+
+    # Конкретні технічні болі (Duplicate GA4 / EU Consent Mode v2 Gap)
+    if red_flags_count >= 1:
+        score += min(20, red_flags_count * 12)
+
+    # Зрілість бюджету та найм
+    if min_saas_spend_usd >= 1000:
+        score += 10
+    elif min_saas_spend_usd >= 150:
+        score += 6
+
+    if open_positions_total >= 3:
+        score += 6
+
+    return max(0, min(100, score))
+
+
+def derive_contactability_level(
+    best_email: str | None,
+    best_email_type: str | None,
+    dm_name: str | None,
+    dm_linkedin_url: str | None,
+    primary_phone: str | None,
+    best_email_confidence: str = 'NONE',
+) -> str:
+    """
+    Нова вісь v24.0: Чітко класифікує доступність каналу комунікації:
+      - `direct_dm_verified`: підтверджена особиста пошта або профіль LinkedIn ЛПР;
+      - `role_inbox_ready`: пряма пошта відділу маркетингу / керівництва (`marketing@`);
+      - `gatekeeper_only`: загальні/партнерські скриньки (`info@`, `partners@`, `b2b@`), лише ПІБ або телефон;
+      - `unreached`: немає жодного контакту для аутрічу.
+    """
+    is_same_person_email = verify_person_email_match(dm_name, best_email)
+    is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
+
+    if dm_name and (is_same_person_email or is_same_person_li):
+        return 'direct_dm_verified'
+    if best_email_confidence in ('M365_AD_VERIFIED', 'API_VERIFIED') and best_email_type == 'personal_or_named_inbox':
+        return 'direct_dm_verified'
+    if best_email_type == 'marketing_or_exec_role':
+        return 'role_inbox_ready'
+    if best_email_type == 'personal_or_named_inbox' and best_email:
+        return 'role_inbox_ready'
+    if best_email or dm_name or primary_phone:
+        return 'gatekeeper_only'
+    return 'unreached'
 
 
 # ==============================================================================
@@ -715,6 +816,7 @@ def build_sales_hook(
 
     techs = tech_info.get('detected_technologies_list') or []
     cms = tech_info.get('detected_cms')
+    scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
     has_gtm = bool(tech_info.get('has_gtm'))
     has_sgtm = bool(tech_info.get('has_sgtm'))
     has_ga4 = bool(tech_info.get('has_ga4'))
@@ -738,6 +840,14 @@ def build_sales_hook(
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
+    if scan_comp == 'partial_csp_headers':
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"CSP Allowlist Signals: {stack_str} (tag firing unverified due to strict bot protection). "
+            f"Opening Hook: \"Reaching out regarding {brand}'s digital analytics & attribution setup — "
+            f"who currently oversees marketing measurement and server-side tracking on your team?\""
+        )
+
     if dup_ga4_ids:
         dup_id = dup_ga4_ids[0]
         dup_tag = 'duplicate_runtime_hits_confirmed' if dup_runtime_confirmed else 'duplicate_configuration_suspected'
@@ -753,7 +863,7 @@ def build_sales_hook(
         is_eu_gdpr
         and has_gads
         and not has_cm_v2
-        and tech_info.get('tech_scan_completeness') == 'full'
+        and scan_comp == 'full'
         and (pw_used or has_consent)
     ):
         cm_v2_gap_note = ' [EU Consent Mode v2 gap: Google Ads active without gcs/gcd parameters observed]'
@@ -870,7 +980,10 @@ def evaluate_qualification_v180(
     )
 
     if all_signals:
-        detected_signals_str = ', '.join(all_signals)
+        if scan_comp == 'partial_csp_headers':
+            detected_signals_str = f"{', '.join(all_signals)} (CSP Header Allowlist Only)"
+        else:
+            detected_signals_str = ', '.join(all_signals)
     elif detected_cms:
         consent_note = ' — ad tags likely consent-gated' if has_cookie_banner else ''
         detected_signals_str = f"None detected ({', '.join(detected_cms)} platform only{consent_note})"
@@ -888,7 +1001,13 @@ def evaluate_qualification_v180(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    if len(ad_tags) >= 2 and analytics_tags:
+    # Виправлено (v24.0): При partial_csp_headers (flaconi.de) не виставляємо High Stack Maturity
+    if scan_comp == 'partial_csp_headers':
+        tech_signal = (
+            f"Unverified Stack (CSP Allowlist Only — Browser Render Needed; "
+            f"domains observed in security policy: {', '.join(all_signals[:5])})"
+        )
+    elif len(ad_tags) >= 2 and analytics_tags:
         tech_signal = (
             f"High Stack Maturity: Multi-pixel ad tracking ({', '.join(ad_tags)}) + {'/'.join(analytics_tags[:2])} "
             "(Verified in HTML/GTM; confirms tracking infrastructure, not current ad spend)"
@@ -970,13 +1089,14 @@ def evaluate_qualification_v180(
             f'Note: {dm_name} ({dm_role}) is corporate founder/board level and {best_email} handles commercial/vendor inquiries; '
             f'locate operational CMO / Head of Digital via LinkedIn before pitching analytics.{source_extra_note}'
         )
-    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and len(all_signals) >= 1:
+    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         contact_quality = (
-            f'Tier A- (Decision-Maker Found: {dm_name} + Commercial B2B/Sales Channel: {best_email})'
+            f'Tier B (Executive Found: {dm_name} + Commercial/Partner Inbox: {best_email} — Request CMO Referral)'
         )
-        enrichment_status = 'decision_maker_paired_with_commercial_b2b_channel'
+        enrichment_status = 'executive_paired_with_partner_or_sales_channel'
         confidence_warning = (
-            f'Note: Verified executive ({dm_name}) paired with commercial B2B/Sales inbox ({best_email}).{source_extra_note}'
+            f'Note: Listed executive ({dm_name}) paired with partner/commercial inbox ({best_email}); '
+            f'request referral to CMO / Head of Digital.{source_extra_note}'
         )
     elif dm_name and best_email_type == 'personal_or_named_inbox' and not is_same_person_email:
         contact_quality = (
@@ -1067,6 +1187,7 @@ def evaluate_qualification_v180(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
+    # Виправлено (v24.0): sales_ready присвоюється лише коли є реальний прямий контакт або marketing@
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -1083,23 +1204,25 @@ def evaluate_qualification_v180(
             readiness_verdict = f'Contact-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
     elif dm_name and is_same_person_email:
         readiness_verdict = 'Sales-Ready Tier 1 (Verified Decision-Maker + Matching Direct Email)'
+    elif best_email_type == 'marketing_or_exec_role' and all_signals and scan_comp != 'partial_csp_headers':
+        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
     elif dm_name and is_mp_founder_with_vendor_b2b:
         readiness_verdict = (
             f'Partnership-Ready Only (Marketplace Founder {dm_name} + Commercial B2B Desk — Locate CMO/Head of Digital for MarTech Pitch)'
         )
-    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox') and all_signals:
-        readiness_verdict = f'Sales-Ready Tier 1.5 (Verified Decision-Maker {dm_name} + Commercial B2B/Sales Channel)'
-    elif best_email_type == 'marketing_or_exec_role' and all_signals:
-        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
-    elif not all_signals:
+    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
+        readiness_verdict = (
+            f'Partnership-Ready + DM Known ({dm_name} + {best_email} — Request Referral to CMO / Head of Digital)'
+        )
+    elif not all_signals or scan_comp == 'partial_csp_headers':
         if best_email_type in ('b2b_partnerships', 'marketing_or_exec_role'):
             dm_part = f' + {dm_name}' if dm_name else ''
             readiness_verdict = f'Partnership-Ready{dm_part} (B2B/Marketing Channel Found; Tech Stack Unverified — Check Manually)'
         elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox', 'personal_or_named_inbox') or dm_name:
             dm_part = f' + {dm_name} Known' if dm_name else ''
-            readiness_verdict = f'Gatekeeper-Ready{dm_part} (Contact Found; Tracking Gated by Consent or Absent — Verify Manually)'
+            readiness_verdict = f'Gatekeeper-Ready{dm_part} (Contact Found; Tracking Gated by Consent or Unverified — Verify Manually)'
         else:
-            readiness_verdict = 'Unverified (Support/Non-Sales Contact Only & No Tech Signals Detected in Static HTML)'
+            readiness_verdict = 'Unverified (Support/Non-Sales Contact Only & No Verified Tech Signals)'
     elif best_email_type == 'b2b_partnerships':
         readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
     elif enrichment_status == 'owner_identified_paired_with_brand_webmail':
@@ -1118,6 +1241,8 @@ def evaluate_qualification_v180(
         )
     elif company_category == 'Non-Profit / Education / Institution':
         opportunity = 'Non-commercial / Institutional organization — disqualify from standard B2B sales'
+    elif scan_comp == 'partial_csp_headers':
+        opportunity = 'Partial scan (CSP headers only) — run full browser audit or verify tracking setup before technical pitch'
     elif len(ad_tags) >= 2:
         opportunity = (
             f"Hypothesis for discovery audit: multi-channel ad tracking tags ({', '.join(ad_tags)}) configured; "
@@ -1132,7 +1257,7 @@ def evaluate_qualification_v180(
         opportunity = 'Verify manually if tags are gated by Cookie Consent before proposing GA4/GTM implementation'
 
     phone_note = f' or call {primary_phone}' if primary_phone else ' (no public phone listed)'
-    has_real_signals = bool(all_signals)
+    has_real_signals = bool(all_signals) and scan_comp != 'partial_csp_headers'
     stack_ref_clause = (
         f' referencing detected stack ({detected_signals_str})'
         if has_real_signals
@@ -1157,6 +1282,11 @@ def evaluate_qualification_v180(
             f"Send personalized LinkedIn message to {dm_name} ({dm_role}) at {dm_linkedin_url}"
             f"{stack_ref_clause}{pred_email_clause}"
         )
+    elif dm_name and is_same_person_email:
+        next_action = (
+            f"Send personalized MarTech audit email to {dm_name} ({dm_role}) at {best_email}"
+            f"{stack_ref_clause}"
+        )
     elif dm_name and is_mp_founder_with_vendor_b2b:
         next_action = (
             f"Locate operational CMO / Head of Digital via decision_maker_search_query on LinkedIn before pitching analytics "
@@ -1164,8 +1294,8 @@ def evaluate_qualification_v180(
         )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         next_action = (
-            f"Contact {dm_name} ({dm_role}) via LinkedIn{pred_email_clause} or send B2B discovery proposal to {best_email}"
-            f"{stack_ref_clause}{phone_note}"
+            f"Use decision_maker_search_query on LinkedIn to locate CMO/Head of Digital{pred_email_clause}, "
+            f"or request warm referral via {best_email} (listed executive: {dm_name})"
         )
     elif best_email_type in (
         'customer_support_inbox', 'pr_and_media_inbox', 'wholesale_or_sales_inbox',
@@ -1234,9 +1364,9 @@ def build_manual_seed_record(
     checked_at: str,
     playwright_available: bool = True
 ) -> dict:
-    # Локальний імпорт усередині функції усуває циклічну залежність із src.domain_helpers
     from .domain_helpers import (
         build_compliance_note,
+        derive_data_source_sensitivity,
         derive_gdpr_jurisdiction,
         derive_human_contact_tier,
         derive_legal_basis_for_processing,
@@ -1360,7 +1490,18 @@ def build_manual_seed_record(
         is_same_person_email=verify_person_email_match(dm_name, best_email),
     )
 
+    opp_score = compute_account_opportunity_score(cat, tech_info)
+    contact_lvl = derive_contactability_level(
+        best_email,
+        best_email_type,
+        dm_name,
+        seed.get('decision_maker_linkedin_url'),
+        primary_phone,
+        'OBSERVED_ON_SITE' if best_email else 'NONE',
+    )
+
     c_hint = detect_country_hint(canonical_domain, '', '', primary_phone, '')
+    jur_str = derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, '')
     tz_info = resolve_prospect_timezone_and_locale_v23(
         canonical_domain, primary_phone, c_hint, '', page_title=seed.get('page_title') or ''
     )
@@ -1378,6 +1519,8 @@ def build_manual_seed_record(
         'cached_snapshot_age_days': age_days,
         'error_message': truncate_error_msg(f'Live {short_err_msg}; served verified manual_seed from {verified_at}'),
         'data_quality_score': dq_score,
+        'account_opportunity_score': opp_score,
+        'contactability_level': contact_lvl,
         'sales_readiness_verdict': sales_readiness_verdict,
         'sales_actionability_class': derive_sales_actionability_class(sales_readiness_verdict, cat),
         'company_category': cat,
@@ -1396,8 +1539,9 @@ def build_manual_seed_record(
             f'(age={age_days}d, verified_at={verified_at}).'
         ),
         'gdpr_eu_domain': is_eu_gdpr,
-        'gdpr_jurisdiction': derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, ''),
+        'gdpr_jurisdiction': jur_str,
         'legal_basis_for_processing': derive_legal_basis_for_processing(canonical_domain, c_hint, bool(best_email or dm_name or primary_phone)),
+        'data_source_sensitivity': derive_data_source_sensitivity(dm_src_type, seed.get('email_source_type', 'contact_page'), jur_str),
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, seed.get('decision_maker_linkedin_url')),
@@ -1412,6 +1556,9 @@ def build_manual_seed_record(
         'best_email': best_email,
         'email_domain': f'{canonical_domain} (matches_site)' if best_email else None,
         'best_email_type': best_email_type,
+        'best_email_confidence': 'OBSERVED_ON_SITE' if best_email else 'NONE',
+        'dm_predicted_email': None,
+        'dm_predicted_email_status': 'not_generated',
         'email_source_type': seed.get('email_source_type', 'contact_page'),
         'email_source_note': seed.get('email_source_note', 'Verified via manual audit seed'),
         'named_email_owner_role_hint': None,
