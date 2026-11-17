@@ -262,7 +262,9 @@ def detect_tech_with_evidence(
     """
     html_str = html or ''
     gtm_str = gtm_js or ''
-    html_low = html_str.lower()
+    # Відокремлюємо синтетичні коментарі заголовків і мережевих запитів перед скануванням тіла HTML
+    html_clean_body = PW_NET_REQ_COMMENT_RE.sub('', HTTP_HEADERS_COMMENT_RE.sub('', html_str))
+    html_low = html_clean_body.lower()
     gtm_low = gtm_str.lower()
 
     evidence_map: Dict[str, Dict[str, str]] = {}
@@ -323,7 +325,7 @@ def detect_tech_with_evidence(
     if valid_gtms:
         _record_tech('Google Tag Manager', 'configured_in_code', 'html', f'Container IDs: {", ".join(valid_gtms[:4])}')
 
-    html_ga4_ids = _extract_ga4_ids_from_text(html_str, is_gtm=False)
+    html_ga4_ids = _extract_ga4_ids_from_text(html_clean_body, is_gtm=False)
     gtm_ga4_ids = _extract_ga4_ids_from_text(gtm_str, is_gtm=True)
     net_ga4_ids = set(runtime_ga4_hit_counts.keys())
 
@@ -335,7 +337,7 @@ def detect_tech_with_evidence(
         _record_tech('Google Analytics (GA4)', 'configured_in_code', src_lbl, f'Measurement IDs: {", ".join(all_sample)}')
 
     # Google Ads Conversion (AW-XXXXXX)
-    gads_html = set(GOOGLE_ADS_REGEX.findall(html_str))
+    gads_html = set(GOOGLE_ADS_REGEX.findall(html_clean_body))
     gads_gtm = set(GOOGLE_ADS_REGEX.findall(gtm_str))
     if gads_html or gads_gtm:
         aw_sample = sorted(gads_html | gads_gtm)[:3]
@@ -347,19 +349,19 @@ def detect_tech_with_evidence(
         )
 
     # sGTM у коді HTML або GTM
-    for m_loader in SGTM_CUSTOM_LOADER_REGEX.findall(html_str):
+    for m_loader in SGTM_CUSTOM_LOADER_REGEX.findall(html_clean_body):
         _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'Custom sGTM loader: {m_loader[:100]}')
-    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_str + '\n' + gtm_str):
+    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_clean_body + '\n' + gtm_str):
         sgtm_hosts.add(m_coll.lower())
         _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'First-party sGTM endpoint: {m_coll}')
 
     # Consent Mode v2 у коді HTML/GTM
-    for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(html_str + '\n' + gtm_str):
+    for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(html_clean_body + '\n' + gtm_str):
         consent_mode_signals.add(f'gcs={gcs_m}')
-    for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(html_str + '\n' + gtm_str):
+    for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(html_clean_body + '\n' + gtm_str):
         consent_mode_signals.add(f'gcd={gcd_m}')
 
-    # Сигнатури рекламних пікселів та аналітики в HTML / GTM
+    # Сигнатури рекламних пікселів та аналітики в тілі HTML / GTM
     for tech_name, sigs in AD_AND_ANALYTICS_SIGNATURES.items():
         matched_html = next((s for s in sigs if s in html_low), None)
         if matched_html:
