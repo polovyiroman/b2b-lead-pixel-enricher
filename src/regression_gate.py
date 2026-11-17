@@ -1,7 +1,7 @@
 import asyncio
 import hashlib
 import inspect
-from typing import Callable
+from typing import Any, Callable
 from bs4 import BeautifulSoup
 
 from .config import (
@@ -98,7 +98,7 @@ class _MockAsyncClient:
 
 def _run_fetch_html_safely_sync_check() -> None:
     """
-    Тест №27 (v23.8.1): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
+    Тест №27 (v23.8.2): Перевіряє fetch_html_safely на відсутність синтаксичної помилки `str | str`
     та верифікує повернення 4-елементного кортежу (status, html, final_url, err_msg) на мок-відповіді 200 OK.
     """
     src_code = inspect.getsource(fetch_html_safely)
@@ -142,10 +142,10 @@ def _run_fetch_html_safely_sync_check() -> None:
 def run_startup_regression_gate(
     log_fn: Callable[[str], None] | None = None,
     normalize_tech_fn: Callable[[dict], None] | None = None,
-    resolve_cache_comp_fn: Callable[[str, bool, bool], str] | None = None,
+    resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8.1).
+    Виконує 28 вбудованих юніт-тестів під час старту контейнера (Startup Regression Gate v23.8.2).
     Якщо будь-який інваріант порушено — миттєво зупиняє запуск із інформативним AssertionError.
     """
     # 1. Domain preparation & canonicalization
@@ -337,7 +337,7 @@ def run_startup_regression_gate(
     )
     assert 'Named Contact: n.koshel@netpeak.net' in hook_str
 
-    # 24. Optional callbacks from main.py
+    # 24. Optional callbacks from main.py (сумісно і з 3, і з 5 аргументами resolve_cache_merged_completeness)
     if normalize_tech_fn is not None:
         dummy_tech = {'detected_technologies_list': ['Meta Pixel', 'Shopify'], 'detected_cms_list': ['Shopify']}
         normalize_tech_fn(dummy_tech)
@@ -345,7 +345,11 @@ def run_startup_regression_gate(
         assert dummy_tech['has_google_ads'] is False
 
     if resolve_cache_comp_fn is not None:
-        assert resolve_cache_comp_fn('full', False, True) == 'partial_cached'
+        param_count = len(inspect.signature(resolve_cache_comp_fn).parameters)
+        if param_count >= 5:
+            assert resolve_cache_comp_fn(False, False, True, False, 'full') == 'partial_cached'
+        else:
+            assert resolve_cache_comp_fn('full', False, True) == 'partial_cached'
 
     # 25. Utility helpers
     assert sanitize_kv_key('https://rozetka.com.ua/') == 'https___rozetka.com.ua_'
@@ -356,4 +360,4 @@ def run_startup_regression_gate(
     _run_fetch_html_safely_sync_check()
 
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8.1 Store Gold Master).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 28/28 unit & integration tests green (v23.8.2 Store Gold Master).')
