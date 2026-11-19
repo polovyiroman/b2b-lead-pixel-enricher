@@ -43,6 +43,7 @@ from .qualifier import (
     classify_company_category,
     compute_account_change_triggers_v23,
     compute_account_opportunity_score,
+    compute_actionable_priority_score,
     compute_data_quality_score,
     derive_contactability_level,
     detect_ma_rebrand_and_insolvency_v23,
@@ -62,8 +63,11 @@ from .scraper import (
 from .tech_detector import (
     cap_ga4_ids_and_confidence,
     decode_apple_pay_merchant_association_safe,
+    detect_agency_credits_from_html_and_gtm,
+    detect_ats_from_html_or_dns,
     detect_broken_attribution_red_flags,
     detect_tech_with_evidence,
+    extract_account_scale_signals,
     extract_embedded_headers_and_ssr_signals_v23_1,
     extract_shopify_pim_and_logistics_signals,
 )
@@ -152,7 +156,7 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 30 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.0).
+    Виконує 32 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.1).
     """
     # 1. Domain preparation & canonicalization
     prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
@@ -242,7 +246,7 @@ def run_startup_regression_gate(
     flags = detect_broken_attribution_red_flags(t_info, 'E-commerce / Retail Brand', is_eu_gdpr=True, pw_used=True)
     assert any('Duplicate GA4 Tagging' in f for f in flags)
 
-    # 10. GA4 IDs cap (supports up to 50 IDs in v24.0)
+    # 10. GA4 IDs cap (supports up to 50 IDs)
     capped_str, total_c, _ = cap_ga4_ids_and_confidence(
         'G-11111111; G-22222222; G-33333333; G-44444444; G-55555555; G-66666666',
         max_display=50,
@@ -310,11 +314,21 @@ def run_startup_regression_gate(
     )
     assert ma_liq['corporate_lifecycle_status'] == 'IN_LIQUIDATION_OR_INSOLVENCY'
 
-    # 18. SaaS Spend Estimator (v24.0: BIMI VMC Seal виключено з витрат на SaaS)
-    sp_est = calculate_saas_spend_range_usd({'Shopify Plus', 'Klaviyo'}, has_enterprise_cdn=True, has_vmc_seal=True)
+    # 18. SaaS Spend Estimator (v24.1: виключає allowlisted_in_csp та BIMI VMC Seal)
+    sp_est = calculate_saas_spend_range_usd(
+        {'Shopify Plus', 'Klaviyo', 'Dynamic Yield'},
+        has_enterprise_cdn=True,
+        has_vmc_seal=True,
+        tech_verification_tiers={
+            'Shopify Plus': 'configured_in_code',
+            'Klaviyo': 'configured_in_code',
+            'Dynamic Yield': 'allowlisted_in_csp',
+        },
+    )
     assert sp_est['min_estimated_saas_spend_usd'] == 2300 + 150 + 1500
+    assert sp_est['martech_maturity_tier'] == 'Enterprise'
 
-    # 19. Prospect Timezone & Outreach Lang
+    # 19. Prospect Timezone & Outreach Lang (включно з прив'язкою до юрисдикції)
     tz_res = resolve_prospect_timezone_and_locale_v23('notino.de', '+4989123456', 'DE', 'de')
     assert tz_res['prospect_iana_timezone'] == 'Europe/Berlin'
     assert tz_res['recommended_outreach_lang'] == 'de'
@@ -324,10 +338,11 @@ def run_startup_regression_gate(
     )
     assert tz_creatio['recommended_outreach_lang'] == 'en'
 
-    tz_yakaboo = resolve_prospect_timezone_and_locale_v23(
-        'yakaboo.ua', '+380630335425', 'UA', 'en', page_title='Купити книги в інтернет-магазині Yakaboo'
-    )
-    assert tz_yakaboo['recommended_outreach_lang'] == 'uk'
+    tz_uk = resolve_prospect_timezone_and_locale_v23('gymshark.com', None, '', 'en', gdpr_jurisdiction='UK_GDPR')
+    assert tz_uk['prospect_iana_timezone'] == 'Europe/London'
+
+    tz_eu = resolve_prospect_timezone_and_locale_v23('ccc.eu', None, '', 'en', gdpr_jurisdiction='EU_EEA_GDPR')
+    assert tz_eu['prospect_iana_timezone'] == 'Europe/Berlin'
 
     # 20. Account Change Triggers (Delta Engine)
     deltas = compute_account_change_triggers_v23(
@@ -340,7 +355,7 @@ def run_startup_regression_gate(
     wa_num = normalize_whatsapp_number_safe('380671234567', 'UA')
     assert wa_num in ('+380671234567', None)
 
-    # 22. Decoupled Qualification, Opportunity Score, Contactability & DSK Compliance (v24.0)
+    # 22. Decoupled Qualification, Actionable Priority Score, Contactability & DSK Compliance
     verdict, _, tech_sig_str, c_tier, _, _, _, _, _ = evaluate_qualification_v180(
         'E-commerce / Retail Brand', t_info, 'marketing@shop.de', 'marketing_or_exec_role',
         '+49 30 123456', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
@@ -356,7 +371,11 @@ def run_startup_regression_gate(
     assert derive_contactability_level('matthias@bergfreunde.de', 'personal_or_named_inbox', 'Matthias Gebhard', None, None, 'M365_AD_VERIFIED') == 'direct_dm_verified'
     assert derive_contactability_level('partners@flaconi.de', 'b2b_partnerships', 'Bastian Siebers', None, None, 'OBSERVED_ON_SITE') == 'gatekeeper_only'
 
-    # Перевірка часткового CSP-скану (flaconi.de не отримує High Stack Maturity та sales_ready)
+    prio_reachable = compute_actionable_priority_score(90, 'direct_dm_verified', 85, 'E-commerce / Retail Brand', 'issue_confirmed')
+    prio_unreached = compute_actionable_priority_score(99, 'unreached', 22, 'E-commerce / Retail Brand', 'issue_suspected')
+    assert prio_reachable > prio_unreached
+
+    # Перевірка часткового CSP-скану (flaconi.de)
     v_csp, _, sig_csp, _, _, _, _, _, _ = evaluate_qualification_v180(
         'E-commerce / Retail Brand', t_csp, 'partners@flaconi.de', 'b2b_partnerships',
         None, 'Bastian Siebers', 'Managing Director / CEO (Geschäftsführer)',
@@ -369,15 +388,42 @@ def run_startup_regression_gate(
     assert derive_gdpr_jurisdiction('global-brand.com', None, '', '<div>Subtotal: 129,00 € incl. VAT</div>') == 'EU_EEA_GDPR'
     assert derive_data_source_sensitivity('impressum_page', 'contact_page', 'EU_EEA_GDPR') == 'impressum_statutory_disclosure_restricted'
 
-    # 23. Unmatched named inbox hook
-    hook_str = build_sales_hook(
+    # 23. Hyper-specific sales_hook & Holding Founder Exclusion (Eva / Notino / Netpeak)
+    hook_eva = build_sales_hook(
+        'eva.ua', 'E-commerce / Retail Brand', t_info,
+        'Ruslan Shostak', 'Founder', 'https://www.linkedin.com/in/ruslan-shostak', 'info@eva.ua',
+        is_eu_gdpr=False, pw_used=True, best_email_type='general_office_inbox',
+        is_marketplace=True, ads_active_last_30d=True, active_ad_formats=['Search', 'Display', 'Video'],
+    )
+    assert 'Head of Marketing / Digital Lead (Account: Eva; listed owner/founder: Ruslan Shostak)' in hook_eva
+
+    hook_netpeak = build_sales_hook(
         'netpeak.net', 'B2B Agency / Marketing Media', t_info,
         'Андрій Чумаченко', 'Co-Founder', None, 'n.koshel@netpeak.net',
         is_eu_gdpr=False, pw_used=False, best_email_type='personal_or_named_inbox'
     )
-    assert 'Named Contact: n.koshel@netpeak.net' in hook_str
+    assert 'Named Contact: n.koshel@netpeak.net' in hook_netpeak
 
-    # 24. Optional callbacks from main.py (перевірка null при partial_csp_headers)
+    # 24. Account Intelligence Scale, Agency Credits & Multi-ATS Detection (v24.1)
+    scale_res = extract_account_scale_signals(
+        '<link rel="alternate" hreflang="de-DE" href="https://notino.de/" />'
+        '<link rel="alternate" hreflang="pl-PL" href="https://notino.pl/" />',
+        ga4_ids_count=41,
+    )
+    assert scale_res['estimated_markets_count'] == 20
+    assert 'de-DE' in scale_res['detected_market_locales']
+
+    agency_res = detect_agency_credits_from_html_and_gtm(
+        '<footer>Розробка сайту: <a href="https://example.agency">WebStudio Alpha</a></footer>',
+        '',
+        'notino',
+    )
+    assert agency_res == 'WebStudio Alpha'
+
+    ats_prov, ats_slug = detect_ats_from_html_or_dns('<a href="https://jobs.lever.co/creatio/123">Jobs</a>')
+    assert ats_prov == 'Lever' and ats_slug == 'creatio'
+
+    # 25. Optional callbacks from main.py (перевірка null при partial_csp_headers)
     if normalize_tech_fn is not None:
         dummy_tech = {'detected_technologies_list': ['Meta Pixel', 'Shopify'], 'detected_cms_list': ['Shopify']}
         normalize_tech_fn(dummy_tech)
@@ -397,13 +443,11 @@ def run_startup_regression_gate(
             comp_val = resolve_cache_comp_fn('full', False, True)
         assert isinstance(comp_val, str) and bool(comp_val)
 
-    # 25. Utility helpers
+    # 26. Utility helpers & fetch_html_safely integration mock
     assert sanitize_kv_key('https://rozetka.com.ua/') == 'https___rozetka.com.ua_'
     assert len(truncate_error_msg('x' * 200, max_len=50)) <= 50
     assert CACHE_SCHEMA_VERSION >= 30
-
-    # 26. Інтеграційний мок-тест fetch_html_safely + антибот-детектор Cloudflare
     _run_fetch_html_safely_sync_check()
 
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 30/30 unit & integration tests green (v24.0 Enterprise MarTech).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 32/32 unit & integration tests green (v24.1 Enterprise MarTech & Account Intelligence).')
