@@ -99,7 +99,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v24.0 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
+# v24.1 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -268,30 +268,54 @@ def detect_ma_rebrand_and_insolvency_v23(
 def calculate_saas_spend_range_usd(
     detected_tech_set: Set[str],
     has_enterprise_cdn: bool = False,
-    has_vmc_seal: bool = False
+    has_vmc_seal: bool = False,
+    tech_verification_tiers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Виправлено (v24.0): BIMI VMC Seal виключено з оцінки витрат на SaaS-продукти,
-    оскільки це сертифікат поштового логотипу бренду, а не MarTech/SaaS-підписка.
+    Виправлено (v24.1):
+    1. Заборонено розрахунок витрат за сигналами рівня `allowlisted_in_csp` (кейс flaconi.de).
+    2. Виключено поштовий сертифікат BIMI VMC Seal із витрат на SaaS.
+    3. Додано якісну класифікацію зрілості стеку `martech_maturity_tier`.
     """
     min_total = 0
     max_total = 0
     basis: List[str] = []
-    for tech in sorted(detected_tech_set):
+    tiers_map = tech_verification_tiers or {}
+
+    confirmed_techs = {
+        t for t in detected_tech_set
+        if tiers_map.get(t) != "allowlisted_in_csp"
+    }
+
+    for tech in sorted(confirmed_techs):
         if tech in SAAS_PRICING_RANGE_USD:
             lo, hi = SAAS_PRICING_RANGE_USD[tech]
             min_total += lo
             max_total += hi
             basis.append(f"{tech} (est. ${lo}-${hi}/mo)")
+
     if has_enterprise_cdn:
         min_total += 1500
         max_total += 4000
         basis.append("Enterprise CDN (est. $1500-$4000/mo)")
+
+    if min_total >= 2000 or "Server-Side GTM (sGTM)" in confirmed_techs or len(confirmed_techs) >= 6:
+        maturity_tier = "Enterprise"
+    elif min_total >= 400 or len(confirmed_techs) >= 4:
+        maturity_tier = "Mid-Market"
+    elif len(confirmed_techs) >= 2:
+        maturity_tier = "Growth"
+    elif len(confirmed_techs) >= 1:
+        maturity_tier = "Basic"
+    else:
+        maturity_tier = "Unverified / Minimal"
+
     return {
         "min_estimated_saas_spend_usd": min_total,
         "estimated_saas_spend_min_usd": min_total,
         "estimated_saas_spend_max_usd": max_total,
         "spend_estimation_basis": basis[:10],
+        "martech_maturity_tier": maturity_tier,
     }
 
 
@@ -301,7 +325,12 @@ def resolve_prospect_timezone_and_locale_v23(
     detected_country_code: str = "",
     html_lang_attr: str = "",
     page_title: str = "",
+    gdpr_jurisdiction: str = "",
 ) -> Dict[str, str]:
+    """
+    Виправлено (v24.1): Прив'язує дефолтну таймзону до юрисдикції (UK_GDPR -> Europe/London,
+    EU_EEA_GDPR -> Europe/Berlin, UA_PDP -> Europe/Kyiv), якщо TLD є загальним (.com/.eu/.net).
+    """
     clean_dom = domain.lower().strip().rstrip(".")
     parts = clean_dom.split(".")
     tld_1 = parts[-1] if parts else ""
@@ -331,9 +360,19 @@ def resolve_prospect_timezone_and_locale_v23(
             pass
 
     cc_low = (detected_country_code or "").strip().lower()
+    jur_up = (gdpr_jurisdiction or "").strip().upper()
+
     if not tz:
         if cc_low in EXACT_TLD_TO_TZ_AND_LANG:
             tz, default_lang = EXACT_TLD_TO_TZ_AND_LANG[cc_low]
+        elif jur_up == "UK_GDPR":
+            tz, default_lang = ("Europe/London", "en")
+        elif jur_up == "UA_PDP":
+            tz, default_lang = ("Europe/Kyiv", "uk")
+        elif jur_up == "CH_FADP":
+            tz, default_lang = ("Europe/Zurich", "de")
+        elif jur_up == "EU_EEA_GDPR":
+            tz, default_lang = ("Europe/Berlin", "en")
         elif cc_low == "us":
             tz, default_lang = ("America/New_York", "en")
         elif cc_low == "ca":
@@ -381,10 +420,13 @@ def compute_account_change_triggers_v23(
     if prev_record.get("ads_active_last_30d") is False and curr_record.get("ads_active_last_30d") is True:
         triggers.append("AD_CAMPAIGN_NEWLY_LAUNCHED")
 
-    old_jobs = int(prev_record.get("open_positions_total") or 0)
-    new_jobs = int(curr_record.get("open_positions_total") or 0)
-    if new_jobs >= old_jobs + 3:
-        triggers.append(f"HIRING_SURGE (+{new_jobs - old_jobs} open roles)")
+    old_jobs_raw = prev_record.get("open_positions_total")
+    new_jobs_raw = curr_record.get("open_positions_total")
+    if old_jobs_raw is not None and new_jobs_raw is not None:
+        old_jobs = int(old_jobs_raw)
+        new_jobs = int(new_jobs_raw)
+        if new_jobs >= old_jobs + 3:
+            triggers.append(f"HIRING_SURGE (+{new_jobs - old_jobs} open roles)")
 
     old_tech = {t.strip() for t in str(prev_record.get("detected_technologies") or "").split(";") if t.strip()}
     new_tech = {t.strip() for t in str(curr_record.get("detected_technologies") or "").split(";") if t.strip()}
@@ -412,7 +454,7 @@ def compute_account_change_triggers_v23(
 
 
 # ==============================================================================
-# v24.0 Decoupled Qualification Axes: Account Opportunity Score & Contactability
+# v24.1 Decoupled Qualification Axes + Composite Actionable Priority Score
 # ==============================================================================
 
 def compute_account_opportunity_score(
@@ -421,11 +463,10 @@ def compute_account_opportunity_score(
     ads_active_last_30d: bool | None = None,
     red_flags_count: int = 0,
     min_saas_spend_usd: int = 0,
-    open_positions_total: int = 0,
+    open_positions_total: int | None = None,
 ) -> int:
     """
-    Нова вісь v24.0: Оцінює суто комерційну цінність та MarTech-прогалини акаунта (0–100)
-    незалежно від того, чи знайдено на сайті прямий email керівника.
+    Оцінює суто комерційну цінність та MarTech-прогалини акаунта (0–100).
     """
     if company_category == 'Non-Profit / Education / Institution':
         return 5
@@ -457,7 +498,6 @@ def compute_account_opportunity_score(
         if tech_info.get('has_ga4') or tech_info.get('has_gtm'):
             score += 8
 
-    # Активні оголошення в Google Ads Transparency + відсутність Server-Side GTM
     if ads_active_last_30d is True:
         score += 18
         if not tech_info.get('has_sgtm'):
@@ -465,17 +505,15 @@ def compute_account_opportunity_score(
     elif ad_pixels >= 1 and not tech_info.get('has_sgtm') and scan_comp == 'full':
         score += 8
 
-    # Конкретні технічні болі (Duplicate GA4 / EU Consent Mode v2 Gap)
     if red_flags_count >= 1:
         score += min(20, red_flags_count * 12)
 
-    # Зрілість бюджету та найм
     if min_saas_spend_usd >= 1000:
         score += 10
     elif min_saas_spend_usd >= 150:
         score += 6
 
-    if open_positions_total >= 3:
+    if open_positions_total is not None and int(open_positions_total) >= 3:
         score += 6
 
     return max(0, min(100, score))
@@ -489,13 +527,6 @@ def derive_contactability_level(
     primary_phone: str | None,
     best_email_confidence: str = 'NONE',
 ) -> str:
-    """
-    Нова вісь v24.0: Чітко класифікує доступність каналу комунікації:
-      - `direct_dm_verified`: підтверджена особиста пошта або профіль LinkedIn ЛПР;
-      - `role_inbox_ready`: пряма пошта відділу маркетингу / керівництва (`marketing@`);
-      - `gatekeeper_only`: загальні/партнерські скриньки (`info@`, `partners@`, `b2b@`), лише ПІБ або телефон;
-      - `unreached`: немає жодного контакту для аутрічу.
-    """
     is_same_person_email = verify_person_email_match(dm_name, best_email)
     is_same_person_li = verify_person_linkedin_match(dm_name, dm_linkedin_url)
 
@@ -510,6 +541,34 @@ def derive_contactability_level(
     if best_email or dm_name or primary_phone:
         return 'gatekeeper_only'
     return 'unreached'
+
+
+def compute_actionable_priority_score(
+    account_opportunity_score: int,
+    contactability_level: str,
+    data_quality_score: int,
+    company_category: str = '',
+    sales_gap_confidence: str | None = None,
+) -> int:
+    """
+    Новий композитний індекс v24.1 (0–100):
+    Поєднує цінність технічної проблеми, підтвердженість болю, повноту даних і реальну доступність контакту,
+    щоб закриті домени без контактів (unreached) не перекривали готові до роботи ліди.
+    """
+    if company_category == 'Non-Profit / Education / Institution':
+        return 5
+
+    contact_weights: Dict[str, Tuple[float, int]] = {
+        'direct_dm_verified': (1.00, 12),
+        'role_inbox_ready': (0.90, 6),
+        'gatekeeper_only': (0.64, 0),
+        'unreached': (0.25, -5),
+    }
+    mult, bonus = contact_weights.get(contactability_level, (0.50, 0))
+    gap_bonus = 8 if sales_gap_confidence == 'issue_confirmed' else (3 if sales_gap_confidence == 'issue_suspected' else 0)
+
+    raw = (account_opportunity_score * mult) + (data_quality_score * 0.15) + bonus + gap_bonus
+    return max(0, min(100, int(round(raw))))
 
 
 # ==============================================================================
@@ -786,7 +845,17 @@ def build_sales_hook(
     is_eu_gdpr: bool = False,
     pw_used: bool = False,
     best_email_type: str | None = None,
+    is_marketplace: bool = False,
+    ads_active_last_30d: bool | None = None,
+    active_ad_formats: list[str] | None = None,
 ) -> str:
+    """
+    v24.1 Hyper-Specific Account Hook Generator:
+    1. На великих ритейлерах не підставляє мільярдерів-засновників холдингів (Ruslan Shostak, Галина Герега)
+       як адресатів технічного листа — переадресовує на Head of Marketing / Digital Lead.
+    2. Вшиває конкретні артефакти акаунта (кількість регіональних GA4 ID, ID контейнера GTM,
+       конкретні формати реклами з Google Ads Transparency).
+    """
     brand = canonical_domain.split('.')[0].capitalize() if canonical_domain else 'Company'
     if company_category == 'Non-Profit / Education / Institution':
         return f'{brand} is a non-profit/institutional entity — exclude from commercial outbound.'
@@ -817,6 +886,8 @@ def build_sales_hook(
     techs = tech_info.get('detected_technologies_list') or []
     cms = tech_info.get('detected_cms')
     scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
+    ga4_count = int(tech_info.get('all_ga4_ids_count') or 0)
+    gtm_ids = tech_info.get('gtm_ids') or []
     has_gtm = bool(tech_info.get('has_gtm'))
     has_sgtm = bool(tech_info.get('has_sgtm'))
     has_ga4 = bool(tech_info.get('has_ga4'))
@@ -829,14 +900,24 @@ def build_sales_hook(
     dup_ga4_ids = tech_info.get('duplicate_ga4_ids') or []
     dup_runtime_confirmed = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
 
-    if is_unmatched_named_inbox:
+    role_low = (dm_role or '').lower()
+    is_holding_founder = (
+        bool(dm_name)
+        and not is_marketing_or_digital_role(dm_role)
+        and any(k in role_low for k in ('founder', 'co-founder', 'owner'))
+        and (is_marketplace or ga4_count >= 5)
+    )
+
+    if is_holding_founder:
+        dm_intro = f'Head of Marketing / Digital Lead (Account: {brand}; listed owner/founder: {dm_name})'
+    elif is_unmatched_named_inbox:
         dm_intro = f'Marketing Lead (via named contact {best_email}; listed {dm_role or "Exec"}: {dm_name})'
     elif dm_name:
         dm_intro = f'{dm_name} ({dm_role})'
     else:
         dm_intro = 'Marketing Lead'
 
-    li_badge = ' [LinkedIn verified]' if dm_linkedin_url else ''
+    li_badge = ' [LinkedIn verified]' if (dm_linkedin_url and not is_holding_founder) else ''
     stack_str = ', '.join(techs[:5]) if techs else ('Consent-gated / unverified stack' if has_consent else 'No public ad pixels detected')
     cms_str = f' on {cms}' if cms else ''
 
@@ -851,11 +932,35 @@ def build_sales_hook(
     if dup_ga4_ids:
         dup_id = dup_ga4_ids[0]
         dup_tag = 'duplicate_runtime_hits_confirmed' if dup_runtime_confirmed else 'duplicate_configuration_suspected'
+        gtm_ref = f"container {gtm_ids[0]} and " if gtm_ids else "your GTM container and "
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
             f"Stack: {stack_str} [Red Flag: Duplicate GA4 Tagging ({dup_id} in both HTML & GTM — {dup_tag})]. "
-            f"Opening Hook: \"Noticed {brand}'s GA4 property ({dup_id}) is present both in the page HTML "
-            f"and inside your GTM container — have you verified whether GTM firing triggers are deduplicating pageviews and conversions?\""
+            f"Opening Hook: \"Noticed {brand}'s {gtm_ref}page HTML are both firing GA4 property {dup_id} — "
+            f"have you audited trigger deduplication so pageviews and conversions aren't double-counted?\""
+        )
+
+    if ga4_count >= 5:
+        prop_clause = f"across your {ga4_count} regional GA4 properties"
+        gap_angle = (
+            "EEA Consent Mode v2 (gcs/gcd) signaling and cross-domain attribution"
+            if (is_eu_gdpr and has_gads and not has_cm_v2)
+            else ("server-side GTM standardization" if not has_sgtm else "CAPI event match quality")
+        )
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str} ({ga4_count} GA4 properties detected). "
+            f"Opening Hook: \"Saw {brand} manages multi-market tracking {prop_clause} — "
+            f"how is your team currently standardizing {gap_angle} across regions?\""
+        )
+
+    if ads_active_last_30d is True and not has_sgtm:
+        formats_str = ', '.join(active_ad_formats) if active_ad_formats else 'Search & Display'
+        return (
+            f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
+            f"Stack: {stack_str} [Active Ads Verified: {formats_str} without sGTM]. "
+            f"Opening Hook: \"Saw {brand} is actively running {formats_str} ads in Google Ads Transparency "
+            f"without observable server-side GTM — how are you protecting conversion match rates against browser ITP/cookie restrictions?\""
         )
 
     cm_v2_gap_note = ''
@@ -899,9 +1004,9 @@ def build_sales_hook(
             )
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str}. Multi-platform ad tracking tags ({paid_str}) configured on site (current campaign spend unverified). "
-            f"Opening Hook: \"Saw {brand} has {paid_str} tracking configured alongside GA4 — "
-            f"how are you currently validating cross-channel attribution and server-side signal recovery across your funnel?\""
+            f"Stack: {stack_str}. Multi-platform ad tracking tags ({paid_str}) configured on site. "
+            f"Opening Hook: \"Noticed {brand} is running client-side {paid_str} tags{cms_str} without observable server-side GTM — "
+            f"have you benchmarked how much conversion signal is lost to ad blockers and ITP?\""
         )
 
     if has_gtm or has_ga4:
@@ -1001,7 +1106,6 @@ def evaluate_qualification_v180(
     else:
         icp_fit_tier = 'Non-Target ICP (Non-Profit / Education / Institution)'
 
-    # Виправлено (v24.0): При partial_csp_headers (flaconi.de) не виставляємо High Stack Maturity
     if scan_comp == 'partial_csp_headers':
         tech_signal = (
             f"Unverified Stack (CSP Allowlist Only — Browser Render Needed; "
@@ -1187,7 +1291,6 @@ def evaluate_qualification_v180(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
-    # Виправлено (v24.0): sales_ready присвоюється лише коли є реальний прямий контакт або marketing@
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -1289,12 +1392,12 @@ def evaluate_qualification_v180(
         )
     elif dm_name and is_mp_founder_with_vendor_b2b:
         next_action = (
-            f"Locate operational CMO / Head of Digital via decision_maker_search_query on LinkedIn before pitching analytics "
+            f"Locate operational CMO / Head of Digital via company_linkedin_people_url or decision_maker_search_query before pitching analytics "
             f"(listed DM {dm_name} is {dm_role}, and {best_email} is a commercial/vendor B2B desk){phone_note}"
         )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         next_action = (
-            f"Use decision_maker_search_query on LinkedIn to locate CMO/Head of Digital{pred_email_clause}, "
+            f"Open company_linkedin_people_url or decision_maker_search_query to locate CMO/Head of Digital{pred_email_clause}, "
             f"or request warm referral via {best_email} (listed executive: {dm_name})"
         )
     elif best_email_type in (
@@ -1306,17 +1409,17 @@ def evaluate_qualification_v180(
         if predicted_dm_email and dm_name:
             next_action = (
                 f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-                f"test predicted DM email {predicted_dm_email} via verifier or message {dm_name} via decision_maker_search_query on LinkedIn{phone_note}"
+                f"test predicted DM email {predicted_dm_email} via verifier or message {dm_name} via LinkedIn{phone_note}"
             )
         else:
             next_action = (
                 f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-                f"locate Marketing Lead / DM{dm_hint} via decision_maker_search_query on LinkedIn{phone_note}"
+                f"locate Marketing Lead / DM{dm_hint} via company_linkedin_people_url or decision_maker_search_query{phone_note}"
             )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
             f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
-            f"NO DM found on site — use decision_maker_search_query on LinkedIn to find CMO/Head of Marketing first{phone_note}"
+            f"use company_linkedin_people_url or decision_maker_search_query to find CMO/Head of Marketing first{phone_note}"
         )
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
@@ -1326,11 +1429,11 @@ def evaluate_qualification_v180(
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
         dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
-            f"Locate CMO / Head of E-commerce{dm_hint} via decision_maker_search_query on LinkedIn{pred_email_clause} first; "
+            f"Locate CMO / Head of E-commerce{dm_hint} via company_linkedin_people_url or decision_maker_search_query{pred_email_clause} first; "
             f"use {best_email} only for warm gatekeeper routing / referral request"
         )
     elif primary_phone:
-        next_action = f"Use decision_maker_search_query on LinkedIn{pred_email_clause} or call {primary_phone} for routing"
+        next_action = f"Use company_linkedin_people_url or decision_maker_search_query{pred_email_clause} or call {primary_phone} for routing"
     else:
         next_action = (
             f"Run decision_maker_search_query in LinkedIn / Apollo{pred_email_clause} to locate marketing decision-maker{phone_note}"
@@ -1406,6 +1509,7 @@ def build_manual_seed_record(
         'has_gtm': ('Google Tag Manager' in seed_tech_set) or bool(seed.get('has_gtm', True)),
         'has_sgtm': ('Server-Side GTM (sGTM)' in seed_tech_set) or bool(seed.get('has_sgtm', False)),
         'all_ga4_ids': seed.get('all_ga4_ids'),
+        'all_ga4_ids_count': 1 if seed.get('all_ga4_ids') else 0,
         'ga4_detection_confidence': seed.get('ga4_detection_confidence', 'Verified (Manual Audit Seed)'),
         'detected_cms_list': [x.strip() for x in (seed.get('detected_cms') or '').split(';') if x.strip()],
         'detected_cms': seed.get('detected_cms'),
@@ -1441,7 +1545,7 @@ def build_manual_seed_record(
         li_url,
         False,
         'not_attempted_manual_seed',
-        is_mp_platform=False,
+        is_mp_platform=is_mp,
     )
 
     sales_hook = build_sales_hook(
@@ -1455,6 +1559,7 @@ def build_manual_seed_record(
         is_eu_gdpr=is_eu_gdpr,
         pw_used=False,
         best_email_type=best_email_type,
+        is_marketplace=is_mp,
     )
 
     deliv_str = seed.get(
@@ -1499,11 +1604,18 @@ def build_manual_seed_record(
         primary_phone,
         'OBSERVED_ON_SITE' if best_email else 'NONE',
     )
+    actionable_score = compute_actionable_priority_score(opp_score, contact_lvl, dq_score, cat, None)
 
     c_hint = detect_country_hint(canonical_domain, '', '', primary_phone, '')
     jur_str = derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, '')
     tz_info = resolve_prospect_timezone_and_locale_v23(
-        canonical_domain, primary_phone, c_hint, '', page_title=seed.get('page_title') or ''
+        canonical_domain, primary_phone, c_hint, '', page_title=seed.get('page_title') or '', gdpr_jurisdiction=jur_str
+    )
+
+    company_li_people_url = (
+        f"{li_url.rstrip('/')}/people/?keywords=marketing"
+        if (li_url and 'linkedin.com/company/' in li_url.lower())
+        else None
     )
 
     return {
@@ -1521,6 +1633,7 @@ def build_manual_seed_record(
         'data_quality_score': dq_score,
         'account_opportunity_score': opp_score,
         'contactability_level': contact_lvl,
+        'actionable_priority_score': actionable_score,
         'sales_readiness_verdict': sales_readiness_verdict,
         'sales_actionability_class': derive_sales_actionability_class(sales_readiness_verdict, cat),
         'company_category': cat,
@@ -1583,6 +1696,7 @@ def build_manual_seed_record(
         'decision_makers_found': dms_found_str,
         'decision_makers_json': dms_json_str,
         'decision_maker_linkedin_url': seed.get('decision_maker_linkedin_url'),
+        'company_linkedin_people_url': company_li_people_url,
         'decision_maker_search_query': build_linkedin_xray_query(canonical_domain, cat),
         'linkedin_url': li_url,
         'instagram_url': seed.get('instagram_url'),
@@ -1599,6 +1713,8 @@ def build_manual_seed_record(
         'sales_hook': sales_hook,
         'sales_opportunity': sales_opportunity,
         'next_best_action': next_best_action,
+        'primary_sales_gap': None,
+        'sales_gap_confidence': None,
         'technology_evidence_summary': tech_info['technology_evidence_summary'],
         'technology_evidence': tech_info['technology_evidence'],
         'technology_evidence_json': tech_info['technology_evidence_json'],
@@ -1616,18 +1732,25 @@ def build_manual_seed_record(
         'all_ga4_ids_count': 1 if tech_info['all_ga4_ids'] else None,
         'detected_technologies': seed.get('detected_technologies'),
         'detected_payment_gateways': [],
+        'martech_maturity_tier': 'Mid-Market',
         'min_estimated_saas_spend_usd': 0,
         'estimated_saas_spend_min_usd': 0,
         'estimated_saas_spend_max_usd': 0,
         'spend_estimation_basis': [],
-        'primary_sales_gap': None,
+        'estimated_markets_count': 1,
+        'detected_market_locales': [],
+        'catalog_estimated_skus': 0,
+        'ecom_avg_price': None,
+        'ecom_currency': None,
+        'logistics_and_returns_stack': [],
         'ads_rpc_status': 'not_checked',
         'ads_active_last_30d': None,
         'active_ad_formats': [],
         'advertiser_sister_domains': [],
         'detected_marketing_agency': None,
-        'open_positions_total': 0,
+        'open_positions_total': None,
         'hiring_departments': [],
+        'hiring_marketing_or_data_roles': None,
         'dmarc_policy': None,
         'email_security_gateway': None,
         'plain_text_outreach_required': False,
