@@ -1,27 +1,27 @@
 {
-  "title": "B2B MarTech & Account Intelligence Enricher (v24.0)",
-  "description": "Deep MarTech stack audit (GTM container unpacking, runtime GA4 duplicate detection, sGTM, EU Consent Mode v2 gaps), active ad spend intelligence (Google Ads Transparency RPC), 3-tier verification (CSP vs Code vs Runtime), decoupled Opportunity Score & Contactability, and GDPR / German §7 UWG compliance.",
+  "title": "B2B MarTech & Account Intelligence Enricher (v24.1)",
+  "description": "Built for MarTech/Analytics Agencies, Performance Agencies, CRO Consultants & MarTech SaaS Vendors: deep GTM container unpacking, runtime GA4 duplicate detection, sGTM & EU Consent Mode v2 gap analysis, Google Ads Transparency active spend verification, multi-ATS hiring feeds (Greenhouse/Lever/Workable/SmartRecruiters/Personio), market scale signals, composite actionable_priority_score, 1-click LinkedIn Marketing People links, and GDPR / German §7 UWG compliance.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "domains": {
       "sectionCaption": "1. Target Domains, Scan Mode & Output Format",
-      "sectionDescription": "Provide target company domains or URLs to audit their MarTech stack, ad activity, decision-makers, and compliance status.",
+      "sectionDescription": "Provide target company domains or URLs to audit their MarTech stack, ad spend signals, business scale, hiring feeds, and outbound contacts.",
       "title": "Target Domains / URLs",
       "type": "array",
-      "description": "List of company domains or URLs to enrich (e.g., 'intertop.ua', 'https://www.notino.de', 'bergfreunde.de').",
+      "description": "List of company domains or URLs to enrich (e.g., 'notino.de', 'yakaboo.ua', 'bergfreunde.de', 'stls.store').",
       "editor": "stringList",
       "prefill": [
-        "intertop.ua",
         "notino.de",
         "yakaboo.ua",
-        "netpeak.net"
+        "bergfreunde.de",
+        "stls.store"
       ]
     },
     "scanMode": {
       "title": "Scan Execution Mode",
       "type": "string",
-      "description": "Choose 'full_audit' to allow Playwright headless browser fallback when needed, or 'fast_http_only' for sub-second browserless HTTP/TLS/DNS execution (ideal for large batches and Standby API).",
+      "description": "Choose 'full_audit' to allow Playwright headless browser fallback when needed, or 'fast_http_only' for sub-second browserless HTTP/TLS/DNS execution (ideal for large 200+ domain batches and Standby API).",
       "editor": "select",
       "default": "full_audit",
       "enum": [
@@ -36,7 +36,7 @@
     "outputView": {
       "title": "Output Dataset View",
       "type": "string",
-      "description": "Choose 'full_audit' for all 132 technical & compliance columns, or 'sdr_compact' for a clean 34-column CRM-ready outbound view.",
+      "description": "Choose 'full_audit' for all 143 technical, scale & compliance columns, or 'sdr_compact' for a clean 42-column CRM-ready outbound view.",
       "editor": "select",
       "default": "full_audit",
       "enum": [
@@ -44,14 +44,14 @@
         "sdr_compact"
       ],
       "enumTitles": [
-        "Full MarTech & Compliance Audit (132 Columns)",
-        "SDR / Agency Outbound View (34 Columns)"
+        "Full MarTech & Account Intelligence Audit (143 Columns)",
+        "SDR / Agency Outbound View (42 Columns)"
       ]
     },
     "disableDeepOsint": {
       "title": "Disable 2-Wave Deep OSINT DAG (Minimal HTTP Mode)",
       "type": "boolean",
-      "description": "By default (false), runs fast browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SEG, Google Ads Transparency RPC, Wikidata, VIES/GLEIF, RDAP, and M365 AD email verification. Check to disable.",
+      "description": "By default (false), runs fast browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SEG, Google Ads Transparency RPC, multi-ATS job feeds, Wikidata, VIES/GLEIF, RDAP, and M365 AD email verification.",
       "editor": "checkbox",
       "default": false
     },
@@ -125,9 +125,9 @@
     "scanContactPages": {
       "sectionCaption": "4. Performance & Proxy Configuration",
       "sectionDescription": "Fine-tune subpage crawling, GTM container unpacking, concurrency, and Apify Proxy settings.",
-      "title": "Crawl Contact, About & Impressum Subpages",
+      "title": "Crawl Contact, About, Team & Impressum Subpages",
       "type": "boolean",
-      "description": "Automatically discovers and scans /contact, /about, /team, /b2b, and /impressum pages for executive names and B2B emails.",
+      "description": "Automatically discovers and scans /contact, /about, /team, /leadership, /b2b, and /impressum pages for marketing leaders and B2B emails.",
       "editor": "checkbox",
       "default": true
     },
