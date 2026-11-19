@@ -35,6 +35,45 @@ SHOPIFY_SHOP_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+HREFLANG_LINK_RE = re.compile(
+    r'<link[^>]+rel=["\']alternate["\'][^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\']|'
+    r'<link[^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\'][^>]+rel=["\']alternate["\']',
+    re.IGNORECASE,
+)
+
+ATS_HTML_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
+    ('Greenhouse', re.compile(r'boards(?:-api)?\.greenhouse\.io/(?:v1/boards/)?([a-z0-9_-]+)', re.I)),
+    ('Lever', re.compile(r'jobs\.lever\.co/([a-z0-9_-]+)', re.I)),
+    ('Workable', re.compile(r'apply\.workable\.com/(?:api/v3/accounts/)?([a-z0-9_-]+)', re.I)),
+    ('SmartRecruiters', re.compile(r'jobs\.smartrecruiters\.com/([a-z0-9_-]+)', re.I)),
+    ('Personio', re.compile(r'([a-z0-9-]+)\.jobs\.personio\.(?:de|com)', re.I)),
+    ('Teamtailor', re.compile(r'([a-z0-9-]+)\.teamtailor\.com', re.I)),
+    ('Ashby', re.compile(r'jobs\.ashbyhq\.com/([a-z0-9_-]+)', re.I)),
+)
+
+MARKETING_DATA_JOB_RE = re.compile(
+    r'\b(?:marketing|growth|performance|ppc|seo|crm|retention|e-?commerce|ecommerce|'
+    r'digital|analytics|analyst|data|cro|conversion|paid\s+social|paid\s+search|'
+    r'brand|content|маркетинг|аналітик|трафік|конверс)\b',
+    re.IGNORECASE,
+)
+
+AGENCY_CREDIT_RE = re.compile(
+    r'(?:розробка\s+(?:та\s+підтримка\s+)?сайту|створення\s+сайту|дизайн\s+та\s+розробка|'
+    r'seo[\s\-]просування|просування\s+сайту|created\s+by|developed\s+by|designed\s+by|'
+    r'website\s+by|site\s+by|built\s+by|digital\s+partner|realisierung|webdesign\s+by|'
+    r'conception\s+et\s+réalisation|realizacja)\s*[:\-–—]?\s*'
+    r'(?:<a[^>]*>)?([A-ZА-ЯІЇЄҐ0-9][A-Za-zА-Яа-яІЇЄҐіїєґ0-9\s.&\-]{2,42})(?:</a>)?',
+    re.IGNORECASE,
+)
+
+AGENCY_CREDIT_NOISE = {
+    'shopify', 'wordpress', 'webflow', 'wix', 'tilda', 'squarespace', 'magento',
+    'woocommerce', 'shopware', 'prestashop', 'opencart', 'bitrix', 'horoshop',
+    'cloudflare', 'vercel', 'netlify', 'aws', 'google', 'all rights reserved',
+    'всі права захищено', 'все права защищены', 'cookie', 'privacy', 'terms',
+}
+
 COOKIE_TECH_SIGNATURES: Dict[str, str] = {
     'fpid': 'Server-Side GTM (sGTM)',
     '_ga': 'Google Analytics (GA4)',
@@ -229,6 +268,102 @@ def extract_shopify_pim_and_logistics_signals(html: str) -> Dict[str, Any]:
     return out
 
 
+def extract_account_scale_signals(
+    html: str,
+    ga4_ids_count: int | None = None,
+    advertiser_sister_domains: list[str] | None = None,
+) -> Dict[str, Any]:
+    """
+    v24.1 Account Scale Intelligence:
+    Визначає географічний масштаб бізнесу (estimated_markets_count, detected_market_locales)
+    на основі <link rel="alternate" hreflang="...">, мульти-властивостей GA4 та сестринських доменів.
+    """
+    locales: Set[str] = set()
+    if html:
+        for g1, g2 in HREFLANG_LINK_RE.findall(html[:120000]):
+            loc = (g1 or g2 or '').strip()
+            if loc and loc.lower() != 'x-default':
+                locales.add(loc)
+
+    country_codes: Set[str] = set()
+    for loc in locales:
+        parts = loc.split('-')
+        code = parts[-1].upper() if len(parts) == 2 else parts[0].upper()
+        if len(code) == 2:
+            country_codes.add(code)
+
+    ga4_cnt = int(ga4_ids_count or 0)
+    sister_cnt = len(advertiser_sister_domains or [])
+    ga4_market_est = max(1, ga4_cnt // 2) if ga4_cnt >= 4 else 1
+
+    est_markets = max(1, len(country_codes), ga4_market_est, sister_cnt)
+    return {
+        'estimated_markets_count': est_markets,
+        'detected_market_locales': sorted(locales)[:20],
+    }
+
+
+def detect_agency_credits_from_html_and_gtm(
+    html: str,
+    gtm_js: str = '',
+    brand_root: str = '',
+) -> Optional[str]:
+    """
+    v24.1 Competitive Agency Intelligence:
+    Виявляє веб-студію, розробника або performance-агенцію у футері сайту чи GTM-контейнері.
+    """
+    b_low = (brand_root or '').lower().strip()
+    if html:
+        tail = html[-35000:] if len(html) > 35000 else html
+        for m in AGENCY_CREDIT_RE.finditer(tail):
+            cand = ' '.join(m.group(1).split()).strip(' .,:;-–—|/\\"\'')
+            cand_low = cand.lower()
+            if len(cand) < 3 or len(cand) > 40:
+                continue
+            if any(noise in cand_low for noise in AGENCY_CREDIT_NOISE):
+                continue
+            if b_low and len(b_low) >= 3 and b_low in cand_low:
+                continue
+            if any(ch.isdigit() for ch in cand) and len(cand) < 5:
+                continue
+            return cand
+
+    if gtm_js:
+        gtm_low = gtm_js.lower()
+        known_gtm_agencies = (
+            ('netpeak', 'Netpeak Agency'),
+            ('promodo', 'Promodo Agency'),
+            ('inweb', 'Inweb Agency'),
+            ('deptagency', 'DEPT Agency'),
+            ('publicis', 'Publicis Media'),
+            ('groupm', 'GroupM'),
+            ('dentsu', 'Dentsu'),
+            ('jellyfish', 'Jellyfish'),
+            ('dept', 'DEPT'),
+        )
+        for sig, label in known_gtm_agencies:
+            if sig in gtm_low and (not b_low or sig != b_low):
+                return label
+
+    return None
+
+
+def detect_ats_from_html_or_dns(html: str, dns_ats_provider: str | None = None) -> tuple[str | None, str | None]:
+    """
+    Повертає (ats_provider, company_slug) з DNS CNAME або посилань на кар'єрній сторінці.
+    """
+    if html:
+        for provider, rx in ATS_HTML_PATTERNS:
+            m = rx.search(html)
+            if m:
+                slug = m.group(1).strip().lower()
+                if slug and slug not in ('embed', 'api', 'v1', 'v3', 'jobs', 'careers', 'www'):
+                    return provider, slug
+    if dns_ats_provider:
+        return dns_ats_provider, None
+    return None, None
+
+
 def _extract_ga4_ids_from_text(text: str, is_gtm: bool = False) -> Set[str]:
     found: Set[str] = set()
     if not text:
@@ -254,7 +389,7 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.0 Enterprise MarTech & Account Intelligence:
+    v24.1 Enterprise MarTech & Account Intelligence:
     Розділяє джерела сигналів на 3 рівні підтвердження:
       - `runtime_verified` (мережевий запит Playwright `pw_net_req` або першосторонні кукі `FPID`/`_ga`/`_fbp`);
       - `configured_in_code` (HTML-код сторінки або внутрішній код розпакованого `gtm.js`);
@@ -262,7 +397,6 @@ def detect_tech_with_evidence(
     """
     html_str = html or ''
     gtm_str = gtm_js or ''
-    # Відокремлюємо синтетичні коментарі заголовків і мережевих запитів перед скануванням тіла HTML
     html_clean_body = PW_NET_REQ_COMMENT_RE.sub('', HTTP_HEADERS_COMMENT_RE.sub('', html_str))
     html_low = html_clean_body.lower()
     gtm_low = gtm_str.lower()
@@ -283,14 +417,12 @@ def detect_tech_with_evidence(
                 'evidence': evidence_detail[:220],
             }
 
-    # 1. Витяг заголовків HTTP (CSP, Set-Cookie, SSR CMS)
     hdr_info = extract_embedded_headers_and_ssr_signals_v23_1(html_str)
     for tech_name, csp_ev in hdr_info['csp_techs'].items():
         _record_tech(tech_name, 'allowlisted_in_csp', 'http_headers_csp', csp_ev)
     for tech_name, ck_ev in hdr_info['cookie_techs'].items():
         _record_tech(tech_name, 'runtime_verified', 'runtime_cookie', ck_ev)
 
-    # 2. Витяг живих мережевих запитів із Playwright (pw_net_req)
     net_urls = PW_NET_REQ_COMMENT_RE.findall(html_str)
     runtime_ga4_hit_counts: Counter = Counter()
     consent_mode_signals: Set[str] = set()
@@ -320,7 +452,6 @@ def detect_tech_with_evidence(
         for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(n_url):
             consent_mode_signals.add(f'gcd={gcd_m}')
 
-    # 3. Перевірка GTM IDs та розпакованого контейнера gtm.js (configured_in_code)
     valid_gtms = sorted({g.upper() for g in (gtm_ids or []) if is_valid_gtm_id(g)})
     if valid_gtms:
         _record_tech('Google Tag Manager', 'configured_in_code', 'html', f'Container IDs: {", ".join(valid_gtms[:4])}')
@@ -336,7 +467,6 @@ def detect_tech_with_evidence(
         all_sample = sorted(html_ga4_ids | gtm_ga4_ids)[:3]
         _record_tech('Google Analytics (GA4)', 'configured_in_code', src_lbl, f'Measurement IDs: {", ".join(all_sample)}')
 
-    # Google Ads Conversion (AW-XXXXXX)
     gads_html = set(GOOGLE_ADS_REGEX.findall(html_clean_body))
     gads_gtm = set(GOOGLE_ADS_REGEX.findall(gtm_str))
     if gads_html or gads_gtm:
@@ -348,20 +478,17 @@ def detect_tech_with_evidence(
             f'Conversion IDs: {", ".join(aw_sample)}',
         )
 
-    # sGTM у коді HTML або GTM
     for m_loader in SGTM_CUSTOM_LOADER_REGEX.findall(html_clean_body):
         _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'Custom sGTM loader: {m_loader[:100]}')
     for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_clean_body + '\n' + gtm_str):
         sgtm_hosts.add(m_coll.lower())
         _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'First-party sGTM endpoint: {m_coll}')
 
-    # Consent Mode v2 у коді HTML/GTM
     for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(html_clean_body + '\n' + gtm_str):
         consent_mode_signals.add(f'gcs={gcs_m}')
     for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(html_clean_body + '\n' + gtm_str):
         consent_mode_signals.add(f'gcd={gcd_m}')
 
-    # Сигнатури рекламних пікселів та аналітики в тілі HTML / GTM
     for tech_name, sigs in AD_AND_ANALYTICS_SIGNATURES.items():
         matched_html = next((s for s in sigs if s in html_low), None)
         if matched_html:
@@ -372,7 +499,6 @@ def detect_tech_with_evidence(
             if matched_gtm:
                 _record_tech(tech_name, 'configured_in_code', 'gtm_container', f'GTM container signature: {matched_gtm}')
 
-    # CMS-платформи
     detected_cms_list: list[str] = []
     if hdr_info.get('ssr_cms'):
         detected_cms_list.append(hdr_info['ssr_cms'])
@@ -391,7 +517,6 @@ def detect_tech_with_evidence(
     if 'WooCommerce' in detected_cms_list and 'WordPress' not in detected_cms_list:
         detected_cms_list.append('WordPress')
 
-    # Платіжні шлюзи (PSP)
     payment_gateways: Set[str] = set(hdr_info['csp_gateways'])
     for psp_name, sigs in PAYMENT_HTML_SIGNATURES.items():
         if any(s in html_low or s in gtm_low for s in sigs):
@@ -399,7 +524,6 @@ def detect_tech_with_evidence(
 
     has_cookie_banner = any(m in html_low for m in COOKIE_CONSENT_MARKERS)
 
-    # Дублювання GA4 (між статичним HTML та GTM, або подвійні хіти у Playwright)
     dup_ga4_ids = sorted(html_ga4_ids & gtm_ga4_ids)
     dup_runtime_confirmed = any(runtime_ga4_hit_counts.get(gid, 0) >= 2 for gid in dup_ga4_ids)
     if not dup_ga4_ids:
@@ -408,7 +532,6 @@ def detect_tech_with_evidence(
             dup_ga4_ids = runtime_multi
             dup_runtime_confirmed = True
 
-    # Визначення повноти сканування: якщо всі технології лише зі списку CSP (allowlisted_in_csp)
     all_detected_techs = sorted(evidence_map.keys())
     effective_completeness = scan_completeness
     if all_detected_techs and all(
@@ -416,7 +539,6 @@ def detect_tech_with_evidence(
     ):
         effective_completeness = 'partial_csp_headers'
 
-    # Повний список GA4 ID без обрізання до 5 (MAX_DISPLAY_GA4_IDS = 50)
     all_ga4_combined = sorted(html_ga4_ids | gtm_ga4_ids | net_ga4_ids)
     raw_ga4_joined = '; '.join(all_ga4_combined) if all_ga4_combined else None
 
@@ -462,6 +584,7 @@ def detect_tech_with_evidence(
         'has_sgtm': 'Server-Side GTM (sGTM)' in evidence_map,
         'has_esp_retention': bool({'Klaviyo', 'HubSpot', 'Braze'} & set(evidence_map.keys())),
         'has_enterprise_cdn': bool(hdr_info.get('has_enterprise_cdn')),
+        'gtm_ids': valid_gtms,
         'all_ga4_ids': all_ga4_str,
         'all_ga4_ids_count': all_ga4_count,
         'ga4_detection_confidence': ga4_conf,
@@ -551,9 +674,13 @@ async def fetch_google_ads_transparency_intel_v23_1(
     etld_func: Callable[[str], tuple[str, str]],
     infra_denylist: tuple[str, ...] = (),
 ) -> Dict[str, Any]:
+    """
+    Виправлено (v24.1): При таймауті або HTTP-помилці RPC повертає `ads_active_last_30d: None`
+    (а не хибне `False`), а при активній рекламі розпізнає конкретні формати оголошень.
+    """
     out: Dict[str, Any] = {
-        'ads_rpc_status': 'checked_no_ads',
-        'ads_active_last_30d': False,
+        'ads_rpc_status': 'not_checked',
+        'ads_active_last_30d': None,
         'active_ad_formats': [],
         'verified_advertiser_legal_name': None,
         'advertiser_sister_domains': [],
@@ -575,7 +702,7 @@ async def fetch_google_ads_transparency_intel_v23_1(
             rpc_url,
             data={'f.req': json.dumps(payload)},
             headers=headers,
-            timeout=2.2,
+            timeout=2.4,
         )
         if resp.status_code == 200 and resp.text:
             body = resp.text.lstrip(")]}'\n ")
@@ -584,7 +711,18 @@ async def fetch_google_ads_transparency_intel_v23_1(
             if isinstance(suggestions, list) and suggestions:
                 out['ads_rpc_status'] = 'verified_active_advertiser'
                 out['ads_active_last_30d'] = True
-                out['active_ad_formats'] = ['Search / Shopping / Display']
+                raw_low = body.lower()
+                formats_found: list[str] = []
+                if 'shopping' in raw_low or 'merchant' in raw_low:
+                    formats_found.append('Shopping')
+                if 'video' in raw_low or 'youtube' in raw_low:
+                    formats_found.append('Video')
+                if 'display' in raw_low or 'image' in raw_low:
+                    formats_found.append('Display')
+                if not formats_found or 'search' in raw_low or 'text' in raw_low:
+                    formats_found.insert(0, 'Search')
+                out['active_ad_formats'] = list(dict.fromkeys(formats_found))
+
                 first_item = suggestions[0]
                 if isinstance(first_item, dict):
                     adv_obj = first_item.get('1') or {}
@@ -594,38 +732,123 @@ async def fetch_google_ads_transparency_intel_v23_1(
                             out['verified_advertiser_legal_name'] = legal_n.strip()
             else:
                 out['ads_rpc_status'] = 'checked_no_active_ads'
+                out['ads_active_last_30d'] = False
         else:
             out['ads_rpc_status'] = f'rpc_http_{resp.status_code}'
+            out['ads_active_last_30d'] = None
     except Exception:
         out['ads_rpc_status'] = 'rpc_timeout_or_blocked'
+        out['ads_active_last_30d'] = None
     return out
 
 
 async def fetch_public_ats_hiring_intel(
     http_client: Any,
-    ats_provider: str,
+    ats_provider: str | None,
     brand_slug: str,
 ) -> Dict[str, Any]:
+    """
+    v24.1 Multi-Platform ATS Hiring Parser:
+    Підтримує Greenhouse, Lever, Workable, SmartRecruiters та Personio.
+    Якщо ATS не виявлено або не підтримується — повертає `open_positions_total: None` (не 0).
+    """
     out: Dict[str, Any] = {
-        'open_positions_total': 0,
+        'ats_provider': ats_provider,
+        'open_positions_total': None,
         'hiring_departments': [],
+        'hiring_marketing_or_data_roles': None,
     }
-    if not brand_slug or ats_provider != 'Greenhouse':
+    if not brand_slug or not ats_provider:
         return out
+
+    titles: List[str] = []
+    depts: Set[str] = set()
+
     try:
-        resp = await http_client.get(
-            f'https://boards-api.greenhouse.io/v1/boards/{brand_slug}/jobs',
-            timeout=2.0,
-        )
-        if resp.status_code == 200:
-            jobs = resp.json().get('jobs') or []
-            out['open_positions_total'] = len(jobs)
-            depts: Set[str] = set()
-            for j in jobs[:50]:
-                for d in (j.get('departments') or []):
-                    if isinstance(d, dict) and d.get('name'):
-                        depts.add(str(d['name']).strip())
-            out['hiring_departments'] = sorted(depts)[:8]
+        if ats_provider == 'Greenhouse':
+            resp = await http_client.get(
+                f'https://boards-api.greenhouse.io/v1/boards/{brand_slug}/jobs',
+                timeout=2.2,
+            )
+            if resp.status_code == 200:
+                jobs = resp.json().get('jobs') or []
+                out['open_positions_total'] = len(jobs)
+                for j in jobs[:80]:
+                    if j.get('title'):
+                        titles.append(str(j['title']))
+                    for d in (j.get('departments') or []):
+                        if isinstance(d, dict) and d.get('name'):
+                            depts.add(str(d['name']).strip())
+
+        elif ats_provider == 'Lever':
+            resp = await http_client.get(
+                f'https://api.lever.co/v0/postings/{brand_slug}?mode=json',
+                timeout=2.2,
+            )
+            if resp.status_code == 200:
+                jobs = resp.json() if isinstance(resp.json(), list) else []
+                out['open_positions_total'] = len(jobs)
+                for j in jobs[:80]:
+                    if j.get('text'):
+                        titles.append(str(j['text']))
+                    cats = j.get('categories') or {}
+                    if isinstance(cats, dict) and cats.get('department'):
+                        depts.add(str(cats['department']).strip())
+
+        elif ats_provider == 'Workable':
+            resp = await http_client.post(
+                f'https://apply.workable.com/api/v3/accounts/{brand_slug}/jobs',
+                json={'query': '', 'location': [], 'department': [], 'worktype': []},
+                timeout=2.2,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                jobs = data.get('results') or []
+                out['open_positions_total'] = int(data.get('total') or len(jobs))
+                for j in jobs[:80]:
+                    if j.get('title'):
+                        titles.append(str(j['title']))
+                    if j.get('department'):
+                        depts.add(str(j['department']).strip())
+
+        elif ats_provider == 'SmartRecruiters':
+            resp = await http_client.get(
+                f'https://api.smartrecruiters.com/v1/companies/{brand_slug}/postings',
+                timeout=2.2,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                jobs = data.get('content') or []
+                out['open_positions_total'] = int(data.get('totalFound') or len(jobs))
+                for j in jobs[:80]:
+                    if j.get('name'):
+                        titles.append(str(j['name']))
+                    dept_obj = j.get('department') or {}
+                    if isinstance(dept_obj, dict) and dept_obj.get('label'):
+                        depts.add(str(dept_obj['label']).strip())
+
+        elif ats_provider == 'Personio':
+            resp = await http_client.get(
+                f'https://{brand_slug}.jobs.personio.de/xml',
+                timeout=2.2,
+            )
+            if resp.status_code == 200 and '<position>' in resp.text:
+                xml_txt = resp.text
+                pos_titles = re.findall(r'<name>\s*<!\[CDATA\[(.*?)\]\]>\s*</name>|<name>(.*?)</name>', xml_txt)
+                pos_depts = re.findall(r'<department>\s*<!\[CDATA\[(.*?)\]\]>\s*</department>|<department>(.*?)</department>', xml_txt)
+                cleaned_t = [a or b for a, b in pos_titles if (a or b)]
+                out['open_positions_total'] = len(cleaned_t)
+                titles.extend(cleaned_t[:80])
+                for a, b in pos_depts:
+                    val = (a or b).strip()
+                    if val:
+                        depts.add(val)
     except Exception:
         pass
+
+    if out['open_positions_total'] is not None:
+        out['hiring_departments'] = sorted(depts)[:8]
+        combined_text = ' '.join(titles + list(depts))
+        out['hiring_marketing_or_data_roles'] = bool(MARKETING_DATA_JOB_RE.search(combined_text))
+
     return out
