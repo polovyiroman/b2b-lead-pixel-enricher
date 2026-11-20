@@ -55,7 +55,13 @@ SHOPIFY_SHOP_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
-HREFLANG_LINK_RE = re.compile(
+HREFLANG_FULL_LINK_RE = re.compile(
+    r'<link[^>]+rel=["\']alternate["\'][^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\'][^>]+href=["\'](https?://[^"\']+)["\']|'
+    r'<link[^>]+href=["\'](https?://[^"\']+)["\'][^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\']',
+    re.IGNORECASE,
+)
+
+HREFLANG_FALLBACK_RE = re.compile(
     r'<link[^>]+rel=["\']alternate["\'][^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\']|'
     r'<link[^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\'][^>]+rel=["\']alternate["\']',
     re.IGNORECASE,
@@ -175,6 +181,14 @@ NON_MARTECH_INFRA_LABELS: Set[str] = {
     'Microsoft 365', 'Google Workspace', 'Cloudflare', 'Akamai', 'Fastly',
 }
 
+# v24.5 Жорстка 3-рівнева ієрархія доказів (+ CSP allowlist)
+EVIDENCE_TIER_RANK: Dict[str, int] = {
+    'allowlisted_in_csp': 1,
+    'DETECTED_IN_HTML': 2,
+    'CONFIGURED_IN_GTM': 3,
+    'RUNTIME_NETWORK_VERIFIED': 4,
+}
+
 
 def _extract_reg_domain_for_sgtm(page_url: str) -> str:
     host = (urlparse(page_url or '').hostname or '').lower().removeprefix('www.').strip('.')
@@ -189,7 +203,7 @@ def _extract_reg_domain_for_sgtm(page_url: str) -> str:
 
 def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str, Any]:
     """
-    v24.4 XHR/Fetch/Ping Runtime Traffic Analyzer:
+    v24.5 XHR/Fetch/Ping Runtime Traffic Analyzer:
     Аналізує перехоплені Playwright XHR/Fetch/Beacon запити (`pw_xhr_req`, `pw_runtime_summary`),
     виявляє server-side tracking на нестандартних першосторонніх піддоменах (`x99.domain.com/collect`),
     Cloudflare Zaraz (`/cdn-cgi/zaraz/`) та first-party проксі-шляхах (`/sgtm/collect`, `/capi/`, `/mp/collect`).
@@ -224,7 +238,7 @@ def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str
                 first_party_hits.append(ev)
         elif is_non_www_sub and any(
             tok in path_q_low
-            for tok in ('tid=g-', 'v=2&', 'en=page_view', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=')
+            for tok in ('tid=g-', 'v=2&', 'en=page_view', 'en=purchase', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=')
         ):
             ev = f'XHR/{res_type.upper()} non-standard 1st-party tracking subdomain: {nh}{p.path[:60]}'
             if ev not in seen:
@@ -244,6 +258,7 @@ def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str
         'xhr_fetch_requests_inspected': total_inspected,
         'xhr_first_party_collect_endpoints': first_party_hits[:10],
         'xhr_urls': [u for _, u in xhr_entries],
+        'ga4_runtime_events_summary': summary.get('ga4_events') or [],
     }
 
 
@@ -255,8 +270,9 @@ def detect_first_party_sgtm_endpoints(
 ) -> list[tuple[str, str]]:
     """
     Виявляє серверний трекінг (sGTM / Cloudflare Zaraz / CAPI / First-Party Collector) на першосторонніх
-    піддоменах (`metrics.<domain>`, `analytics.<domain>`, `sgtm.<domain>`, `sst.<domain>`, `tag.<domain>`)
-    та `/cdn-cgi/zaraz/` у мережевих запитах Playwright, параметрах `transport_url`/`server_container_url` і HTML/GTM.
+    піддоменах та `/cdn-cgi/zaraz/` у мережевих запитах Playwright, параметрах `transport_url` і HTML/GTM.
+    Повертає список кортежів `(evidence_tier, evidence_str)` з ієрархією
+    `RUNTIME_NETWORK_VERIFIED` / `CONFIGURED_IN_GTM` / `DETECTED_IN_HTML`.
     """
     reg_dom = _extract_reg_domain_for_sgtm(page_url)
     if not reg_dom or '.' not in reg_dom:
@@ -278,47 +294,51 @@ def detect_first_party_sgtm_endpoints(
                 ev = f'1st-party sGTM subdomain request: {nh}{parsed.path[:60]}'
                 if ev not in seen_ev:
                     seen_ev.add(ev)
-                    hits.append(('runtime_verified', ev))
+                    hits.append(('RUNTIME_NETWORK_VERIFIED', ev))
         elif nh == reg_dom or nh == f'www.{reg_dom}':
             if NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE.search(f'{parsed.path}?{parsed.query}'):
                 ev = f'1st-party sGTM/Zaraz path proxy request: {nh}{parsed.path[:60]}'
                 if ev not in seen_ev:
                     seen_ev.add(ev)
-                    hits.append(('runtime_verified', ev))
+                    hits.append(('RUNTIME_NETWORK_VERIFIED', ev))
 
-    combined = f'{html_clean or ""}\n{gtm_str or ""}'
-
-    if CLOUDFLARE_ZARAZ_RE.search(combined):
-        ev = 'Cloudflare Zaraz server-side tag manager detected in markup'
+    if CLOUDFLARE_ZARAZ_RE.search(html_clean or ''):
+        ev = 'Cloudflare Zaraz server-side tag manager detected in HTML'
         if ev not in seen_ev:
             seen_ev.add(ev)
-            hits.append(('configured_in_code', ev))
+            hits.append(('DETECTED_IN_HTML', ev))
 
-    for m_url in SGTM_TRANSPORT_URL_RE.findall(combined):
-        m_low = m_url.lower()
-        if not any(g in m_low for g in ('google-analytics.com', 'googletagmanager.com', 'doubleclick.net')):
-            ev = f'sGTM transport/server container URL: {m_url[:100]}'
-            if ev not in seen_ev:
-                seen_ev.add(ev)
-                hits.append(('configured_in_code', ev))
+    for src_text, src_tier in ((gtm_str or '', 'CONFIGURED_IN_GTM'), (html_clean or '', 'DETECTED_IN_HTML')):
+        if not src_text:
+            continue
+        for m_url in SGTM_TRANSPORT_URL_RE.findall(src_text):
+            m_low = m_url.lower()
+            if not any(g in m_low for g in ('google-analytics.com', 'googletagmanager.com', 'doubleclick.net')):
+                ev = f'sGTM transport/server container URL: {m_url[:100]}'
+                if ev not in seen_ev:
+                    seen_ev.add(ev)
+                    hits.append((src_tier, ev))
 
     sub_alt = '|'.join(re.escape(p) for p in SGTM_SUBDOMAIN_PREFIXES)
     fp_sub_re = re.compile(
         rf'https?://((?:{sub_alt})\.{re.escape(reg_dom)})(?:/[^\s"\'<>]*)?',
         re.IGNORECASE,
     )
-    for m in fp_sub_re.finditer(combined):
-        full_u = m.group(0).lower()
-        sub_host = m.group(1).lower()
-        sub_prefix = sub_host.split('.', 1)[0]
-        if (
-            sub_prefix in SGTM_STRICT_RUNTIME_PREFIXES
-            or any(tok in full_u for tok in ('/gtm.js', '/gtag', '/g/collect', '/collect', 'sgtm', 'sst.', 'stape.'))
-        ):
-            ev = f'1st-party sGTM endpoint in code: {sub_host}'
-            if ev not in seen_ev:
-                seen_ev.add(ev)
-                hits.append(('configured_in_code', ev))
+    for src_text, src_tier in ((gtm_str or '', 'CONFIGURED_IN_GTM'), (html_clean or '', 'DETECTED_IN_HTML')):
+        if not src_text:
+            continue
+        for m in fp_sub_re.finditer(src_text):
+            full_u = m.group(0).lower()
+            sub_host = m.group(1).lower()
+            sub_prefix = sub_host.split('.', 1)[0]
+            if (
+                sub_prefix in SGTM_STRICT_RUNTIME_PREFIXES
+                or any(tok in full_u for tok in ('/gtm.js', '/gtag', '/g/collect', '/collect', 'sgtm', 'sst.', 'stape.'))
+            ):
+                ev = f'1st-party sGTM endpoint in code: {sub_host}'
+                if ev not in seen_ev:
+                    seen_ev.add(ev)
+                    hits.append((src_tier, ev))
 
     return hits
 
@@ -480,29 +500,67 @@ def extract_account_scale_signals(
     html: str,
     ga4_ids_count: int | None = None,
     advertiser_sister_domains: list[str] | None = None,
+    canonical_domain: str = '',
+    tls_corporate_sans: list[str] | None = None,
 ) -> Dict[str, Any]:
+    """
+    v24.5 Суворий підрахунок ринків (Крок 4 аудиту):
+    `estimated_markets_count` більше НЕ роздувається лише з мовних версій `hreflang` на одному домені
+    (`?lang=es`, `/en`, `/fr`). Ринок зараховується лише за підтвердженими локалізованими доменами/піддоменами
+    (`notino.de`, `uk.gymshark.com`), регіональними шляхами з кодом країни (`en-us`, `de-at`),
+    корпоративними TLS SAN, сестринськими доменами рекламодавця або регіональними GA4-властивостями (>=4).
+    """
+    reg_dom = _extract_reg_domain_for_sgtm(f'https://{canonical_domain}/') if canonical_domain else ''
     locales: Set[str] = set()
-    if html:
-        for g1, g2 in HREFLANG_LINK_RE.findall(html[:120000]):
-            loc = (g1 or g2 or '').strip()
-            if loc and loc.lower() != 'x-default':
-                locales.add(loc)
+    localized_hosts: Set[str] = set()
+    regional_country_paths: Set[str] = set()
 
-    country_codes: Set[str] = set()
-    for loc in locales:
-        parts = loc.split('-')
-        code = parts[-1].upper() if len(parts) == 2 else parts[0].upper()
-        if len(code) == 2:
-            country_codes.add(code)
+    if html:
+        sample = html[:120000]
+        for m in HREFLANG_FULL_LINK_RE.finditer(sample):
+            loc = (m.group(1) or m.group(4) or '').strip()
+            href = (m.group(2) or m.group(3) or '').strip()
+            if not loc or loc.lower() == 'x-default':
+                continue
+            locales.add(loc)
+            p = urlparse(href)
+            h = (p.hostname or '').lower().removeprefix('www.')
+            if h and reg_dom and h != reg_dom:
+                localized_hosts.add(h)
+            elif h and not reg_dom:
+                localized_hosts.add(h)
+            elif p.path:
+                first_seg = p.path.strip('/').split('/')[0].lower()
+                if re.match(r'^[a-z]{2}-[a-z]{2}$', first_seg):
+                    regional_country_paths.add(first_seg)
+
+        if not locales:
+            for g1, g2 in HREFLANG_FALLBACK_RE.findall(sample):
+                loc = (g1 or g2 or '').strip()
+                if loc and loc.lower() != 'x-default':
+                    locales.add(loc)
+
+    verified_extra_domains: Set[str] = set(localized_hosts)
+    for d in (tls_corporate_sans or []):
+        if d and d != reg_dom:
+            verified_extra_domains.add(d.lower())
+    for d in (advertiser_sister_domains or []):
+        if d and d != reg_dom:
+            verified_extra_domains.add(d.lower())
+    if reg_dom:
+        verified_extra_domains.discard(reg_dom)
 
     ga4_cnt = int(ga4_ids_count or 0)
-    sister_cnt = len(advertiser_sister_domains or [])
     ga4_market_est = max(1, ga4_cnt // 2) if ga4_cnt >= 4 else 1
 
-    est_markets = max(1, len(country_codes), ga4_market_est, sister_cnt)
+    domain_backed_markets = (1 + len(verified_extra_domains)) if verified_extra_domains else 1
+    regional_path_markets = len(regional_country_paths) if len(regional_country_paths) >= 2 else 1
+
+    est_markets = max(1, domain_backed_markets, regional_path_markets, ga4_market_est)
     return {
         'estimated_markets_count': est_markets,
         'detected_market_locales': sorted(locales)[:20],
+        'localized_domains_count': len(verified_extra_domains),
     }
 
 
@@ -588,12 +646,15 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.4 Enterprise MarTech & Runtime XHR/Fetch Traffic Analyzer:
-    1. Аналізує XHR/Fetch/Ping трафік Playwright (`pw_xhr_req`, `pw_runtime_summary`),
-       виявляючи server-side tracking на нестандартних першосторонніх піддоменах,
-       `/collect` та Cloudflare Zaraz (`/cdn-cgi/zaraz/`).
-    2. Окремо формує `confirmed_martech_platforms` (лише `runtime_verified` та
-       `configured_in_code` MarTech-платформи — без CDN, сертифікатів та CSP-allowlist).
+    v24.5 Technical Evidence Engine (Крок 1 P0):
+    Жорстка 3-рівнева ієрархія доказів:
+      1. `DETECTED_IN_HTML` — лише гіпотеза зі статичної розмітки;
+      2. `CONFIGURED_IN_GTM` — підтверджена конфігурація в розпакованому `gtm.js`;
+      3. `RUNTIME_NETWORK_VERIFIED` — найвищий доказ (реальні мережеві запити Playwright
+         до `/g/collect`, `connect.facebook.net`, першосторонніх `/collect` чи `/cdn-cgi/zaraz/`).
+    Також виявляє мовчазні/заблоковані консентом теги (`CONSENT_GATED_OR_SILENT`) та
+    довідно подвійні мережеві події GA4 (`page_view`, `purchase`).
+    Якщо sGTM не виявлено позитивно, `server_side_tracking_assessment = 'SERVER_SIDE_TRACKING_STATUS_UNKNOWN'`.
     """
     html_str = html or ''
     gtm_str = gtm_js or ''
@@ -608,15 +669,10 @@ def detect_tech_with_evidence(
     gtm_low = gtm_str.lower()
 
     evidence_map: Dict[str, Dict[str, str]] = {}
-    tier_rank = {
-        'allowlisted_in_csp': 1,
-        'configured_in_code': 2,
-        'runtime_verified': 3,
-    }
 
     def _record_tech(tech_name: str, tier: str, source: str, evidence_detail: str) -> None:
         existing = evidence_map.get(tech_name)
-        if not existing or tier_rank[tier] > tier_rank.get(existing.get('verification_tier', ''), 0):
+        if not existing or EVIDENCE_TIER_RANK.get(tier, 0) > EVIDENCE_TIER_RANK.get(existing.get('verification_tier', ''), 0):
             evidence_map[tech_name] = {
                 'verification_tier': tier,
                 'source': source,
@@ -627,14 +683,15 @@ def detect_tech_with_evidence(
     for tech_name, csp_ev in hdr_info['csp_techs'].items():
         _record_tech(tech_name, 'allowlisted_in_csp', 'http_headers_csp', csp_ev)
     for tech_name, ck_ev in hdr_info['cookie_techs'].items():
-        _record_tech(tech_name, 'runtime_verified', 'runtime_cookie', ck_ev)
+        _record_tech(tech_name, 'RUNTIME_NETWORK_VERIFIED', 'runtime_cookie', ck_ev)
 
     xhr_info = analyze_xhr_fetch_tracking_signals(html_str, page_url)
     for xhr_ev in xhr_info['xhr_first_party_collect_endpoints']:
-        _record_tech('Server-Side GTM (sGTM)', 'runtime_verified', 'runtime_xhr_fetch', xhr_ev)
+        _record_tech('Server-Side GTM (sGTM)', 'RUNTIME_NETWORK_VERIFIED', 'runtime_xhr_fetch', xhr_ev)
 
     net_urls = list(dict.fromkeys(PW_NET_REQ_COMMENT_RE.findall(html_str) + xhr_info['xhr_urls']))
     runtime_ga4_hit_counts: Counter = Counter()
+    runtime_ga4_event_counts: Counter = Counter()
     consent_mode_signals: Set[str] = set()
     sgtm_hosts: Set[str] = set()
 
@@ -642,20 +699,23 @@ def detect_tech_with_evidence(
         n_low = n_url.lower()
         for tech_name, markers in RUNTIME_NET_SIGNATURES.items():
             if any(mk in n_low for mk in markers):
-                _record_tech(tech_name, 'runtime_verified', 'runtime_network', f'Playwright network hit: {n_url[:140]}')
+                _record_tech(tech_name, 'RUNTIME_NETWORK_VERIFIED', 'runtime_network', f'Playwright network hit: {n_url[:140]}')
 
-        if '/g/collect' in n_low:
+        if '/g/collect' in n_low or '/collect?' in n_low:
             try:
                 qs = parse_qs(urlparse(n_url).query)
-                for tid in qs.get('tid', []):
-                    if tid.upper().startswith('G-'):
-                        runtime_ga4_hit_counts[tid.upper()] += 1
+                tids = [t.upper() for t in qs.get('tid', []) if t.upper().startswith('G-')]
+                ev_names = [e.lower() for e in qs.get('en', [])] or ['hit']
+                for tid in tids:
+                    runtime_ga4_hit_counts[tid] += 1
+                    for en_val in ev_names:
+                        runtime_ga4_event_counts[(tid, en_val)] += 1
             except Exception:
                 pass
             m_sgtm = SGTM_FIRST_PARTY_COLLECT_REGEX.search(n_url)
             if m_sgtm:
                 sgtm_hosts.add(m_sgtm.group(1).lower())
-                _record_tech('Server-Side GTM (sGTM)', 'runtime_verified', 'runtime_network', f'1st-party sGTM collect endpoint: {m_sgtm.group(1)}')
+                _record_tech('Server-Side GTM (sGTM)', 'RUNTIME_NETWORK_VERIFIED', 'runtime_network', f'1st-party sGTM collect endpoint: {m_sgtm.group(1)}')
 
         for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(n_url):
             consent_mode_signals.add(f'gcs={gcs_m}')
@@ -663,40 +723,43 @@ def detect_tech_with_evidence(
             consent_mode_signals.add(f'gcd={gcd_m}')
 
     for fp_tier, fp_ev in detect_first_party_sgtm_endpoints(html_clean_body, gtm_str, net_urls, page_url):
-        src_lbl = 'runtime_network' if fp_tier == 'runtime_verified' else 'html_or_gtm'
+        src_lbl = (
+            'runtime_network' if fp_tier == 'RUNTIME_NETWORK_VERIFIED'
+            else ('gtm_container' if fp_tier == 'CONFIGURED_IN_GTM' else 'html')
+        )
         _record_tech('Server-Side GTM (sGTM)', fp_tier, src_lbl, fp_ev)
 
     valid_gtms = sorted({g.upper() for g in (gtm_ids or []) if is_valid_gtm_id(g)})
     if valid_gtms:
-        _record_tech('Google Tag Manager', 'configured_in_code', 'html', f'Container IDs: {", ".join(valid_gtms[:4])}')
+        gtm_tier = 'CONFIGURED_IN_GTM' if gtm_str else 'DETECTED_IN_HTML'
+        _record_tech('Google Tag Manager', gtm_tier, 'gtm_container' if gtm_str else 'html', f'Container IDs: {", ".join(valid_gtms[:4])}')
 
     html_ga4_ids = _extract_ga4_ids_from_text(html_clean_body, is_gtm=False)
     gtm_ga4_ids = _extract_ga4_ids_from_text(gtm_str, is_gtm=True)
     net_ga4_ids = set(runtime_ga4_hit_counts.keys())
 
     if net_ga4_ids:
-        _record_tech('Google Analytics (GA4)', 'runtime_verified', 'runtime_network', f'Active /g/collect hits for {", ".join(sorted(net_ga4_ids)[:3])}')
-    elif html_ga4_ids or gtm_ga4_ids:
-        src_lbl = 'gtm_container' if (gtm_ga4_ids and not html_ga4_ids) else 'html'
-        all_sample = sorted(html_ga4_ids | gtm_ga4_ids)[:3]
-        _record_tech('Google Analytics (GA4)', 'configured_in_code', src_lbl, f'Measurement IDs: {", ".join(all_sample)}')
+        _record_tech('Google Analytics (GA4)', 'RUNTIME_NETWORK_VERIFIED', 'runtime_network', f'Active /g/collect hits for {", ".join(sorted(net_ga4_ids)[:3])}')
+    elif gtm_ga4_ids:
+        _record_tech('Google Analytics (GA4)', 'CONFIGURED_IN_GTM', 'gtm_container', f'Measurement IDs in GTM: {", ".join(sorted(gtm_ga4_ids)[:3])}')
+    elif html_ga4_ids:
+        _record_tech('Google Analytics (GA4)', 'DETECTED_IN_HTML', 'html', f'Measurement IDs in HTML: {", ".join(sorted(html_ga4_ids)[:3])}')
 
     gads_html = set(GOOGLE_ADS_REGEX.findall(html_clean_body))
     gads_gtm = set(GOOGLE_ADS_REGEX.findall(gtm_str))
-    if gads_html or gads_gtm:
-        aw_sample = sorted(gads_html | gads_gtm)[:3]
-        _record_tech(
-            'Google Ads Conversion',
-            'configured_in_code',
-            'gtm_container' if (gads_gtm and not gads_html) else 'html',
-            f'Conversion IDs: {", ".join(aw_sample)}',
-        )
+    if gads_gtm:
+        _record_tech('Google Ads Conversion', 'CONFIGURED_IN_GTM', 'gtm_container', f'Conversion IDs in GTM: {", ".join(sorted(gads_gtm)[:3])}')
+    elif gads_html:
+        _record_tech('Google Ads Conversion', 'DETECTED_IN_HTML', 'html', f'Conversion IDs in HTML: {", ".join(sorted(gads_html)[:3])}')
 
     for m_loader in SGTM_CUSTOM_LOADER_REGEX.findall(html_clean_body):
-        _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'Custom sGTM loader: {m_loader[:100]}')
-    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_clean_body + '\n' + gtm_str):
+        _record_tech('Server-Side GTM (sGTM)', 'DETECTED_IN_HTML', 'html', f'Custom sGTM loader: {m_loader[:100]}')
+    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(gtm_str):
         sgtm_hosts.add(m_coll.lower())
-        _record_tech('Server-Side GTM (sGTM)', 'configured_in_code', 'html', f'First-party sGTM endpoint: {m_coll}')
+        _record_tech('Server-Side GTM (sGTM)', 'CONFIGURED_IN_GTM', 'gtm_container', f'First-party sGTM endpoint in GTM: {m_coll}')
+    for m_coll in SGTM_FIRST_PARTY_COLLECT_REGEX.findall(html_clean_body):
+        sgtm_hosts.add(m_coll.lower())
+        _record_tech('Server-Side GTM (sGTM)', 'DETECTED_IN_HTML', 'html', f'First-party sGTM endpoint in HTML: {m_coll}')
 
     for gcs_m in CONSENT_MODE_V2_GCS_REGEX.findall(html_clean_body + '\n' + gtm_str):
         consent_mode_signals.add(f'gcs={gcs_m}')
@@ -704,26 +767,25 @@ def detect_tech_with_evidence(
         consent_mode_signals.add(f'gcd={gcd_m}')
 
     for tech_name, sigs in AD_AND_ANALYTICS_SIGNATURES.items():
-        matched_html = next((s for s in sigs if s in html_low), None)
-        if matched_html:
-            _record_tech(tech_name, 'configured_in_code', 'html', f'HTML signature: {matched_html}')
-            continue
         if gtm_low:
             matched_gtm = next((s for s in sigs if s in gtm_low), None)
             if matched_gtm:
-                _record_tech(tech_name, 'configured_in_code', 'gtm_container', f'GTM container signature: {matched_gtm}')
+                _record_tech(tech_name, 'CONFIGURED_IN_GTM', 'gtm_container', f'GTM container signature: {matched_gtm}')
+        matched_html = next((s for s in sigs if s in html_low), None)
+        if matched_html:
+            _record_tech(tech_name, 'DETECTED_IN_HTML', 'html', f'HTML signature: {matched_html}')
 
     detected_cms_list: list[str] = []
     if hdr_info.get('ssr_cms'):
         detected_cms_list.append(hdr_info['ssr_cms'])
-        _record_tech(hdr_info['ssr_cms'], 'configured_in_code', 'http_headers_ssr', f'SSR header: {hdr_info["ssr_cms"]}')
+        _record_tech(hdr_info['ssr_cms'], 'DETECTED_IN_HTML', 'http_headers_ssr', f'SSR header: {hdr_info["ssr_cms"]}')
 
     for cms_name, sigs in CMS_HTML_ONLY_SIGNATURES.items():
         matched_cms = next((s for s in sigs if s in html_low), None)
         if matched_cms:
             if cms_name not in detected_cms_list:
                 detected_cms_list.append(cms_name)
-            _record_tech(cms_name, 'configured_in_code', 'html', f'CMS signature: {matched_cms}')
+            _record_tech(cms_name, 'DETECTED_IN_HTML', 'html', f'CMS signature: {matched_cms}')
 
     if 'Shopify' in detected_cms_list and 'WordPress' in detected_cms_list:
         detected_cms_list = [c for c in detected_cms_list if c != 'WordPress']
@@ -738,8 +800,16 @@ def detect_tech_with_evidence(
 
     has_cookie_banner = any(m in html_low for m in COOKIE_CONSENT_MARKERS)
 
+    # Дублювання GA4: розрізняємо статичну підозру vs доведений runtime duplicate у XHR/network
+    dup_ga4_events = [
+        f'{tid} ({ev} x{cnt})'
+        for (tid, ev), cnt in sorted(runtime_ga4_event_counts.items())
+        if cnt >= 2 and ev in ('page_view', 'purchase', 'begin_checkout', 'add_to_cart', 'hit')
+    ]
     dup_ga4_ids = sorted(html_ga4_ids & gtm_ga4_ids)
-    dup_runtime_confirmed = any(runtime_ga4_hit_counts.get(gid, 0) >= 2 for gid in dup_ga4_ids)
+    dup_runtime_confirmed = bool(
+        dup_ga4_events or any(runtime_ga4_hit_counts.get(gid, 0) >= 2 for gid in dup_ga4_ids)
+    )
     if not dup_ga4_ids:
         runtime_multi = sorted(gid for gid, cnt in runtime_ga4_hit_counts.items() if cnt >= 2)
         if runtime_multi:
@@ -757,10 +827,12 @@ def detect_tech_with_evidence(
     raw_ga4_joined = '; '.join(all_ga4_combined) if all_ga4_combined else None
 
     ga4_tier = (evidence_map.get('Google Analytics (GA4)') or {}).get('verification_tier')
-    if ga4_tier == 'runtime_verified':
-        base_ga4_conf = f'High (Runtime Verified — {len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
-    elif ga4_tier == 'configured_in_code':
-        base_ga4_conf = f'Verified in Code ({len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
+    if ga4_tier == 'RUNTIME_NETWORK_VERIFIED':
+        base_ga4_conf = f'RUNTIME_NETWORK_VERIFIED ({len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
+    elif ga4_tier == 'CONFIGURED_IN_GTM':
+        base_ga4_conf = f'CONFIGURED_IN_GTM ({len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
+    elif ga4_tier == 'DETECTED_IN_HTML':
+        base_ga4_conf = f'DETECTED_IN_HTML ({len(all_ga4_combined)} GA4 ID{"s" if len(all_ga4_combined) != 1 else ""})'
     elif ga4_tier == 'allowlisted_in_csp':
         base_ga4_conf = 'Low (CSP Header Allowlist Only — Tag Firing Unverified)'
     else:
@@ -776,20 +848,34 @@ def detect_tech_with_evidence(
         t: info['verification_tier'] for t, info in evidence_map.items()
     }
 
+    # Перевірка реального спрацювання GA4 у Playwright (Крок 1: якщо тег у коді є, а /g/collect немає -> CONSENT_GATED_OR_SILENT)
+    if ga4_tier == 'RUNTIME_NETWORK_VERIFIED':
+        tag_runtime_status = 'RUNTIME_NETWORK_VERIFIED'
+    elif (html_ga4_ids or gtm_ga4_ids) and xhr_info['xhr_fetch_traffic_analyzed'] and not net_ga4_ids:
+        tag_runtime_status = 'CONSENT_GATED_OR_SILENT'
+    elif gtm_ga4_ids or valid_gtms:
+        tag_runtime_status = 'CONFIGURED_IN_GTM'
+    elif html_ga4_ids or all_detected_techs:
+        tag_runtime_status = 'DETECTED_IN_HTML'
+    else:
+        tag_runtime_status = 'NO_TAGS_OBSERVED'
+
     confirmed_martech_platforms = sorted(
         t for t, tier in tech_verification_tiers.items()
-        if tier in ('runtime_verified', 'configured_in_code') and t not in NON_MARTECH_INFRA_LABELS
+        if tier in ('RUNTIME_NETWORK_VERIFIED', 'CONFIGURED_IN_GTM', 'DETECTED_IN_HTML')
+        and t not in NON_MARTECH_INFRA_LABELS
     )
 
+    # Крок 1 P0: Ніколи не стверджуємо про відсутність sGTM — лише підтверджений sGTM або SERVER_SIDE_TRACKING_STATUS_UNKNOWN
     sgtm_tier = tech_verification_tiers.get('Server-Side GTM (sGTM)')
-    if sgtm_tier == 'runtime_verified':
-        sgtm_assessment = 'runtime_verified_sgtm'
-    elif sgtm_tier == 'configured_in_code':
-        sgtm_assessment = 'configured_in_code_sgtm'
-    elif xhr_info['xhr_fetch_traffic_analyzed']:
-        sgtm_assessment = 'not_detected_in_xhr_traffic'
+    if sgtm_tier == 'RUNTIME_NETWORK_VERIFIED':
+        sgtm_assessment = 'RUNTIME_NETWORK_VERIFIED_SGTM'
+    elif sgtm_tier == 'CONFIGURED_IN_GTM':
+        sgtm_assessment = 'CONFIGURED_IN_GTM_SGTM'
+    elif sgtm_tier == 'DETECTED_IN_HTML':
+        sgtm_assessment = 'DETECTED_IN_HTML_SGTM'
     else:
-        sgtm_assessment = 'not_detected_in_static_html'
+        sgtm_assessment = 'SERVER_SIDE_TRACKING_STATUS_UNKNOWN'
 
     evidence_lines = [
         f"{t} [{info['verification_tier']}]: {info['evidence']}"
@@ -818,7 +904,9 @@ def detect_tech_with_evidence(
         'all_ga4_ids_count': all_ga4_count,
         'ga4_detection_confidence': ga4_conf,
         'duplicate_ga4_ids': dup_ga4_ids,
+        'duplicate_ga4_events': dup_ga4_events,
         'duplicate_ga4_runtime_confirmed': dup_runtime_confirmed,
+        'tag_runtime_status': tag_runtime_status,
         'has_cookie_banner': has_cookie_banner,
         'has_consent_mode_v2_signals': bool(consent_mode_signals),
         'consent_mode_v2_signals': sorted(consent_mode_signals),
@@ -850,11 +938,22 @@ def detect_broken_attribution_red_flags(
 
     red_flags: list[str] = []
     dup_ids = tech_info.get('duplicate_ga4_ids') or []
+    dup_events = tech_info.get('duplicate_ga4_events') or []
     dup_rt = bool(tech_info.get('duplicate_ga4_runtime_confirmed'))
     if dup_ids:
-        status_lbl = 'duplicate_runtime_hits_confirmed' if dup_rt else 'duplicate_configuration_suspected'
+        if dup_rt:
+            ev_detail = f" — {', '.join(dup_events[:2])}" if dup_events else ''
+            red_flags.append(
+                f"Duplicate GA4 Firing [RUNTIME_NETWORK_VERIFIED] ({dup_ids[0]}{ev_detail})"
+            )
+        else:
+            red_flags.append(
+                f"Duplicate GA4 Config [CONFIGURED_IN_GTM + DETECTED_IN_HTML] ({dup_ids[0]} — runtime verification needed)"
+            )
+
+    if tech_info.get('tag_runtime_status') == 'CONSENT_GATED_OR_SILENT':
         red_flags.append(
-            f"Duplicate GA4 Tagging [{status_lbl}] ({dup_ids[0]} present in both HTML and GTM)"
+            'GA4 Tag Silent After Render [CONSENT_GATED_OR_SILENT] (configured in code/GTM, zero /g/collect network hits observed)'
         )
 
     scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
@@ -893,7 +992,7 @@ def build_evidence_json_from_cached_record(rec: dict, source_label: str = 'cache
         return None
     ev_map = {
         t: {
-            'verification_tier': 'configured_in_code',
+            'verification_tier': 'DETECTED_IN_HTML',
             'source': source_label,
             'evidence': f'Recovered from {source_label}',
         }
