@@ -41,7 +41,12 @@ PW_RUNTIME_SUMMARY_RE = re.compile(
 
 NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE = re.compile(
     r'(?:/g/collect|/j/collect|/r/collect|/collect(?:/|$|\?)|/sgtm/|/sst/|/gtm\.js|/gtag/js|'
-    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi)',
+    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi|/cdn-cgi/zaraz/)',
+    re.IGNORECASE,
+)
+
+CLOUDFLARE_ZARAZ_RE = re.compile(
+    r'(?:/cdn-cgi/zaraz/|zaraz\.track\(|window\.zaraz\b|__zarazContext)',
     re.IGNORECASE,
 )
 
@@ -148,6 +153,7 @@ RUNTIME_NET_SIGNATURES: Dict[str, tuple[str, ...]] = {
     'Dynamic Yield': ('cdn.dynamicyield.com', 'cdn-eu.dynamicyield.com'),
     'Optimizely': ('cdn.optimizely.com', 'logx.optimizely.com'),
     'Salesforce Marketing Cloud': ('exacttarget.com', 'collect.igodigital.com'),
+    'Server-Side GTM (sGTM)': ('/cdn-cgi/zaraz/',),
 }
 
 PAYMENT_GATEWAY_NAMES: Set[str] = {
@@ -165,6 +171,10 @@ PAYMENT_HTML_SIGNATURES: Dict[str, tuple[str, ...]] = {
     'PayPal': ('paypal.com/sdk/js', 'paypalobjects.com/api/checkout'),
 }
 
+NON_MARTECH_INFRA_LABELS: Set[str] = {
+    'Microsoft 365', 'Google Workspace', 'Cloudflare', 'Akamai', 'Fastly',
+}
+
 
 def _extract_reg_domain_for_sgtm(page_url: str) -> str:
     host = (urlparse(page_url or '').hostname or '').lower().removeprefix('www.').strip('.')
@@ -179,10 +189,10 @@ def _extract_reg_domain_for_sgtm(page_url: str) -> str:
 
 def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str, Any]:
     """
-    v24.3 XHR/Fetch/Ping Runtime Traffic Analyzer:
+    v24.4 XHR/Fetch/Ping Runtime Traffic Analyzer:
     Аналізує перехоплені Playwright XHR/Fetch/Beacon запити (`pw_xhr_req`, `pw_runtime_summary`),
-    виявляє server-side tracking на нестандартних першосторонніх піддоменах (напр. `x99.domain.com/collect`,
-    `fp.domain.com/g/collect`) та first-party проксі-шляхах (`/sgtm/collect`, `/capi/`, `/mp/collect`).
+    виявляє server-side tracking на нестандартних першосторонніх піддоменах (`x99.domain.com/collect`),
+    Cloudflare Zaraz (`/cdn-cgi/zaraz/`) та first-party проксі-шляхах (`/sgtm/collect`, `/capi/`, `/mp/collect`).
     """
     reg_dom = _extract_reg_domain_for_sgtm(page_url)
     summary: Dict[str, Any] = {}
@@ -208,7 +218,7 @@ def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str
         is_non_www_sub = bool(reg_dom and nh.endswith(f'.{reg_dom}') and nh != f'www.{reg_dom}')
 
         if is_first_party and NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE.search(path_q):
-            ev = f'XHR/{res_type.upper()} 1st-party collect hit: {nh}{p.path[:60]}'
+            ev = f'XHR/{res_type.upper()} 1st-party collect/Zaraz hit: {nh}{p.path[:60]}'
             if ev not in seen:
                 seen.add(ev)
                 first_party_hits.append(ev)
@@ -244,9 +254,9 @@ def detect_first_party_sgtm_endpoints(
     page_url: str,
 ) -> list[tuple[str, str]]:
     """
-    Виявляє серверний трекінг (sGTM / CAPI / First-Party Collector) на першосторонніх піддоменах
-    (metrics.<domain>, analytics.<domain>, sgtm.<domain>, sst.<domain>, tag.<domain>, track.<domain> тощо)
-    у мережевих запитах Playwright, параметрах transport_url/server_container_url та коді HTML/GTM.
+    Виявляє серверний трекінг (sGTM / Cloudflare Zaraz / CAPI / First-Party Collector) на першосторонніх
+    піддоменах (`metrics.<domain>`, `analytics.<domain>`, `sgtm.<domain>`, `sst.<domain>`, `tag.<domain>`)
+    та `/cdn-cgi/zaraz/` у мережевих запитах Playwright, параметрах `transport_url`/`server_container_url` і HTML/GTM.
     """
     reg_dom = _extract_reg_domain_for_sgtm(page_url)
     if not reg_dom or '.' not in reg_dom:
@@ -271,12 +281,18 @@ def detect_first_party_sgtm_endpoints(
                     hits.append(('runtime_verified', ev))
         elif nh == reg_dom or nh == f'www.{reg_dom}':
             if NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE.search(f'{parsed.path}?{parsed.query}'):
-                ev = f'1st-party sGTM path proxy request: {nh}{parsed.path[:60]}'
+                ev = f'1st-party sGTM/Zaraz path proxy request: {nh}{parsed.path[:60]}'
                 if ev not in seen_ev:
                     seen_ev.add(ev)
                     hits.append(('runtime_verified', ev))
 
     combined = f'{html_clean or ""}\n{gtm_str or ""}'
+
+    if CLOUDFLARE_ZARAZ_RE.search(combined):
+        ev = 'Cloudflare Zaraz server-side tag manager detected in markup'
+        if ev not in seen_ev:
+            seen_ev.add(ev)
+            hits.append(('configured_in_code', ev))
 
     for m_url in SGTM_TRANSPORT_URL_RE.findall(combined):
         m_low = m_url.lower()
@@ -572,11 +588,12 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.3 Enterprise MarTech & Runtime XHR/Fetch Traffic Analyzer:
-    1. Аналізує XHR/Fetch/Ping трафік із Playwright (`pw_xhr_req`, `pw_runtime_summary`) для виявлення
-       server-side tracking навіть на нестандартних першосторонніх піддоменах та `/collect`.
-    2. Розділяє джерела сигналів на 3 рівні підтвердження:
-       `runtime_verified`, `configured_in_code`, `allowlisted_in_csp`.
+    v24.4 Enterprise MarTech & Runtime XHR/Fetch Traffic Analyzer:
+    1. Аналізує XHR/Fetch/Ping трафік Playwright (`pw_xhr_req`, `pw_runtime_summary`),
+       виявляючи server-side tracking на нестандартних першосторонніх піддоменах,
+       `/collect` та Cloudflare Zaraz (`/cdn-cgi/zaraz/`).
+    2. Окремо формує `confirmed_martech_platforms` (лише `runtime_verified` та
+       `configured_in_code` MarTech-платформи — без CDN, сертифікатів та CSP-allowlist).
     """
     html_str = html or ''
     gtm_str = gtm_js or ''
@@ -759,6 +776,11 @@ def detect_tech_with_evidence(
         t: info['verification_tier'] for t, info in evidence_map.items()
     }
 
+    confirmed_martech_platforms = sorted(
+        t for t, tier in tech_verification_tiers.items()
+        if tier in ('runtime_verified', 'configured_in_code') and t not in NON_MARTECH_INFRA_LABELS
+    )
+
     sgtm_tier = tech_verification_tiers.get('Server-Side GTM (sGTM)')
     if sgtm_tier == 'runtime_verified':
         sgtm_assessment = 'runtime_verified_sgtm'
@@ -808,6 +830,7 @@ def detect_tech_with_evidence(
         'detected_cms': '; '.join(detected_cms_list) if detected_cms_list else None,
         'payment_gateways': sorted(payment_gateways),
         'detected_technologies_list': all_detected_techs,
+        'confirmed_martech_platforms': confirmed_martech_platforms,
         'tech_verification_tiers': tech_verification_tiers,
         'technology_evidence_summary': ', '.join(summary_parts) if summary_parts else 'No tracking technologies detected',
         'technology_evidence': ' | '.join(evidence_lines) if evidence_lines else 'No tracking signatures matched',
