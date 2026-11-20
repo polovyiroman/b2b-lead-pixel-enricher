@@ -2,8 +2,8 @@
   "actorSpecification": 1,
   "name": "b2b-lead-pixel-enricher",
   "title": "B2B Lead Tech Stack, Pixel & Decision-Maker Enricher",
-  "description": "Enterprise B2B MarTech & Account Intelligence engine (v24.2): 3-axis lead scoring (Account Fit, Technical Opportunity, Sales Actionability), first-party sGTM detection, operational Marketing Buyer targeting, EU/DE §7 UWG compliance guardrails, and verified OSINT enrichment.",
-  "version": "24.2",
+  "description": "Commercial B2B MarTech & Account Intelligence engine (v24.3): decoupled Account Scale vs. MarTech Stack tiers, 3-axis scoring (Account Fit, Technical Opportunity, Sales Actionability), XHR/Fetch sGTM runtime traffic analysis, operational Marketing Buyer targeting, null-scored scan failure classes, and EU/DE §7 UWG compliance guardrails.",
+  "version": "24.3",
   "buildTag": "latest",
   "meta": {
     "templateId": "python-empty"
@@ -14,22 +14,27 @@
   "storages": {
     "dataset": {
       "actorSpecification": 1,
-      "title": "B2B MarTech & Lead Intelligence Results (v24.2)",
+      "title": "B2B MarTech & Lead Intelligence Results (v24.3)",
       "fields": {},
       "views": {
         "overview": {
-          "title": "Pilot-Ready Sales View (3-Axis Scoring & Compliance)",
+          "title": "Commercial Sales View (29 Actionable Columns)",
           "transformation": {
             "fields": [
               "canonical_domain",
+              "sales_actionability_class",
               "actionable_priority_score",
               "account_fit_score",
               "technical_opportunity_score",
               "sales_actionability_score",
+              "data_quality_score",
+              "account_scale_tier",
               "martech_stack_tier",
               "company_category",
               "primary_sales_gap",
               "sales_gap_confidence",
+              "xhr_fetch_traffic_analyzed",
+              "server_side_tracking_assessment",
               "dm_buyer_fit_status",
               "outreach_compliance_block",
               "decision_maker_name",
@@ -37,30 +42,33 @@
               "company_linkedin_people_url",
               "best_email",
               "best_email_confidence",
+              "dm_predicted_email",
               "primary_phone",
               "ads_active_last_30d",
               "has_sgtm",
               "detected_signals",
               "sales_hook",
               "next_best_action",
-              "gdpr_jurisdiction",
-              "data_source_sensitivity",
-              "prospect_iana_timezone",
-              "recommended_outreach_lang"
+              "gdpr_jurisdiction"
             ]
           },
           "display": {
             "component": "table",
             "properties": {
               "canonical_domain": {"label": "Canonical Domain", "format": "text"},
+              "sales_actionability_class": {"label": "Actionability Class", "format": "text"},
               "actionable_priority_score": {"label": "Priority Score", "format": "number"},
               "account_fit_score": {"label": "Account Fit", "format": "number"},
               "technical_opportunity_score": {"label": "Tech Opportunity", "format": "number"},
               "sales_actionability_score": {"label": "Sales Actionability", "format": "number"},
+              "data_quality_score": {"label": "Data Quality", "format": "number"},
+              "account_scale_tier": {"label": "Account Scale Tier", "format": "text"},
               "martech_stack_tier": {"label": "MarTech Stack Tier", "format": "text"},
               "company_category": {"label": "Company Category", "format": "text"},
               "primary_sales_gap": {"label": "Primary Sales Gap", "format": "text"},
               "sales_gap_confidence": {"label": "Gap Confidence", "format": "text"},
+              "xhr_fetch_traffic_analyzed": {"label": "XHR/Fetch Traffic Analyzed", "format": "boolean"},
+              "server_side_tracking_assessment": {"label": "sGTM Assessment", "format": "text"},
               "dm_buyer_fit_status": {"label": "DM Buyer Fit", "format": "text"},
               "outreach_compliance_block": {"label": "Compliance Block", "format": "text"},
               "decision_maker_name": {"label": "Decision Maker", "format": "text"},
@@ -68,21 +76,19 @@
               "company_linkedin_people_url": {"label": "LinkedIn Marketing People", "format": "link"},
               "best_email": {"label": "Best Email", "format": "text"},
               "best_email_confidence": {"label": "Email Confidence", "format": "text"},
+              "dm_predicted_email": {"label": "Predicted DM Email", "format": "text"},
               "primary_phone": {"label": "Primary Phone", "format": "text"},
               "ads_active_last_30d": {"label": "Active Google Ads (30d)", "format": "boolean"},
               "has_sgtm": {"label": "sGTM (Server-Side)", "format": "boolean"},
               "detected_signals": {"label": "Detected Signals", "format": "text"},
               "sales_hook": {"label": "Sales Hook", "format": "text"},
               "next_best_action": {"label": "Next Best Action", "format": "text"},
-              "gdpr_jurisdiction": {"label": "Jurisdiction", "format": "text"},
-              "data_source_sensitivity": {"label": "Data Source Sensitivity", "format": "text"},
-              "prospect_iana_timezone": {"label": "Timezone", "format": "text"},
-              "recommended_outreach_lang": {"label": "Outreach Lang", "format": "text"}
+              "gdpr_jurisdiction": {"label": "Jurisdiction", "format": "text"}
             }
           }
         },
         "full_audit": {
-          "title": "Full Technical, OSINT & Compliance Audit (144 Fields)",
+          "title": "Full Technical, XHR/OSINT & Compliance Audit (150 Fields)",
           "transformation": {
             "fields": [
               "input_domain",
@@ -199,6 +205,12 @@
               "all_ga4_ids_count",
               "detected_technologies",
               "detected_payment_gateways",
+              "xhr_fetch_traffic_analyzed",
+              "xhr_fetch_requests_inspected",
+              "xhr_first_party_collect_endpoints",
+              "server_side_tracking_assessment",
+              "account_scale_tier",
+              "account_scale_basis",
               "martech_stack_tier",
               "martech_stack_tier_basis",
               "estimated_markets_count",
@@ -348,6 +360,12 @@
               "all_ga4_ids_count": {"label": "GA4 IDs Count", "format": "number"},
               "detected_technologies": {"label": "Detected Technologies", "format": "text"},
               "detected_payment_gateways": {"label": "Payment Gateways", "format": "array"},
+              "xhr_fetch_traffic_analyzed": {"label": "XHR/Fetch Traffic Analyzed", "format": "boolean"},
+              "xhr_fetch_requests_inspected": {"label": "XHR/Fetch Requests Inspected", "format": "number"},
+              "xhr_first_party_collect_endpoints": {"label": "1st-Party Collect Endpoints", "format": "array"},
+              "server_side_tracking_assessment": {"label": "sGTM Assessment", "format": "text"},
+              "account_scale_tier": {"label": "Account Scale Tier", "format": "text"},
+              "account_scale_basis": {"label": "Account Scale Basis", "format": "array"},
               "martech_stack_tier": {"label": "MarTech Stack Tier", "format": "text"},
               "martech_stack_tier_basis": {"label": "Stack Tier Basis", "format": "array"},
               "estimated_markets_count": {"label": "Est. Markets", "format": "number"},
