@@ -102,16 +102,21 @@ from .qualifier import (
     classify_company_category,
     classify_martech_stack_tier,
     compute_account_change_triggers_v23,
-    compute_account_fit_score,
+    compute_account_potential_score,
     compute_actionable_priority_score,
     compute_data_quality_score,
+    compute_evidence_confidence_score,
     compute_sales_actionability_score,
+    compute_sales_readiness_score,
     compute_technical_opportunity_score,
     derive_contactability_level,
+    derive_sales_readiness_status,
     detect_ma_rebrand_and_insolvency_v23,
+    enforce_outreach_compliance_guardrail,
     evaluate_qualification_v180,
+    extract_buying_intent_signals,
     fetch_rdap_domain_maturity_v23,
-    is_impressum_cold_email_blocked,
+    is_cold_email_compliance_blocked,
     is_marketplace_platform,
     resolve_prospect_timezone_and_locale_v23,
     verify_eu_entity_vies_and_gleif,
@@ -160,20 +165,22 @@ _OSINT_SEMAPHORE = asyncio.Semaphore(12)
 
 SDR_COMPACT_COLUMNS = (
     'canonical_domain',
+    'sales_readiness_status',
+    'sales_readiness_score',
+    'account_potential_score',
+    'evidence_confidence_score',
     'actionable_priority_score',
-    'account_fit_score',
-    'technical_opportunity_score',
-    'sales_actionability_score',
+    'data_quality_score',
     'contactability_level',
     'dm_buyer_fit_status',
     'outreach_compliance_block',
     'sales_actionability_class',
     'contact_quality_tier_human',
-    'data_quality_score',
     'company_category',
     'account_scale_tier',
     'martech_stack_tier',
-    'martech_stack_tier_basis',
+    'confirmed_martech_platforms',
+    'buying_intent_signals',
     'decision_maker_name',
     'dm_first_name',
     'dm_last_name',
@@ -210,6 +217,16 @@ SDR_COMPACT_COLUMNS = (
     'data_confidence_warning',
 )
 
+STATUS_SORT_ORDER = {
+    'SALES_READY': 0,
+    'ESCALATION_NEEDED': 1,
+    'RESEARCH_PRIORITY': 2,
+    'PARTNER_PIPELINE': 3,
+    'UNVERIFIED': 4,
+    'DISQUALIFIED': 5,
+    'SCAN_FAILED': 6,
+}
+
 LOW_VALUE_LIVE_EMAIL_TYPES = {
     'customer_support_inbox',
     'legal_or_hr_inbox',
@@ -234,7 +251,7 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v24.3 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
+# v24.4 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -361,8 +378,9 @@ def _normalize_inverted_dm_name(raw_dm_name: str | None) -> tuple[str | None, st
 
 def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: str = 'US') -> dict:
     """
-    Гарантує 100% паритет усіх 150 ключів схеми v24.3 та коректну обробку
-    `scan_failed_*` записів (збереження `None` / `null` у числових оцінках).
+    Гарантує 100% паритет усіх 156 ключів схеми v24.4, жорсткий комплаєнс-гардрейл
+    та збереження `sales_readiness_status = 'SCAN_FAILED'` із `None` у всіх 8 оцінках
+    для невдалих сканувань.
     """
     for legacy_k in (
         'account_opportunity_score',
@@ -472,13 +490,18 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     )
     rec['data_source_sensitivity'] = data_sens
 
-    impressum_blk = is_impressum_cold_email_blocked(jur_str, data_sens, False)
-    rec['outreach_compliance_block'] = 'eu_impressum_cold_email_blocked' if impressum_blk else 'none'
-    if impressum_blk and rec.get('next_best_action') and 'COMPLIANCE BLOCK' not in str(rec['next_best_action']):
-        rec['next_best_action'] = (
-            f"COMPLIANCE BLOCK (EU/DE §7 UWG & DSK): Do NOT send unsolicited cold email to Impressum address "
-            f"({best_em or 'listed email'}). Instead, connect with Head of Marketing / Digital via LinkedIn "
-            f"(company_linkedin_people_url or decision_maker_search_query) or obtain a warm intro."
+    comp_blk, comp_code = is_cold_email_compliance_blocked(
+        jur_str, data_sens, canonical_domain=canonical_domain, country_hint=c_hint, has_confirmed_legitimate_interest=False
+    )
+    rec['outreach_compliance_block'] = comp_code
+    if comp_blk and rec.get('next_best_action'):
+        rec['next_best_action'] = enforce_outreach_compliance_guardrail(
+            str(rec['next_best_action']),
+            comp_code,
+            dm_name=rec.get('decision_maker_name'),
+            dm_role=rec.get('decision_maker_role'),
+            dm_buyer_fit_status=dm_buyer_fit,
+            has_company_li_people=bool(company_li_people),
         )
 
     tz_info = resolve_prospect_timezone_and_locale_v23(
@@ -509,12 +532,18 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     )
 
     if is_scan_failed:
+        rec['sales_readiness_status'] = 'SCAN_FAILED'
         rec['sales_actionability_class'] = scan_fail_cls
+        rec['account_potential_score'] = None
+        rec['evidence_confidence_score'] = None
+        rec['sales_readiness_score'] = None
         rec['data_quality_score'] = None
         rec['account_fit_score'] = None
         rec['technical_opportunity_score'] = None
         rec['sales_actionability_score'] = None
         rec['actionable_priority_score'] = None
+        rec['confirmed_martech_platforms'] = []
+        rec['buying_intent_signals'] = []
         rec.setdefault('account_scale_tier', None)
         rec.setdefault('account_scale_basis', [])
         rec.setdefault('martech_stack_tier', None)
@@ -548,6 +577,10 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
                 ev_tiers = {k: str(v.get('verification_tier') or '') for k, v in ev_obj.items() if isinstance(v, dict)}
         except Exception:
             pass
+
+    confirmed_martech = sorted(t for t in tech_set if ev_tiers.get(t) != 'allowlisted_in_csp')
+    rec['confirmed_martech_platforms'] = confirmed_martech
+
     stack_info = classify_martech_stack_tier(tech_set, tech_verification_tiers=ev_tiers)
     rec['martech_stack_tier'] = stack_info['martech_stack_tier']
     rec['martech_stack_tier_basis'] = stack_info['martech_stack_tier_basis']
@@ -575,6 +608,17 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     rec.setdefault('primary_sales_gap', None)
     rec.setdefault('sales_gap_confidence', None)
 
+    buying_intent = extract_buying_intent_signals(
+        hiring_marketing_or_data_roles=rec.get('hiring_marketing_or_data_roles'),
+        open_positions_total=rec.get('open_positions_total'),
+        ads_active_last_30d=rec.get('ads_active_last_30d'),
+        active_ad_formats=rec.get('active_ad_formats'),
+        recent_change_triggers=rec.get('recent_change_triggers'),
+        primary_sales_gap=rec.get('primary_sales_gap'),
+        sales_gap_confidence=rec.get('sales_gap_confidence'),
+    )
+    rec['buying_intent_signals'] = buying_intent
+
     fake_tech_info = {
         'tech_scan_completeness': rec.get('tech_scan_completeness') or 'full',
         'detected_technologies_list': sorted(tech_set),
@@ -600,6 +644,7 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     rec['contactability_level'] = contact_lvl
 
     cat_str = rec.get('company_category') or 'General Business / Corporate'
+    is_cached_src = rec.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache', 'manual_seed')
     rec['data_quality_score'] = compute_data_quality_score(
         rec.get('contact_quality_tier'),
         len(tech_set),
@@ -607,7 +652,7 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         rec.get('decision_maker_linkedin_url'),
         rec.get('primary_phone'),
         rec.get('tech_scan_completeness') or 'full',
-        rec.get('cached_snapshot_source') in ('versioned_cache', 'evergreen_cache', 'manual_seed'),
+        is_cached_src,
         company_category=cat_str,
         is_manual_seed=(rec.get('cached_snapshot_source') == 'manual_seed'),
         is_same_person_email=verify_person_email_match(rec.get('decision_maker_name'), best_em),
@@ -617,7 +662,7 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         email_deliverability_check=rec.get('email_deliverability_check'),
     )
 
-    acc_fit = compute_account_fit_score(
+    acc_pot = compute_account_potential_score(
         cat_str,
         rec['account_scale_tier'],
         rec['martech_stack_tier'],
@@ -626,6 +671,18 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         rec.get('ads_active_last_30d'),
         rec.get('open_positions_total'),
         rec.get('hiring_marketing_or_data_roles'),
+        buying_intent_count=len(buying_intent),
+    )
+    ev_conf = compute_evidence_confidence_score(
+        rec.get('tech_scan_completeness') or 'full',
+        len(tech_set),
+        len(confirmed_martech),
+        xhr_checked,
+        str(rec.get('playwright_status') or 'not_needed'),
+        str(rec.get('tls_trust_status') or 'not_checked'),
+        str(rec.get('best_email_confidence') or 'NONE'),
+        rec.get('sales_gap_confidence'),
+        is_cached_or_seed=is_cached_src,
     )
     tech_opp = compute_technical_opportunity_score(
         cat_str,
@@ -641,14 +698,33 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         dm_buyer_fit,
         rec.get('best_email_confidence') or 'NONE',
         bool(company_li_people),
-        impressum_blk,
+        comp_blk,
         cat_str,
     )
-    rec['account_fit_score'] = acc_fit
+    sales_readiness = compute_sales_readiness_score(
+        cat_str,
+        dm_buyer_fit,
+        contact_lvl,
+        ev_conf,
+        tech_opp,
+        rec.get('best_email_confidence') or 'NONE',
+        comp_blk,
+        bool(company_li_people),
+        buying_intent_count=len(buying_intent),
+    )
+    readiness_status = derive_sales_readiness_status(
+        cat_str, acc_pot, ev_conf, sales_readiness, dm_buyer_fit, comp_blk
+    )
+
+    rec['sales_readiness_status'] = readiness_status
+    rec['account_potential_score'] = acc_pot
+    rec['evidence_confidence_score'] = ev_conf
+    rec['sales_readiness_score'] = sales_readiness
+    rec['account_fit_score'] = acc_pot
     rec['technical_opportunity_score'] = tech_opp
     rec['sales_actionability_score'] = sales_act
     rec['actionable_priority_score'] = compute_actionable_priority_score(
-        acc_fit, tech_opp, sales_act, cat_str
+        acc_pot, ev_conf, sales_readiness, cat_str
     )
     return rec
 
@@ -658,15 +734,20 @@ async def load_or_init_run_checkpoint() -> tuple[Set[str], Dict[str, int]]:
         "total_processed": 0,
         "valid_scanned": 0,
         "scan_failed": 0,
+        "sales_ready": 0,
+        "escalation_needed": 0,
+        "research_priority": 0,
         "dm_found": 0,
         "direct_mkt_buyers": 0,
         "server_verified_emails": 0,
+        "xhr_analyzed": 0,
+        "buying_intent_detected": 0,
         "active_ads": 0,
         "hiring_active": 0,
         "enterprise_or_mid_stack": 0,
     }
     try:
-        saved = await Actor.get_value("STATE_RUN_CHECKPOINT_V24_3")
+        saved = await Actor.get_value("STATE_RUN_CHECKPOINT_V24_4")
         if isinstance(saved, dict):
             pushed = set(saved.get("pushed_domains") or [])
             metrics = {**default_metrics, **(saved.get("metrics_counter") or {})}
@@ -679,7 +760,7 @@ async def load_or_init_run_checkpoint() -> tuple[Set[str], Dict[str, int]]:
 async def save_migration_safe_checkpoint(pushed_domains: Set[str], metrics_counter: Dict[str, int]) -> None:
     try:
         await Actor.set_value(
-            "STATE_RUN_CHECKPOINT_V24_3",
+            "STATE_RUN_CHECKPOINT_V24_4",
             {"pushed_domains": sorted(pushed_domains), "metrics_counter": dict(metrics_counter)},
         )
     except Exception:
@@ -690,33 +771,43 @@ async def publish_apify_run_executive_summary(metrics: Dict[str, int], is_final:
     total = int(metrics.get("total_processed", 0))
     valid_denom = max(1, int(metrics.get("valid_scanned", 0)) or total)
     failed_cnt = int(metrics.get("scan_failed", 0))
+    sr_cnt = int(metrics.get("sales_ready", 0))
+    esc_cnt = int(metrics.get("escalation_needed", 0))
+    res_cnt = int(metrics.get("research_priority", 0))
     dm = int(metrics.get("dm_found", 0))
     mkt_buyers = int(metrics.get("direct_mkt_buyers", 0))
     ver = int(metrics.get("server_verified_emails", 0))
+    xhr_cnt = int(metrics.get("xhr_analyzed", 0))
+    intent_cnt = int(metrics.get("buying_intent_detected", 0))
     ads = int(metrics.get("active_ads", 0))
     hiring = int(metrics.get("hiring_active", 0))
     ent_mid = int(metrics.get("enterprise_or_mid_stack", 0))
 
     status_msg = (
-        f"{'Done' if is_final else 'Running'}: {total} domains (Valid: {valid_denom}, Scan Failed: {failed_cnt}) | "
-        f"DMs: {dm} (Mkt Buyers: {mkt_buyers}) | Server-Verified Emails: {ver} | Active Ads: {ads}"
+        f"{'Done' if is_final else 'Running'}: {total} domains (Valid: {metrics.get('valid_scanned', 0)}, "
+        f"Scan Failed: {failed_cnt}) | SALES_READY: {sr_cnt} | Escalation: {esc_cnt} | "
+        f"Mkt Buyers: {mkt_buyers} | XHR Analyzed: {xhr_cnt}"
     )
     try:
         await Actor.set_status_message(status_msg)
         if is_final and total > 0:
             summary_md = (
-                f"# B2B MarTech & Account Intelligence v24.3 — Run Executive Summary\n\n"
-                f"| Metric | Count | Share of Valid Scans |\n"
+                f"# B2B MarTech & Account Intelligence v24.4 — Executive Summary\n\n"
+                f"| Metric | Count | Share |\n"
                 f"|---|---|---|\n"
                 f"| **Total Domains Processed** | **{total}** | 100% |\n"
                 f"| **Successfully Scanned Domains** | **{metrics.get('valid_scanned', 0)}** | {round(metrics.get('valid_scanned', 0) * 100 / max(1, total))}% |\n"
-                f"| **Scan Failed (WAF / Timeout / DNS — scores null)** | **{failed_cnt}** | {round(failed_cnt * 100 / max(1, total))}% |\n"
-                f"| **Decision Makers Identified** | **{dm}** | {round(dm * 100 / valid_denom)}% |\n"
-                f"| **Direct Marketing Buyers (CMO / Digital / E-com)** | **{mkt_buyers}** | {round(mkt_buyers * 100 / valid_denom)}% |\n"
-                f"| **Server-Verified Emails (M365 AD / SMTP API)** | **{ver}** | {round(ver * 100 / valid_denom)}% |\n"
-                f"| **Active Google Ads Spenders (Last 30d)** | **{ads}** | {round(ads * 100 / valid_denom)}% |\n"
-                f"| **Enterprise / Mid-Market MarTech Stack** | **{ent_mid}** | {round(ent_mid * 100 / valid_denom)}% |\n"
-                f"| **Actively Hiring Companies (ATS Feeds)** | **{hiring}** | {round(hiring * 100 / valid_denom)}% |\n"
+                f"| **SCAN_FAILED (WAF / Timeout / DNS — scores null)** | **{failed_cnt}** | {round(failed_cnt * 100 / max(1, total))}% |\n"
+                f"| **SALES_READY (Verified Marketing Buyer + High Evidence + Compliant)** | **{sr_cnt}** | {round(sr_cnt * 100 / valid_denom)}% of valid |\n"
+                f"| **ESCALATION_NEEDED (CEO / Founder Only)** | **{esc_cnt}** | {round(esc_cnt * 100 / valid_denom)}% of valid |\n"
+                f"| **RESEARCH_PRIORITY (High Potential Accounts)** | **{res_cnt}** | {round(res_cnt * 100 / valid_denom)}% of valid |\n"
+                f"| **Direct Marketing Buyers Found** | **{mkt_buyers}** (total DMs: {dm}) | {round(mkt_buyers * 100 / valid_denom)}% of valid |\n"
+                f"| **Server-Verified Emails (M365 AD / SMTP API)** | **{ver}** | {round(ver * 100 / valid_denom)}% of valid |\n"
+                f"| **XHR/Fetch Runtime Traffic Inspected (Playwright)** | **{xhr_cnt}** | {round(xhr_cnt * 100 / valid_denom)}% of valid |\n"
+                f"| **Buying Intent Signals Detected** | **{intent_cnt}** | {round(intent_cnt * 100 / valid_denom)}% of valid |\n"
+                f"| **Active Google Ads Spenders (Last 30d)** | **{ads}** | {round(ads * 100 / valid_denom)}% of valid |\n"
+                f"| **Enterprise / Mid-Market Confirmed MarTech** | **{ent_mid}** | {round(ent_mid * 100 / valid_denom)}% of valid |\n"
+                f"| **Actively Hiring Companies (ATS Feeds)** | **{hiring}** | {round(hiring * 100 / valid_denom)}% of valid |\n"
             )
             await Actor.set_value("SUMMARY.md", summary_md, content_type="text/markdown; charset=utf-8")
     except Exception:
@@ -730,12 +821,12 @@ async def start_standby_http_server(enrich_single_domain_func: Callable[[str, st
 
     async def handle_request(request: web.Request) -> web.Response:
         if request.headers.get("x-apify-container-server-readiness-probe"):
-            return web.json_response({"status": "ready", "version": "24.3"}, status=200)
+            return web.json_response({"status": "ready", "version": "24.4"}, status=200)
 
         domain = (request.query.get("domain") or "").strip()
         if not domain:
             if request.path == "/":
-                return web.json_response({"status": "ready", "version": "24.3"}, status=200)
+                return web.json_response({"status": "ready", "version": "24.4"}, status=200)
             return web.json_response({"error": "Missing required query parameter: domain"}, status=400)
 
         reg_dom, _ = extract_etld_plus_one(domain)
@@ -804,12 +895,12 @@ async def _send_completion_webhook(
 
     payload = {
         'event': 'b2b_lead_pixel_enricher.run_completed',
-        'version': '24.3',
+        'version': '24.4',
         'summary': run_telemetry,
         'records_count': len(records),
-        'sales_ready_count': sum(1 for r in records if r.get('sales_actionability_class') == 'sales_ready'),
-        'scan_failed_count': sum(1 for r in records if r.get('sales_actionability_class') in SCAN_FAILED_CLASSES),
-        'partnership_count': sum(1 for r in records if r.get('sales_actionability_class') in ('partnership', 'partner_agency')),
+        'sales_ready_count': sum(1 for r in records if r.get('sales_readiness_status') == 'SALES_READY'),
+        'escalation_needed_count': sum(1 for r in records if r.get('sales_readiness_status') == 'ESCALATION_NEEDED'),
+        'scan_failed_count': sum(1 for r in records if r.get('sales_readiness_status') == 'SCAN_FAILED'),
         'records': records[:250],
     }
     try:
@@ -849,9 +940,9 @@ def _build_early_abort_record(
     pw_attempted_paths: list[str] | None = None,
 ) -> dict:
     """
-    v24.3: Для всіх технічних збоїв (`blocked`, `http_403`, `http_429`, `http_404`, `timeout`, `dns_error`)
-    виставляє клас `scan_failed_waf_block` / `scan_failed_timeout` / `scan_failed_dns_error`
-    та `None` (`null`) для всіх скорингів замість `0`.
+    v24.4: 156-колонковий запис для всіх технічних збоїв (`HTTP 403/429/404`, `timeout`, `dns_error`).
+    Встановлює `sales_readiness_status = 'SCAN_FAILED'`, відповідний `scan_failed_*` клас
+    та `None` (`null`) для всіх 8 числових оцінок.
     """
     cat, cat_conf = classify_company_category(domain_key, '', '', [])
     c_hint = detect_country_hint(canonical_domain, '', '', None, '')
@@ -866,6 +957,7 @@ def _build_early_abort_record(
 
     if is_ssrf:
         verdict = 'Disqualified (SSRF / Non-Public Target Blocked)'
+        readiness_st = 'DISQUALIFIED'
         action_cls = 'unqualified'
         score_val = 0
         tier_val = 'Unverified / Minimal'
@@ -874,6 +966,7 @@ def _build_early_abort_record(
         enrichment_st = 'ssrf_blocked'
     elif scan_fail_cls == 'scan_failed_timeout':
         verdict = f'Scan Failed — Timeout ({short_err_msg or fail_status})'
+        readiness_st = 'SCAN_FAILED'
         action_cls = 'scan_failed_timeout'
         score_val = None
         tier_val = None
@@ -882,6 +975,7 @@ def _build_early_abort_record(
         enrichment_st = 'scan_failed_timeout'
     elif scan_fail_cls == 'scan_failed_dns_error':
         verdict = f'Scan Failed — DNS Error / Unreachable ({short_err_msg or fail_status})'
+        readiness_st = 'SCAN_FAILED'
         action_cls = 'scan_failed_dns_error'
         score_val = None
         tier_val = None
@@ -890,6 +984,7 @@ def _build_early_abort_record(
         enrichment_st = 'scan_failed_dns_error'
     else:
         verdict = f'Scan Failed — WAF / HTTP Block ({short_err_msg or fail_status})'
+        readiness_st = 'SCAN_FAILED'
         action_cls = 'scan_failed_waf_block'
         score_val = None
         tier_val = None
@@ -909,6 +1004,10 @@ def _build_early_abort_record(
         'cached_snapshot_source': f'none (live_{fail_status})',
         'cached_snapshot_age_days': None,
         'error_message': short_err_msg,
+        'sales_readiness_status': readiness_st,
+        'account_potential_score': score_val,
+        'evidence_confidence_score': score_val,
+        'sales_readiness_score': score_val,
         'data_quality_score': score_val,
         'account_fit_score': score_val,
         'technical_opportunity_score': score_val,
@@ -932,7 +1031,7 @@ def _build_early_abort_record(
         'contact_enrichment_status': enrichment_st,
         'data_confidence_warning': (
             f'Scan could not complete ({action_cls}: {short_err_msg}). '
-            f'Account is unverified — numeric scores set to null to prevent dataset distortion.'
+            f'Account is unverified — all numeric scores set to null to prevent dataset distortion.'
         ),
         'gdpr_eu_domain': blocked_is_eu,
         'gdpr_jurisdiction': blocked_jur,
@@ -1018,6 +1117,7 @@ def _build_early_abort_record(
         'all_ga4_ids': None,
         'all_ga4_ids_count': None,
         'detected_technologies': None,
+        'confirmed_martech_platforms': [],
         'detected_payment_gateways': [],
         'xhr_fetch_traffic_analyzed': False,
         'xhr_fetch_requests_inspected': 0,
@@ -1027,6 +1127,7 @@ def _build_early_abort_record(
         'account_scale_basis': [],
         'martech_stack_tier': tier_val,
         'martech_stack_tier_basis': [],
+        'buying_intent_signals': [],
         'estimated_markets_count': est_mkt_val,
         'detected_market_locales': [],
         'catalog_estimated_skus': None,
@@ -1465,10 +1566,29 @@ async def process_domain(
         not tech_info['detected_technologies_list'] and not tech_info['has_gtm']
         and not tech_info['has_ga4'] and bool(page_title)
     )
+    # v24.4 P0: Обов'язковий аналіз XHR/Fetch трафіку у Playwright, якщо знайдено GA4/GTM/рекламні теги без sGTM
+    rem_secs_for_xhr = remaining_run_seconds()
+    has_time_for_xhr_audit = (rem_secs_for_xhr is None or rem_secs_for_xhr > 65.0)
+    needs_pw_sgtm_xhr = bool(
+        not is_fast_http_only
+        and has_time_for_xhr_audit
+        and not tech_info.get('has_sgtm')
+        and not tech_info.get('xhr_fetch_traffic_analyzed')
+        and (
+            tech_info.get('has_ga4')
+            or tech_info.get('has_gtm')
+            or tech_info.get('has_google_ads')
+            or tech_info.get('has_meta_pixel')
+        )
+    )
     remaining_pw_budget = max(0, PW_GLOBAL_MAX_ATTEMPTS_PER_DOMAIN - pw_attempts_count)
 
     if is_playwright_available() and not pw_used_flag and remaining_pw_budget > 0 and (
-        not has_actionable_contacts or needs_pw_tech or needs_pw_empty_shell or needs_pw_no_tech_at_all
+        not has_actionable_contacts
+        or needs_pw_tech
+        or needs_pw_empty_shell
+        or needs_pw_no_tech_at_all
+        or needs_pw_sgtm_xhr
     ):
         if is_pw_hopeless:
             pw_status_str = 'skipped_fast_http_only' if is_fast_http_only else 'skipped_hopeless_waf'
@@ -1505,7 +1625,6 @@ async def process_domain(
                         phone_map[p] = (sc, src)
                 for k, v in pw_s.items():
                     socials_with_source.setdefault(k, v)
-                # v24.3: Завжди переоцінюємо tech_info після Playwright, щоб врахувати XHR/Fetch трафік
                 async with semaphore:
                     pw_gtm_ids, pw_gtm_js = await fetch_gtm_scripts(client, pw_html) if unpack_gtm else ([], '')
                 pw_comp = 'partial_timeout' if pw_incomplete else 'full'
@@ -1524,6 +1643,7 @@ async def process_domain(
     for pim_tech in pim_logistics_info.get('enterprise_pim_and_cms') or []:
         if pim_tech not in tech_info['detected_technologies_list']:
             tech_info['detected_technologies_list'].append(pim_tech)
+            tech_info.setdefault('confirmed_martech_platforms', []).append(pim_tech)
 
     osint_wave1: dict = {}
     osint_wave2: dict = {}
@@ -1551,6 +1671,8 @@ async def process_domain(
         for sh_tech in dns_intel_res.get('dns_shadow_tech') or []:
             if sh_tech in ('Klaviyo', 'HubSpot', 'Salesforce') and sh_tech not in tech_info['detected_technologies_list']:
                 tech_info['detected_technologies_list'].append(sh_tech)
+                tech_info.setdefault('confirmed_martech_platforms', []).append(sh_tech)
+                tech_info.setdefault('tech_verification_tiers', {})[sh_tech] = 'configured_in_code'
                 tech_info['has_esp_retention'] = True
 
         wk_res = osint_wave1.get('well_known') or {}
@@ -1591,6 +1713,10 @@ async def process_domain(
 
     normalize_tech_info_booleans(tech_info)
     detected_tech_list = tech_info['detected_technologies_list']
+    tiers_map = tech_info.get('tech_verification_tiers') or {}
+    confirmed_martech_list = sorted(
+        {t for t in detected_tech_list if tiers_map.get(t) != 'allowlisted_in_csp'}
+    )
 
     google_ads_conf = compute_google_ads_confidence(
         tech_info.get('has_google_ads'), tech_info.get('tech_scan_completeness', 'full'),
@@ -1889,7 +2015,6 @@ async def process_domain(
     dm_predicted_email_status = 'not_needed_already_matched' if (dm_name and verify_person_email_match(dm_name, best_email)) else 'not_generated'
 
     if dm_name and not verify_person_email_match(dm_name, best_email):
-        # v24.3: Враховуємо best_email_type (напр., якщо знайдено info@ -> пріоритет first@ / first.last@)
         dm_email_hyps = generate_dm_email_pattern_candidates(
             dm_name, canonical_domain, all_emails_list, best_email_type=best_email_type
         )
@@ -1939,7 +2064,6 @@ async def process_domain(
                 if verified_dm_em not in all_emails_list:
                     all_emails_list.insert(0, verified_dm_em)
             elif verified_dm_em and verified_conf_label == 'GRAVATAR_OR_PGP_MATCH':
-                # Профільний збіг без підтвердження доставлюваності: не підвищуємо до M365/SMTP
                 best_email = verified_dm_em
                 best_email_type = 'personal_or_named_inbox'
                 best_email_confidence = 'GRAVATAR_OR_PGP_MATCH'
@@ -1963,8 +2087,12 @@ async def process_domain(
     company_li_people_url = _build_company_linkedin_people_url(linkedin_url, canonical_domain)
 
     data_sensitivity = derive_data_source_sensitivity(dm_source_type, email_source_type, gdpr_jurisdiction)
-    impressum_email_blocked = is_impressum_cold_email_blocked(
-        gdpr_jurisdiction, data_sensitivity, has_confirmed_legitimate_interest=False
+    compliance_blocked, compliance_block_code = is_cold_email_compliance_blocked(
+        gdpr_jurisdiction,
+        data_sensitivity,
+        canonical_domain=canonical_domain,
+        country_hint=country_hint,
+        has_confirmed_legitimate_interest=False,
     )
 
     (
@@ -1982,6 +2110,8 @@ async def process_domain(
         has_confirmed_legitimate_interest=False,
         dm_buyer_fit_status=dm_buyer_fit_status,
         company_linkedin_people_url=company_li_people_url,
+        canonical_domain=canonical_domain,
+        country_hint=country_hint,
     )
 
     red_flags = detect_broken_attribution_red_flags(
@@ -2052,7 +2182,6 @@ async def process_domain(
     if pim_logistics_info.get('has_automated_returns_portal'):
         logistics_stack.append('Automated Returns Portal')
 
-    # v24.3: Розділені метрики масштабу (`account_scale_tier`) і технологічної зрілості (`martech_stack_tier`)
     scale_tier_info = classify_account_scale_tier(
         estimated_markets_count=scale_signals['estimated_markets_count'],
         detected_market_locales_count=len(scale_signals['detected_market_locales']),
@@ -2063,16 +2192,16 @@ async def process_domain(
     )
     stack_tier_info = classify_martech_stack_tier(
         set(detected_tech_list),
-        tech_verification_tiers=tech_info.get('tech_verification_tiers'),
+        tech_verification_tiers=tiers_map,
     )
 
     # ==========================================================================
-    # v24.3: Пріоритезований primary_sales_gap + XHR/Fetch-підкріплений issue_suspected
+    # v24.4 P0: Сувора доказовість primary_sales_gap
+    # (НІКОЛИ не ставимо issue_confirmed для відсутності sGTM!)
     # ==========================================================================
     primary_sales_gap: Optional[str] = None
     sales_gap_confidence: Optional[str] = None
     scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
-    tiers_map = tech_info.get('tech_verification_tiers') or {}
     gads_tier = tiers_map.get('Google Ads Conversion', '')
     xhr_analyzed = bool(tech_info.get('xhr_fetch_traffic_analyzed'))
 
@@ -2117,6 +2246,29 @@ async def process_domain(
             primary_sales_gap = 'HIGH_VOLUME_NO_RETURNS_PORTAL'
             sales_gap_confidence = 'issue_suspected'
 
+    recent_change_triggers: List[str] = []
+    if prior_cached_for_safe_write:
+        recent_change_triggers = compute_account_change_triggers_v23(
+            prior_cached_for_safe_write,
+            {
+                'decision_maker_name': dm_name,
+                'ads_active_last_30d': ads_active_30d,
+                'open_positions_total': open_jobs_count,
+                'detected_technologies': '; '.join(detected_tech_list) if detected_tech_list else None,
+                'technology_evidence_json': tech_info.get('technology_evidence_json'),
+            },
+        )
+
+    buying_intent_signals = extract_buying_intent_signals(
+        hiring_marketing_or_data_roles=hiring_mkt_roles,
+        open_positions_total=open_jobs_count,
+        ads_active_last_30d=ads_active_30d,
+        active_ad_formats=active_ad_fmts,
+        recent_change_triggers=recent_change_triggers,
+        primary_sales_gap=primary_sales_gap,
+        sales_gap_confidence=sales_gap_confidence,
+    )
+
     all_phones_list = [p for p, _ in sorted_phones_with_src]
     human_tier = derive_human_contact_tier(contact_quality_tier, company_category)
     actionability_cls = derive_sales_actionability_class(sales_readiness_verdict, company_category)
@@ -2147,7 +2299,8 @@ async def process_domain(
         best_email_confidence=best_email_confidence,
     )
 
-    account_fit_score = compute_account_fit_score(
+    # 3 Незалежні оцінки (Account Potential / Evidence Confidence / Sales Readiness)
+    account_potential_score = compute_account_potential_score(
         company_category,
         scale_tier_info['account_scale_tier'],
         stack_tier_info['martech_stack_tier'],
@@ -2156,6 +2309,18 @@ async def process_domain(
         ads_active_30d,
         open_jobs_count,
         hiring_mkt_roles,
+        buying_intent_count=len(buying_intent_signals),
+    )
+    evidence_confidence_score = compute_evidence_confidence_score(
+        tech_info['tech_scan_completeness'],
+        len(detected_tech_list),
+        len(confirmed_martech_list),
+        xhr_analyzed,
+        pw_status_str=pw_status_str,
+        tls_trust_status=tls_trust_status,
+        best_email_confidence=best_email_confidence,
+        sales_gap_confidence=sales_gap_confidence,
+        is_cached_or_seed=cache_tech_recovered,
     )
     technical_opportunity_score = compute_technical_opportunity_score(
         company_category,
@@ -2171,13 +2336,32 @@ async def process_domain(
         dm_buyer_fit_status,
         best_email_confidence=best_email_confidence,
         has_company_linkedin_people_url=bool(company_li_people_url),
-        impressum_email_blocked=impressum_email_blocked,
+        impressum_email_blocked=compliance_blocked,
         company_category=company_category,
     )
-    actionable_priority = compute_actionable_priority_score(
-        account_fit_score,
+    sales_readiness_score = compute_sales_readiness_score(
+        company_category,
+        dm_buyer_fit_status,
+        contactability_lvl,
+        evidence_confidence_score,
         technical_opportunity_score,
-        sales_actionability_score,
+        best_email_confidence=best_email_confidence,
+        compliance_blocked=compliance_blocked,
+        has_company_li_people=bool(company_li_people_url),
+        buying_intent_count=len(buying_intent_signals),
+    )
+    sales_readiness_status = derive_sales_readiness_status(
+        company_category,
+        account_potential_score,
+        evidence_confidence_score,
+        sales_readiness_score,
+        dm_buyer_fit_status,
+        compliance_blocked=compliance_blocked,
+    )
+    actionable_priority = compute_actionable_priority_score(
+        account_potential_score,
+        evidence_confidence_score,
+        sales_readiness_score,
         company_category=company_category,
     )
 
@@ -2228,6 +2412,7 @@ async def process_domain(
         'email_server_verified': is_server_verified_email_confidence(best_email_confidence, deliverability_check),
         'tls_trust': tls_trust_status,
         'xhr_traffic_analyzed': xhr_analyzed,
+        'compliance_block': compliance_block_code,
     }
 
     result_record = {
@@ -2242,14 +2427,18 @@ async def process_domain(
         'cached_snapshot_source': 'live',
         'cached_snapshot_age_days': 0,
         'error_message': '',
+        'sales_readiness_status': sales_readiness_status,
+        'account_potential_score': account_potential_score,
+        'evidence_confidence_score': evidence_confidence_score,
+        'sales_readiness_score': sales_readiness_score,
         'data_quality_score': dq_score,
-        'account_fit_score': account_fit_score,
+        'account_fit_score': account_potential_score,
         'technical_opportunity_score': technical_opportunity_score,
         'sales_actionability_score': sales_actionability_score,
         'actionable_priority_score': actionable_priority,
         'contactability_level': contactability_lvl,
         'dm_buyer_fit_status': dm_buyer_fit_status,
-        'outreach_compliance_block': 'eu_impressum_cold_email_blocked' if impressum_email_blocked else 'none',
+        'outreach_compliance_block': compliance_block_code,
         'sales_readiness_verdict': sales_readiness_verdict,
         'sales_actionability_class': actionability_cls,
         'company_category': company_category,
@@ -2344,6 +2533,7 @@ async def process_domain(
         'all_ga4_ids': tech_info['all_ga4_ids'],
         'all_ga4_ids_count': tech_info.get('all_ga4_ids_count'),
         'detected_technologies': '; '.join(detected_tech_list) if detected_tech_list else None,
+        'confirmed_martech_platforms': confirmed_martech_list,
         'detected_payment_gateways': tech_info.get('payment_gateways') or [],
         'xhr_fetch_traffic_analyzed': xhr_analyzed,
         'xhr_fetch_requests_inspected': int(tech_info.get('xhr_fetch_requests_inspected') or 0),
@@ -2353,6 +2543,7 @@ async def process_domain(
         'account_scale_basis': scale_tier_info['account_scale_basis'],
         'martech_stack_tier': stack_tier_info['martech_stack_tier'],
         'martech_stack_tier_basis': stack_tier_info['martech_stack_tier_basis'],
+        'buying_intent_signals': buying_intent_signals,
         'estimated_markets_count': scale_signals['estimated_markets_count'],
         'detected_market_locales': scale_signals['detected_market_locales'],
         'catalog_estimated_skus': catalog_skus,
@@ -2375,18 +2566,13 @@ async def process_domain(
         'recommended_outreach_lang': tz_locale_info['recommended_outreach_lang'],
         'corporate_lifecycle_status': lifecycle_info['corporate_lifecycle_status'],
         'outreach_dedup_status': 'PRIMARY_OUTREACH_TARGET',
-        'recent_change_triggers': [],
+        'recent_change_triggers': recent_change_triggers,
         'compliance_ids': compliance_ids,
         'provenance_meta': provenance_meta,
         'all_emails': '; '.join(all_emails_list) if all_emails_list else None,
         'all_phones': '; '.join(all_phones_list) if all_phones_list else None,
         'last_checked_at': checked_at,
     }
-
-    if prior_cached_for_safe_write:
-        result_record['recent_change_triggers'] = compute_account_change_triggers_v23(
-            prior_cached_for_safe_write, result_record
-        )
 
     if compliance_dpo_email and not result_record.get('best_email'):
         result_record['email_source_note'] = f'Compliance/DPO address isolated ({compliance_dpo_email}); excluded from cold sales'
@@ -2556,8 +2742,9 @@ async def main() -> None:
 
                 completed_results.sort(
                     key=lambda r: (
-                        0 if str(r.get('status') or '').startswith('success') else 1,
-                        -(int(r['actionable_priority_score']) if r.get('actionable_priority_score') is not None else -1),
+                        STATUS_SORT_ORDER.get(str(r.get('sales_readiness_status') or 'UNVERIFIED'), 5),
+                        -(int(r['sales_readiness_score']) if r.get('sales_readiness_score') is not None else -1),
+                        -(int(r['account_potential_score']) if r.get('account_potential_score') is not None else -1),
                         str(r.get('canonical_domain') or r.get('input_domain') or ''),
                     )
                 )
@@ -2590,11 +2777,21 @@ async def main() -> None:
 
                     metrics_counter['total_processed'] += 1
                     metrics_counter[f'status_{st}'] += 1
-                    is_failed_rec = result.get('sales_actionability_class') in SCAN_FAILED_CLASSES
+                    readiness_st = str(result.get('sales_readiness_status') or '')
+                    is_failed_rec = (
+                        readiness_st == 'SCAN_FAILED'
+                        or result.get('sales_actionability_class') in SCAN_FAILED_CLASSES
+                    )
                     if is_failed_rec:
                         metrics_counter['scan_failed'] += 1
                     else:
                         metrics_counter['valid_scanned'] += 1
+                        if readiness_st == 'SALES_READY':
+                            metrics_counter['sales_ready'] += 1
+                        elif readiness_st == 'ESCALATION_NEEDED':
+                            metrics_counter['escalation_needed'] += 1
+                        elif readiness_st == 'RESEARCH_PRIORITY':
+                            metrics_counter['research_priority'] += 1
                         if result.get('decision_maker_name'):
                             metrics_counter['dm_found'] += 1
                         if result.get('dm_buyer_fit_status') == 'direct_marketing_buyer':
@@ -2604,6 +2801,10 @@ async def main() -> None:
                             result.get('email_deliverability_check'),
                         ):
                             metrics_counter['server_verified_emails'] += 1
+                        if result.get('xhr_fetch_traffic_analyzed'):
+                            metrics_counter['xhr_analyzed'] += 1
+                        if result.get('buying_intent_signals'):
+                            metrics_counter['buying_intent_detected'] += 1
                         if result.get('ads_active_last_30d') is True:
                             metrics_counter['active_ads'] += 1
                         if (result.get('open_positions_total') or 0) > 0:
@@ -2622,11 +2823,12 @@ async def main() -> None:
                         await save_migration_safe_checkpoint(pushed_canonical_set, metrics_counter)
 
                     Actor.log.info(
-                        f"[{st.upper()}] {result['canonical_domain']} (cls={result['sales_actionability_class']}, "
-                        f"prio={result['actionable_priority_score']}, dq={result['data_quality_score']}, "
-                        f"scale={result.get('account_scale_tier')}, stack={result.get('martech_stack_tier')}, "
-                        f"dm_fit={result['dm_buyer_fit_status']}, xhr={result.get('xhr_fetch_traffic_analyzed')}) | "
-                        f"DM: {result['decision_maker_name'] or '-'} | Email: {result['best_email'] or '-'} ({result['best_email_confidence']})"
+                        f"[{readiness_st or st.upper()}] {result['canonical_domain']} "
+                        f"(pot={result['account_potential_score']}, conf={result['evidence_confidence_score']}, "
+                        f"ready={result['sales_readiness_score']}, dq={result['data_quality_score']}, "
+                        f"blk={result['outreach_compliance_block']}, xhr={result.get('xhr_fetch_traffic_analyzed')}) | "
+                        f"DM: {result['decision_maker_name'] or '-'} ({result['dm_buyer_fit_status']}) | "
+                        f"Email: {result['best_email'] or '-'}"
                     )
 
                 await save_migration_safe_checkpoint(pushed_canonical_set, metrics_counter)
@@ -2637,6 +2839,11 @@ async def main() -> None:
                     'unique_canonical_domains_pushed': len(pushed_canonical_set),
                     'valid_scanned_count': metrics_counter['valid_scanned'],
                     'scan_failed_count': metrics_counter['scan_failed'],
+                    'sales_ready_count': metrics_counter['sales_ready'],
+                    'escalation_needed_count': metrics_counter['escalation_needed'],
+                    'research_priority_count': metrics_counter['research_priority'],
+                    'xhr_analyzed_count': metrics_counter['xhr_analyzed'],
+                    'buying_intent_count': metrics_counter['buying_intent_detected'],
                     'live_success_count': metrics_counter['status_success'] + metrics_counter['status_success (seed_merged)'],
                     'cache_or_seed_fallback_count': metrics_counter['cache_or_seed_fallbacks'],
                     'playwright_rendered_count': metrics_counter['playwright_rendered'],
