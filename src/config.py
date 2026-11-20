@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlparse
 
 MAX_HTML_BYTES = 1_500_000
-CACHE_SCHEMA_VERSION = 30
+CACHE_SCHEMA_VERSION = 31
 MIN_COMPATIBLE_CACHE_SCHEMA = 6
 EVERGREEN_MAX_AGE_DAYS = 180
 MAX_DISPLAY_GA4_IDS = 50
@@ -110,29 +110,39 @@ GTM_FALSE_POSITIVES = {
     'GTM-LABEL', 'GTM-VALUE', 'GTM-TRIGGER', 'GTM-VARIABLE', 'GTM-TAG', 'GTM-MACRO'
 }
 
+# v24.3: Пріоритетні розширені операційні ролі маркетингу, digital, growth та e-commerce
 ROLES_REGEX_PART = (
-    r'(?:CEO|Founder|Co-Founder|Owner|CMO|Chief Marketing Officer|Head of Marketing|'
-    r'Marketing Director|Head of E-commerce|E-commerce Director|Head of Growth|'
-    r'Head of Digital|Performance Lead|Commercial Director|Managing Partner|Managing Director|General Manager|President|'
+    r'(?:CMO|Chief Marketing Officer|VP of Marketing|VP Marketing|SVP Marketing|SVP of Marketing|'
+    r'Head of Marketing|Marketing Director|Director of Marketing|Head of Digital Marketing|'
+    r'Digital Marketing Director|Head of Digital|Digital Director|Head of E-commerce|Head of Ecommerce|'
+    r'E-commerce Director|Ecommerce Director|Director of E-commerce|VP of E-commerce|VP E-commerce|'
+    r'Head of Growth|Growth Director|VP of Growth|VP Growth|Growth Lead|'
+    r'Head of Performance Marketing|Head of Performance|Performance Marketing Director|Performance Lead|'
+    r'Head of Acquisition|Head of Paid Media|Head of CRM|CRM Director|Head of Retention|'
+    r'Head of Analytics|Analytics Director|Head of Data|Head of CRO|CRO Lead|Head of Brand|Brand Director|'
+    r'CEO|Founder|Co-Founder|Owner|Commercial Director|Managing Partner|Managing Director|General Manager|President|'
+    r'Директор з маркетингу|Керівник відділу маркетингу|Керівник маркетингу|Маркетинг-директор|'
+    r'Керівник діджитал|Керівник e-commerce|Директор з e-commerce|Керівник з розвитку|'
     r'Засновник|Засновниця|Співзасновник|Співзасновниця|Співзасновники|Власник|Власниця|'
-    r'Генеральний директор|Директор з маркетингу|Керівник відділу маркетингу|'
-    r'Маркетинг-директор|Комерційний директор|Керівник з розвитку|Директорка|Директор|'
+    r'Генеральний директор|Комерційний директор|Директорка|Директор|'
+    r'Marketingleiter|Marketingleiterin|Leiter Marketing|Leitung Marketing|Leiter Online-Marketing|'
+    r'Leiter E-Commerce|Leitung E-Commerce|Leiter Digital|Digitalleiter|Vertriebsleiter|'
     r'Geschäftsführer|Geschäftsführerin|Geschäftsführung|Inhaber|Inhaberin|'
     r'Gründer|Gründerin|Mitgründer|Mitgründerin|Vorstandsvorsitzender|Vorstandsvorsitzende|Bereichsvorstand|Vorstand|'
-    r'Marketingleiter|Marketingleiterin|Leiter Marketing|Vertriebsleiter|'
-    r'PDG|Président-Directeur Général|Président|Présidente|Directeur Général|Directrice Générale|'
-    r'Gérant|Gérante|Associé Gérant|Fondateur|Fondatrice|Co-fondateur|Co-fondatrice|'
-    r'Directeur Marketing|Directrice Marketing|Directeur Commercial|Directrice Commerciale|Responsable Marketing|'
-    r'Director General|Directora General|Consejero Delegado|Fundador|Fundadora|Cofundador|Cofundadora|'
-    r'Director de Marketing|Directora de Marketing|Director Comercial|Gerente General|Propietario|Socio Director|'
-    r'Amministratore Delegato|Amministratore Unico|Direttore Generale|Fondatore|Fondatrice|Co-fondatore|'
-    r'Direttore Marketing|Direttore Commerciale|Titolare|'
-    r'Algemeen Directeur|Oprichter|Mede-oprichter|Eigenaar|Bestuurder|Commercieel Directeur|Marketing Directeur|Hoofd Marketing|'
-    r'Prezes Zarządu|Wiceprezes Zarządu|Prezes|Właściciel|Właścicielka|Założyciel|Założycielka|Współzałożyciel|'
-    r'Dyrektor Zarządzający|Dyrektor Marketingu|Dyrektor Handlowy|Członek Zarządu|'
-    r'Diretor Geral|Diretora Geral|Sócio-Gerente|Diretor de Marketing|Diretor Comercial|'
-    r'Verkställande direktör|VD|Grundare|Medgrundare|Ägare|Marknadschef|Försäljningschef|'
-    r'Administrerende direktør|Stifter|Medstifter|Ejer|Daglig leder|Markedssjef)'
+    r'Directeur Marketing|Directrice Marketing|Responsable Marketing|Directeur Digital|Directeur E-commerce|'
+    r'Directeur Commercial|Directrice Commerciale|PDG|Président-Directeur Général|Président|Présidente|'
+    r'Directeur Général|Directrice Générale|Gérant|Gérante|Associé Gérant|Fondateur|Fondatrice|Co-fondateur|Co-fondatrice|'
+    r'Director de Marketing|Directora de Marketing|Responsable de Marketing|Director Digital|Director de E-commerce|'
+    r'Director Comercial|Director General|Directora General|Consejero Delegado|Fundador|Fundadora|Cofundador|Cofundadora|Gerente General|Propietario|Socio Director|'
+    r'Direttore Marketing|Responsabile Marketing|Direttore Digitale|Direttore E-commerce|Direttore Commerciale|'
+    r'Amministratore Delegato|Amministratore Unico|Direttore Generale|Fondatore|Fondatrice|Co-fondatore|Titolare|'
+    r'Marketing Directeur|Hoofd Marketing|Hoofd E-commerce|Hoofd Digital|Commercieel Directeur|'
+    r'Algemeen Directeur|Oprichter|Mede-oprichter|Eigenaar|Bestuurder|'
+    r'Dyrektor Marketingu|Dyrektor E-commerce|Dyrektor Digital|Dyrektor Handlowy|'
+    r'Prezes Zarządu|Wiceprezes Zarządu|Prezes|Właściciel|Właścicielka|Założyciel|Założycielka|Współzałożyciel|Dyrektor Zarządzający|Członek Zarządu|'
+    r'Diretor de Marketing|Diretor Digital|Diretor Comercial|Diretor Geral|Diretora Geral|Sócio-Gerente|'
+    r'Marknadschef|Försäljningschef|Verkställande direktör|VD|Grundare|Medgrundare|Ägare|'
+    r'Markedssjef|Administrerende direktør|Stifter|Medstifter|Ejer|Daglig leder)'
 )
 
 UPPER_CHAR_CLASS = r'A-ZА-ЯІЇЄҐÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦŨŪŬŮŰŲŴŶŸŹŻŽ'
@@ -244,7 +254,6 @@ UI_ACTION_WORDS_BLACKLIST = {
     'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere',
     'premium', 'quality', 'best', 'top', 'original', 'official', 'exclusive', 'standard',
     'luxury', 'high', 'super', 'ultra', 'smart', 'pro', 'plus', 'max', 'prime',
-    # v24.1.2: UI-фантоми демо-екранів та німецькі юридичні займенники (airslate, pipedrive, breuninger)
     'message', 'direct', 'search', 'key', 'web', 'solar', 'content', 'interesting',
     'voyage', 'maiden', 'demo', 'sample', 'trial', 'free', 'start', 'get', 'book',
     'schedule', 'request', 'sofern', 'sie', 'ihre', 'ihr', 'mitglied', 'kunde',
@@ -312,31 +321,87 @@ ROLE_WORDS_IN_CONTEXT = (
 ROLE_NORMALIZATION_MAP = {
     'cmo': 'Chief Marketing Officer (CMO)',
     'chief marketing officer': 'Chief Marketing Officer (CMO)',
+    'vp marketing': 'VP of Marketing',
+    'vp of marketing': 'VP of Marketing',
+    'svp marketing': 'SVP of Marketing',
+    'svp of marketing': 'SVP of Marketing',
     'директор з маркетингу': 'Chief Marketing Officer (CMO)',
     'маркетинг-директор': 'Chief Marketing Officer (CMO)',
     'керівник відділу маркетингу': 'Head of Marketing',
+    'керівник маркетингу': 'Head of Marketing',
+    'керівник діджитал': 'Head of Digital',
+    'керівник e-commerce': 'Head of E-commerce',
+    'директор з e-commerce': 'E-commerce Director',
+    'керівник з розвитку': 'Head of Growth',
     'head of marketing': 'Head of Marketing',
     'marketing director': 'Marketing Director',
+    'director of marketing': 'Marketing Director',
     'marketingleiter': 'Head of Marketing',
     'marketingleiterin': 'Head of Marketing',
     'leiter marketing': 'Head of Marketing',
+    'leitung marketing': 'Head of Marketing',
+    'leiter online-marketing': 'Head of Digital',
+    'leiter e-commerce': 'Head of E-commerce',
+    'leitung e-commerce': 'Head of E-commerce',
+    'leiter digital': 'Head of Digital',
+    'digitalleiter': 'Head of Digital',
     'directeur marketing': 'Marketing Director',
     'directrice marketing': 'Marketing Director',
     'responsable marketing': 'Head of Marketing',
+    'directeur digital': 'Head of Digital',
+    'directeur e-commerce': 'E-commerce Director',
     'director de marketing': 'Marketing Director',
     'directora de marketing': 'Marketing Director',
+    'responsable de marketing': 'Head of Marketing',
+    'director digital': 'Head of Digital',
+    'director de e-commerce': 'E-commerce Director',
     'direttore marketing': 'Marketing Director',
+    'responsabile marketing': 'Head of Marketing',
+    'direttore digitale': 'Head of Digital',
+    'direttore e-commerce': 'E-commerce Director',
     'marketing directeur': 'Marketing Director',
     'hoofd marketing': 'Head of Marketing',
+    'hoofd e-commerce': 'Head of E-commerce',
+    'hoofd digital': 'Head of Digital',
     'dyrektor marketingu': 'Marketing Director',
+    'dyrektor e-commerce': 'E-commerce Director',
+    'dyrektor digital': 'Head of Digital',
     'diretor de marketing': 'Marketing Director',
+    'diretor digital': 'Head of Digital',
     'marknadschef': 'Head of Marketing',
     'markedssjef': 'Head of Marketing',
     'head of e-commerce': 'Head of E-commerce',
+    'head of ecommerce': 'Head of E-commerce',
     'e-commerce director': 'E-commerce Director',
+    'ecommerce director': 'E-commerce Director',
+    'director of e-commerce': 'E-commerce Director',
+    'vp of e-commerce': 'E-commerce Director',
+    'vp e-commerce': 'E-commerce Director',
     'head of growth': 'Head of Growth',
+    'growth director': 'Head of Growth',
+    'vp of growth': 'Head of Growth',
+    'vp growth': 'Head of Growth',
+    'growth lead': 'Head of Growth',
     'head of digital': 'Head of Digital',
+    'head of digital marketing': 'Head of Digital',
+    'digital marketing director': 'Head of Digital',
+    'digital director': 'Head of Digital',
+    'head of performance marketing': 'Performance Marketing Lead',
+    'head of performance': 'Performance Marketing Lead',
+    'performance marketing director': 'Performance Marketing Lead',
     'performance lead': 'Performance Marketing Lead',
+    'head of acquisition': 'Head of Growth / Acquisition',
+    'head of paid media': 'Performance Marketing Lead',
+    'head of crm': 'Head of CRM & Retention',
+    'crm director': 'Head of CRM & Retention',
+    'head of retention': 'Head of CRM & Retention',
+    'head of analytics': 'Head of Analytics / Data',
+    'analytics director': 'Head of Analytics / Data',
+    'head of data': 'Head of Analytics / Data',
+    'head of cro': 'Head of CRO / Conversion',
+    'cro lead': 'Head of CRO / Conversion',
+    'head of brand': 'Brand Director',
+    'brand director': 'Brand Director',
     'ceo': 'Chief Executive Officer (CEO)',
     'генеральний директор': 'Chief Executive Officer (CEO)',
     'директор': 'Managing Director / CEO',
@@ -488,7 +553,6 @@ STOP_NAME_WORDS = {
     'Latin', 'America', 'Americas', 'North', 'South', 'Central', 'Eastern', 'Western',
     'Northern', 'Southern', 'Asia', 'Pacific', 'Middle', 'East', 'Africa', 'Global',
     'National', 'Regional', 'Europe', 'European',
-    # v24.1.2: UI-фантоми демо-екранів та німецькі юридичні займенники
     'Message', 'Direct', 'Search', 'Key', 'Web', 'Solar', 'Content', 'Interesting',
     'Voyage', 'Maiden', 'Demo', 'Sample', 'Trial', 'Free', 'Start', 'Get', 'Book',
     'Schedule', 'Request', 'Sofern', 'Sie', 'Ihre', 'Ihr', 'Mitglied', 'Kunde',
@@ -694,7 +758,7 @@ PRIMARY_CONTACT_KEYWORDS = (
 )
 SECONDARY_CONTACT_KEYWORDS = (
     'about', 'uber-uns', 'ueber-uns', 'team', 'komanda', 'company', 'leadership',
-    'management', 'founders', 'our-story', 'pro-nas', 'o-nas', 'history', 'brand',
+    'management', 'founders', 'people', 'executive', 'our-story', 'pro-nas', 'o-nas', 'history', 'brand',
     'wholesale', 'b2b', 'investors', 'oferta', 'offer', 'terms', 'our-services', 'ugoda',
     'qui-sommes-nous', 'a-propos', 'equipe', 'quienes-somos', 'nosotros', 'equipo',
     'chi-siamo', 'over-ons', 'ons-team', 'o-firmie', 'zespol', 'om-oss', 'om-os'
@@ -703,11 +767,13 @@ SECONDARY_CONTACT_KEYWORDS = (
 CONTACT_ANCHOR_TEXT_KEYWORDS = (
     'contact', 'contact us', 'get in touch', 'support', 'customer care',
     'help center', 'контакти', 'зв\'язатися', 'про нас', 'about us', 'impressum',
+    'team', 'leadership', 'our team', 'management', 'команда', 'керівництво',
     'kontakt', 'über uns', 'ueber uns', 'mentions légales', 'contactez-nous',
     'à propos', 'contacto', 'quiénes somos', 'aviso legal', 'contatti',
     'chi siamo', 'over ons', 'skontaktuj się', 'o nas', 'kontakta oss', 'om oss'
 )
 
+# v24.3: Розширено Enterprise MarTech / Analytics / CDP сигнатури
 AD_AND_ANALYTICS_SIGNATURES = {
     'Meta Pixel': [
         'connect.facebook.net', 'fbevents.js', 'fbq(', 'facebook.com/tr',
@@ -726,7 +792,17 @@ AD_AND_ANALYTICS_SIGNATURES = {
     'Hotjar': ['static.hotjar.com', 'hjsettings'],
     'HubSpot': ['js.hs-scripts.com', 'hs-analytics', 'hbspt.forms'],
     'Intercom': ['widget.intercom.io', 'intercomsettings'],
-    'Klaviyo': ['static.klaviyo.com', 'klaviyo.push']
+    'Klaviyo': ['static.klaviyo.com', 'klaviyo.push'],
+    'Adobe Analytics': ['assets.adobedtm.com', 'omtrdc.net', 'appmeasurement.js', 'adobelaunch'],
+    'Segment': ['cdn.segment.com/analytics.js', 'cdn.segment.io/analytics.js', 'analytics.load('],
+    'Tealium': ['tags.tiqcdn.com', 'utag.js', 'utag_data'],
+    'Amplitude': ['cdn.amplitude.com', 'api2.amplitude.com', 'amplitude.getinstance'],
+    'Mixpanel': ['cdn.mxpnl.com', 'api-js.mixpanel.com', 'mixpanel.init('],
+    'Snowplow': ['sp.js', 'snowplowanalytics', 'window.snowplow'],
+    'Braze': ['js.appboycdn.com', 'sdk.iad-01.braze.com', 'braze.initialize'],
+    'Dynamic Yield': ['cdn.dynamicyield.com', 'cdn-eu.dynamicyield.com'],
+    'Optimizely': ['cdn.optimizely.com', 'optimizely.com/js/'],
+    'Salesforce Marketing Cloud': ['exacttarget.com', 'collect.igodigital.com', 'et_mc_'],
 }
 
 CMS_HTML_ONLY_SIGNATURES = {
@@ -901,10 +977,6 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
         return None
 
 
-# ==============================================================================
-# v24.1.2 Enterprise MarTech & Account Intelligence: Константні структури
-# ==============================================================================
-
 MULTI_PART_TLDS: set[str] = {
     "com.ua", "in.ua", "org.ua", "net.ua", "lviv.ua", "kyiv.ua", "kiev.ua",
     "dp.ua", "kharkiv.ua", "kharkov.ua", "odesa.ua", "odessa.ua", "pp.ua",
@@ -977,6 +1049,13 @@ CSP_STRICT_SIGNATURES: dict[str, str] = {
     "nr-data.net": "New Relic",
     "bugsnag.com": "Bugsnag",
     "segment.com": "Segment",
+    "segment.io": "Segment",
+    "adobedtm.com": "Adobe Analytics",
+    "omtrdc.net": "Adobe Analytics",
+    "tiqcdn.com": "Tealium",
+    "amplitude.com": "Amplitude",
+    "mixpanel.com": "Mixpanel",
+    "mxpnl.com": "Mixpanel",
     "braze.com": "Braze",
     "algolia.net": "Algolia",
     "algolianet.com": "Algolia",
@@ -1085,26 +1164,6 @@ ENTERPRISE_PIM_ERP_CMS_SIGNATURES: dict[str, tuple[str, ...]] = {
     "Salsify PIM": ("salsify.com",),
     "Oracle NetSuite": ("netsuite.com",),
     "Odoo ERP": (".odoo.com", "://odoo.com", "/web/static/src/"),
-}
-
-SAAS_PRICING_RANGE_USD: dict[str, tuple[int, int]] = {
-    "Shopify Plus": (2300, 4500),
-    "Salesforce": (1200, 3500),
-    "Dynamic Yield": (2000, 5000),
-    "Optimizely": (1500, 4000),
-    "HubSpot": (800, 2400),
-    "Braze": (1500, 4000),
-    "Algolia": (500, 1800),
-    "Datadog": (400, 1500),
-    "Personio": (350, 1200),
-    "Greenhouse": (500, 1500),
-    "Gorgias": (300, 900),
-    "Zendesk": (300, 1000),
-    "Klaviyo": (150, 700),
-    "VWO": (400, 1200),
-    "Loop Returns": (300, 800),
-    "Sendcloud": (150, 500),
-    "Server-Side GTM (sGTM)": (100, 400),
 }
 
 TOXIC_COMPLIANCE_LOCAL_PARTS: set[str] = {
