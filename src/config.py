@@ -243,7 +243,12 @@ UI_ACTION_WORDS_BLACKLIST = {
     'mehr', 'weiterlesen', 'kontakt', 'impressum', 'lire', 'suite', 'ver', 'más',
     'immer', 'schritt', 'voraus', 'überblick', 'ueberblick', 'themen', 'karriere',
     'premium', 'quality', 'best', 'top', 'original', 'official', 'exclusive', 'standard',
-    'luxury', 'high', 'super', 'ultra', 'smart', 'pro', 'plus', 'max', 'prime'
+    'luxury', 'high', 'super', 'ultra', 'smart', 'pro', 'plus', 'max', 'prime',
+    # v24.1.2: UI-фантоми демо-екранів та німецькі юридичні займенники (airslate, pipedrive, breuninger)
+    'message', 'direct', 'search', 'key', 'web', 'solar', 'content', 'interesting',
+    'voyage', 'maiden', 'demo', 'sample', 'trial', 'free', 'start', 'get', 'book',
+    'schedule', 'request', 'sofern', 'sie', 'ihre', 'ihr', 'mitglied', 'kunde',
+    'kundin', 'nutzer', 'verbraucher', 'stammkarte'
 }
 
 DEPARTMENT_PREFIX_BLACKLIST = {
@@ -482,7 +487,12 @@ STOP_NAME_WORDS = {
     'Premium', 'Quality', 'Best', 'Top', 'Original', 'Exclusive', 'Standard', 'Luxury',
     'Latin', 'America', 'Americas', 'North', 'South', 'Central', 'Eastern', 'Western',
     'Northern', 'Southern', 'Asia', 'Pacific', 'Middle', 'East', 'Africa', 'Global',
-    'National', 'Regional', 'Europe', 'European'
+    'National', 'Regional', 'Europe', 'European',
+    # v24.1.2: UI-фантоми демо-екранів та німецькі юридичні займенники
+    'Message', 'Direct', 'Search', 'Key', 'Web', 'Solar', 'Content', 'Interesting',
+    'Voyage', 'Maiden', 'Demo', 'Sample', 'Trial', 'Free', 'Start', 'Get', 'Book',
+    'Schedule', 'Request', 'Sofern', 'Sie', 'Ihre', 'Ihr', 'Mitglied', 'Kunde',
+    'Kundin', 'Nutzer', 'Verbraucher', 'Stammkarte'
 }
 
 UA_TO_LATIN = {
@@ -892,7 +902,7 @@ def compute_snapshot_age_days(checked_at_str: str | None) -> int | None:
 
 
 # ==============================================================================
-# v24.0 Enterprise MarTech & Account Intelligence: Константні структури
+# v24.1.2 Enterprise MarTech & Account Intelligence: Константні структури
 # ==============================================================================
 
 MULTI_PART_TLDS: set[str] = {
