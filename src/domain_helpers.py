@@ -367,9 +367,8 @@ def build_compliance_note(
     if dom_low.endswith(('.de', '.at')) or (country_hint or '').upper() in ('DE', 'AT'):
         return (
             '[Actor Retention Policy: 365d] DACH Compliance Notice: Under German §7 UWG and DSK guidance, '
-            'contact details published solely to satisfy statutory Impressum obligations do not constitute '
-            'consent for unsolicited cold email or cold telephone marketing. Verify prior opt-in or documented '
-            'business relationship before initiating outreach.'
+            'unsolicited cold email and cold telephone marketing are prohibited without prior opt-in consent, '
+            'and Impressum disclosures may not be used for cold sales. Use LinkedIn or documented warm intros only.'
         )
     if jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP'):
         return (
@@ -423,11 +422,11 @@ def derive_human_contact_tier(contact_quality_tier: str | None, company_category
 
 def derive_scan_failure_class(fail_status: str | None, err_msg: str = '') -> str | None:
     """
-    v24.3: Класифікує технічно невдалі сканування окремо від некваліфікованих лідів:
+    Класифікує технічно невдалі сканування окремо від некваліфікованих лідів:
       - `scan_failed_waf_block` (HTTP 403 / 429 / 404 / 503 / WAF / SSL block)
       - `scan_failed_timeout` (таймаут завантаження або бюджету виконання)
       - `scan_failed_dns_error` (NXDOMAIN / DNS / unreachable)
-    Для цих класів усі скорингові поля встановлюються в `None` (`null`), щоб не спотворювати середні метрики.
+    Для цих класів усі скорингові поля встановлюються в `None` (`null`), а статус — `SCAN_FAILED`.
     """
     st = (fail_status or '').lower().strip()
     err = (err_msg or '').lower()
@@ -471,8 +470,10 @@ def derive_sales_actionability_class(
         return 'unqualified'
     if 'linkedin / warm-intro only' in v:
         return 'linkedin_warm_intro_only'
-    if 'escalation-ready via ceo' in v:
+    if 'escalation-ready via ceo' in v or 'escalation-needed' in v:
         return 'escalation_via_ceo'
+    if 'research priority' in v:
+        return 'research_priority'
     if 'sales-ready' in v:
         return 'sales_ready'
     if 'partnership-ready' in v:
@@ -493,12 +494,15 @@ def domain_weight(item: tuple[str, str, list[str]]) -> int:
 
 def contact_link_priority(url: str) -> int:
     """
-    v24.3: Пріоритет №0 — сторінки команд та керівництва (/team, /leadership, /management, /people)
-    для максимізації виявлення операційних маркетологів (CMO / Head of Digital / Head of E-commerce).
+    v24.4: Пріоритет №0 — сторінки команд, керівництва та прес-центрів
+    (/team, /leadership, /management, /people, /press, /newsroom)
+    для максимізації виявлення операційних маркетологів (CMO / Head of Digital / E-commerce Director).
     """
     path = urlparse(url).path.lower()
     if any(k in path for k in ('team', 'leadership', 'management', 'executive', 'people', 'komanda', 'kerivnytstvo', 'equipe')):
         return 0
+    if any(k in path for k in ('press', 'newsroom')):
+        return 1
     if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return 1
     if any(k in path for k in PRIMARY_CONTACT_KEYWORDS):
@@ -723,8 +727,8 @@ def build_safe_cache_payload(result_record: dict, prior_cached: dict | None = No
 
 def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     """
-    v24.3: Повертає `sales_actionability_class = 'scan_failed_timeout'` та `None` (`null`)
-    для всіх числових скорингів, щоб таймаути не спотворювали статистику датасету.
+    v24.4: 156-колонкова заглушка для таймауту зі статусом `sales_readiness_status = 'SCAN_FAILED'`,
+    класом `scan_failed_timeout` та `None` (`null`) у всіх 8 числових оцінках.
     """
     aliases_str = '; '.join(aliases) if aliases else domain_key
     clean_url = f'https://{domain_key}/'
@@ -741,6 +745,10 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'cached_snapshot_source': 'none (run_timeout)',
         'cached_snapshot_age_days': None,
         'error_message': 'Domain processing exceeded run time budget',
+        'sales_readiness_status': 'SCAN_FAILED',
+        'account_potential_score': None,
+        'evidence_confidence_score': None,
+        'sales_readiness_score': None,
         'data_quality_score': None,
         'account_fit_score': None,
         'technical_opportunity_score': None,
@@ -762,7 +770,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'contact_quality_tier': 'Tier F (Timeout)',
         'contact_quality_tier_human': 'No Contact',
         'contact_enrichment_status': 'scan_failed_timeout',
-        'data_confidence_warning': 'Run time budget exceeded before domain completed (scores set to null).',
+        'data_confidence_warning': 'Run time budget exceeded before domain completed (all scores set to null).',
         'gdpr_eu_domain': stub_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP'),
         'gdpr_jurisdiction': stub_jur,
         'legal_basis_for_processing': None,
@@ -843,6 +851,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'all_ga4_ids': None,
         'all_ga4_ids_count': None,
         'detected_technologies': None,
+        'confirmed_martech_platforms': [],
         'detected_payment_gateways': [],
         'xhr_fetch_traffic_analyzed': False,
         'xhr_fetch_requests_inspected': 0,
@@ -852,6 +861,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'account_scale_basis': [],
         'martech_stack_tier': None,
         'martech_stack_tier_basis': [],
+        'buying_intent_signals': [],
         'estimated_markets_count': None,
         'detected_market_locales': [],
         'catalog_estimated_skus': None,
