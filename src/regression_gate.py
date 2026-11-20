@@ -51,13 +51,20 @@ from .qualifier import (
     classify_martech_stack_tier,
     compute_account_change_triggers_v23,
     compute_account_fit_score,
+    compute_account_potential_score,
     compute_actionable_priority_score,
     compute_data_quality_score,
+    compute_evidence_confidence_score,
     compute_sales_actionability_score,
+    compute_sales_readiness_score,
     compute_technical_opportunity_score,
     derive_contactability_level,
+    derive_sales_readiness_status,
     detect_ma_rebrand_and_insolvency_v23,
+    enforce_outreach_compliance_guardrail,
     evaluate_qualification_v180,
+    extract_buying_intent_signals,
+    is_cold_email_compliance_blocked,
     is_impressum_cold_email_blocked,
     resolve_prospect_timezone_and_locale_v23,
 )
@@ -172,8 +179,8 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 54 вбудовані юніт- та інтеграційні тести під час старту контейнера
-    (Startup Regression Gate v24.3 / Build 0.0.311 Commercial Subscription Release).
+    Виконує 62 вбудовані юніт- та інтеграційні тести під час старту контейнера
+    (Startup Regression Gate v24.4 / Build 0.0.312 Evidence-Driven Commercial Release).
     """
     # 1. Domain preparation & canonicalization
     prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
@@ -384,26 +391,26 @@ def run_startup_regression_gate(
 
     # 22. Qualification, 3-Axis Scoring & Contactability
     verdict, _, tech_sig_str, c_tier, _, _, _, _, nba_with_li = evaluate_qualification_v180(
-        'E-commerce / Retail Brand', t_info, 'marketing@shop.de', 'marketing_or_exec_role',
-        '+49 30 123456', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
+        'E-commerce / Retail Brand', t_info, 'marketing@shop.com', 'marketing_or_exec_role',
+        '+1 212 555 0199', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
         'https://www.linkedin.com/in/max-mustermann', False, 'about_page',
         'https://www.linkedin.com/company/shop', False, 'rendered'
     )
     assert 'Sales-Ready' in verdict
-    score = compute_data_quality_score(c_tier, 5, 'Max Mustermann', 'https://www.linkedin.com/in/max-mustermann', '+49 30 123456', 'full')
+    score = compute_data_quality_score(c_tier, 5, 'Max Mustermann', 'https://www.linkedin.com/in/max-mustermann', '+1 212 555 0199', 'full')
     assert score >= 75
 
     assert derive_contactability_level('matthias@bergfreunde.de', 'personal_or_named_inbox', 'Matthias Gebhard', None, None, 'M365_AD_VERIFIED') == 'direct_dm_verified'
     assert derive_contactability_level('partners@flaconi.de', 'b2b_partnerships', 'Bastian Siebers', None, None, 'OBSERVED_ON_SITE') == 'gatekeeper_only'
 
-    # Перевірка часткового CSP-скану (flaconi.de)
+    # Перевірка часткового CSP-скану з CEO (v24.4: CEO-only -> escalation_via_ceo)
     v_csp, _, sig_csp, _, _, _, _, _, _ = evaluate_qualification_v180(
         'E-commerce / Retail Brand', t_csp, 'partners@flaconi.de', 'b2b_partnerships',
         None, 'Bastian Siebers', 'Managing Director / CEO (Geschäftsführer)',
         None, False, 'about_page', None, False, 'rendered'
     )
     assert 'Unverified Stack (CSP Allowlist Only' in sig_csp
-    assert derive_sales_actionability_class(v_csp, 'E-commerce / Retail Brand') == 'partnership'
+    assert derive_sales_actionability_class(v_csp, 'E-commerce / Retail Brand') == 'escalation_via_ceo'
 
     # Перевірка EU GDPR для .com із цінами в EUR та DSK Impressum sensitivity
     assert derive_gdpr_jurisdiction('global-brand.com', None, '', '<div>Subtotal: 129,00 € incl. VAT</div>') == 'EU_EEA_GDPR'
@@ -566,9 +573,12 @@ def run_startup_regression_gate(
         gdpr_jurisdiction='EU_EEA_GDPR',
         data_source_sensitivity='impressum_statutory_disclosure_restricted',
         has_confirmed_legitimate_interest=False,
+        canonical_domain='shop.de',
+        country_hint='DE',
     )
     assert 'LinkedIn / Warm-Intro Only' in v_imp
-    assert 'COMPLIANCE BLOCK' in nba_imp and 'Do NOT send unsolicited cold email' in nba_imp
+    assert 'COMPLIANCE BLOCK' in nba_imp and 'Unsolicited cold email is programmatically blocked' in nba_imp
+    assert 'LinkedIn only' in nba_imp
     assert derive_sales_actionability_class(v_imp, 'E-commerce / Retail Brand') == 'linkedin_warm_intro_only'
 
     af_top = compute_account_fit_score('E-commerce / Retail Brand', 'Mid-Market Scale', 'Mid-Market', 4, 2500, True, 6, True)
@@ -597,10 +607,7 @@ def run_startup_regression_gate(
     )
     assert 'server_side_tracking_not_detected_in_client' in hook_sgtm_soft
 
-    # ==========================================================================
     # 30. Build 0.0.311 (v24.3 Commercial Subscription Release Checks)
-    # ==========================================================================
-    # 30a. HTML team card extraction + /team /leadership link priority = 0
     cards_html = """
     <html><body><section>
       <div class="card"><h3>Thomas Weber</h3><p>CEO</p></div>
@@ -614,13 +621,11 @@ def run_startup_regression_gate(
     assert contact_link_priority('https://brand.de/team') == 0
     assert contact_link_priority('https://brand.de/impressum') == 1
 
-    # 30b. Email hypotheses driven by best_email_type (info@ -> first@ / first.last@)
     hyps_info = generate_dm_email_pattern_candidates(
         'Sophie Lindner', 'brand.de', ['info@brand.de'], best_email_type='general_office_inbox'
     )
     assert hyps_info[0] == 'sophie@brand.de' and 'sophie.lindner@brand.de' in hyps_info
 
-    # 30c. Strict separation of account_scale_tier vs martech_stack_tier (Typeform & Breuninger)
     tf_stack = classify_martech_stack_tier({'HubSpot', 'Google Analytics (GA4)', 'Google Tag Manager'})
     assert tf_stack['martech_stack_tier'] == 'Mid-Market'
 
@@ -632,7 +637,6 @@ def run_startup_regression_gate(
     ent_adobe = classify_martech_stack_tier({'Adobe Analytics', 'Google Analytics (GA4)'})
     assert ent_adobe['martech_stack_tier'] == 'Enterprise'
 
-    # 30d. Scan-failed classes (WAF/Timeout/DNS) + null numeric scores instead of 0
     assert derive_scan_failure_class('blocked', 'HTTP 403') == 'scan_failed_waf_block'
     assert derive_scan_failure_class('http_429', 'HTTP 429') == 'scan_failed_waf_block'
     assert derive_scan_failure_class('http_404', 'HTTP 404') == 'scan_failed_waf_block'
@@ -648,7 +652,6 @@ def run_startup_regression_gate(
     assert t_stub['sales_actionability_score'] is None
     assert t_stub['actionable_priority_score'] is None
 
-    # 30e. Honest Data Quality Score (penalties for PW/TLS timeout + server-verified email gate)
     assert is_server_verified_email_confidence('GRAVATAR_OR_PGP_MATCH', 'domain_mail_configured') is False
     assert is_server_verified_email_confidence('M365_AD_VERIFIED', 'domain_mail_configured; mailbox_verified_m365_active_directory') is True
     assert is_server_verified_email_confidence('SMTP_API_VERIFIED', 'domain_mail_configured; mailbox_verified_deliverable') is True
@@ -674,7 +677,6 @@ def run_startup_regression_gate(
     )
     assert dq_server_max == 100
 
-    # 30f. XHR/Fetch/Ping runtime traffic analysis for server-side tracking & Technical Opportunity
     assert _should_capture_pw_xhr('https://x99.brand.de/collect?v=2&tid=G-12345', 'fetch', 'brand.de') == (True, True)
     assert _should_capture_pw_xhr('https://www.brand.de/sgtm/collect', 'xhr', 'brand.de') == (True, True)
     assert _should_capture_pw_xhr('https://cdn.brand.de/data.json', 'fetch', 'brand.de') == (False, False)
@@ -704,5 +706,105 @@ def run_startup_regression_gate(
     )
     assert to_xhr > to_static
 
+    # ==========================================================================
+    # 31. Build 0.0.312 (v24.4 Evidence-Driven Commercial Release Checks)
+    # ==========================================================================
+    # 31a. Cloudflare Zaraz server-side tracking detection & confirmed_martech_platforms
+    zaraz_html = """
+    <html><head><script src="/cdn-cgi/zaraz/i.js"></script>
+    <!-- http_headers_json: {"content-security-policy": "script-src https://cdn.dynamicyield.com"} -->
+    <!-- pw_xhr_req: fetch https://www.shop.de/cdn-cgi/zaraz/t -->
+    <!-- pw_runtime_summary: {"xhr_fetch_analyzed": true, "total_xhr_fetch_count": 4} -->
+    </head><body></body></html>
+    """
+    assert _should_capture_pw_request('https://www.shop.de/cdn-cgi/zaraz/i.js', 'shop.de') is True
+    assert _should_capture_pw_xhr('https://www.shop.de/cdn-cgi/zaraz/t', 'fetch', 'shop.de') == (True, True)
+    t_zaraz = detect_tech_with_evidence(zaraz_html, '', [], 'https://www.shop.de/')
+    assert t_zaraz['has_sgtm'] is True
+    assert t_zaraz['server_side_tracking_assessment'] == 'runtime_verified_sgtm'
+    assert 'Server-Side GTM (sGTM)' in (t_zaraz.get('confirmed_martech_platforms') or [])
+    assert 'Dynamic Yield' not in (t_zaraz.get('confirmed_martech_platforms') or [])
+
+    # 31b. JSON-LD @type: Person & Press Quote operational marketing buyer extraction
+    jsonld_person_html = """
+    <html><head><script type="application/ld+json">
+    {"@context": "https://schema.org", "@type": "Person", "name": "Marcus Vance",
+     "jobTitle": "VP of Marketing", "sameAs": ["https://www.linkedin.com/in/marcus-vance-mkt"]}
+    </script></head><body><p>John Miller — Founder.</p></body></html>
+    """
+    jl_name, jl_role, jl_li, _, _, _, _, _ = extract_decision_maker_deep([
+        ('https://acme.com/about', jsonld_person_html, 'John Miller — Founder.')
+    ])
+    assert jl_name == 'Marcus Vance' and jl_role == 'VP of Marketing'
+    assert jl_li == 'https://www.linkedin.com/in/marcus-vance-mkt'
+
+    press_text = '“We doubled retention this quarter,” said Clara Hoffman, VP of Marketing at Acme.'
+    pq_name, pq_role, _, _, _, _, _, _ = extract_decision_maker_deep([
+        ('https://acme.com/press', f'<html><body><p>{press_text}</p></body></html>', press_text)
+    ])
+    assert pq_name == 'Clara Hoffman' and pq_role == 'VP of Marketing'
+
+    # 31c. Zapier-style decoupled scoring: high potential + low evidence -> low readiness & RESEARCH_PRIORITY
+    pot_zap = compute_account_potential_score('SaaS / Marketplace / Tech Platform', 'Enterprise Scale', 'Mid-Market', 8, None, True, 12, True, 2)
+    ec_zap = compute_evidence_confidence_score('partial_blocked', 1, 0, False, 'launched_timeout', 'tls_timeout', 'NONE', None)
+    sr_zap = compute_sales_readiness_score('SaaS / Marketplace / Tech Platform', 'no_dm_found', 'unreached', ec_zap, 18, 'NONE', False, True, 0)
+    st_zap = derive_sales_readiness_status('SaaS / Marketplace / Tech Platform', pot_zap, ec_zap, sr_zap, 'no_dm_found', False)
+    prio_zap = compute_actionable_priority_score(pot_zap, ec_zap, sr_zap, 'SaaS / Marketplace / Tech Platform')
+    assert pot_zap >= 70
+    assert ec_zap <= 20
+    assert sr_zap <= 35
+    assert prio_zap <= 38
+    assert st_zap == 'RESEARCH_PRIORITY'
+
+    # 31d. Strict CEO-only gate: NEVER SALES_READY -> ESCALATION_NEEDED
+    ec_high = compute_evidence_confidence_score('full', 5, 5, True, 'rendered', 'valid_trusted_ca', 'M365_AD_VERIFIED', 'issue_confirmed')
+    sr_ceo = compute_sales_readiness_score('E-commerce / Retail Brand', 'escalation_needed_via_ceo', 'direct_dm_verified', ec_high, 90, 'M365_AD_VERIFIED', False, True, 2)
+    st_ceo = derive_sales_readiness_status('E-commerce / Retail Brand', 85, ec_high, sr_ceo, 'escalation_needed_via_ceo', False)
+    assert sr_ceo <= 64 and st_ceo == 'ESCALATION_NEEDED'
+
+    # 31e. Direct Marketing Buyer + high evidence + compliant -> SALES_READY
+    sr_cmo = compute_sales_readiness_score('E-commerce / Retail Brand', 'direct_marketing_buyer', 'direct_dm_verified', ec_high, 90, 'M365_AD_VERIFIED', False, True, 2)
+    st_cmo = derive_sales_readiness_status('E-commerce / Retail Brand', 85, ec_high, sr_cmo, 'direct_marketing_buyer', False)
+    assert sr_cmo >= 85 and st_cmo == 'SALES_READY'
+
+    # 31f. Programmatic DE/AT §7 UWG compliance guardrail (even on non-Impressum page)
+    de_blk, de_code = is_cold_email_compliance_blocked('EU_EEA_GDPR', 'public_corporate_website', 'shop.de', 'DE', False)
+    assert de_blk is True and de_code == 'de_at_uwg7_cold_email_blocked'
+    guarded_nba = enforce_outreach_compliance_guardrail(
+        'Send personalized email to anna@shop.de', de_code, 'Anna Weber', 'Chief Marketing Officer (CMO)', 'direct_marketing_buyer', True
+    )
+    assert 'COMPLIANCE BLOCK' in guarded_nba and 'LinkedIn only' in guarded_nba and 'Send personalized email' not in guarded_nba
+
+    _, _, _, _, _, _, _, _, nba_de_cmo = evaluate_qualification_v180(
+        'E-commerce / Retail Brand', t_info, 'anna.weber@shop.de', 'personal_or_named_inbox',
+        '+49 30 123456', 'Anna Weber', 'Chief Marketing Officer (CMO)',
+        None, False, 'team_or_leadership_page', 'https://www.linkedin.com/company/shop', False, 'rendered',
+        gdpr_jurisdiction='EU_EEA_GDPR', data_source_sensitivity='public_corporate_website',
+        canonical_domain='shop.de', country_hint='DE',
+    )
+    assert 'COMPLIANCE BLOCK' in nba_de_cmo and 'LinkedIn only' in nba_de_cmo and 'Send personalized MarTech audit email' not in nba_de_cmo
+
+    # 31g. Buying Intent Signals aggregation
+    bi_sigs = extract_buying_intent_signals(
+        hiring_marketing_or_data_roles=True,
+        open_positions_total=14,
+        ads_active_last_30d=True,
+        active_ad_formats=['Search', 'Shopping'],
+        recent_change_triggers=['NEW_DECISION_MAKER: Anna Weber (replaced John Doe)'],
+        primary_sales_gap='DUPLICATE_GA4_TRACKING',
+        sales_gap_confidence='issue_confirmed',
+    )
+    assert 'HIRING_MARKETING_OR_DATA_ROLES' in bi_sigs
+    assert any(s.startswith('ACTIVE_HIRING') for s in bi_sigs)
+    assert any(s.startswith('ACTIVE_GOOGLE_ADS_30D') for s in bi_sigs)
+    assert 'CONFIRMED_TECH_GAP: DUPLICATE_GA4_TRACKING' in bi_sigs
+    assert any('NEW_DECISION_MAKER' in s for s in bi_sigs)
+
+    # 31h. Timeout / Scan-Failed parity with all 8 numeric scores as None & status SCAN_FAILED
+    assert t_stub['sales_readiness_status'] == 'SCAN_FAILED'
+    assert t_stub['account_potential_score'] is None
+    assert t_stub['evidence_confidence_score'] is None
+    assert t_stub['sales_readiness_score'] is None
+
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 54/54 unit & integration tests green (v24.3 / Build 0.0.311 Commercial Release).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 62/62 unit & integration tests green (v24.4 / Build 0.0.312 Evidence-Driven Commercial Release).')
