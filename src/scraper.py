@@ -130,6 +130,7 @@ PW_TRACKED_NET_KEYWORDS = (
     '/collect?',
     '/gtm.js',
     '/gtag/js',
+    '/cdn-cgi/zaraz/',
     'googleadservices.com',
     'doubleclick.net/pagead',
     'connect.facebook.net',
@@ -169,7 +170,7 @@ PW_FIRST_PARTY_SGTM_SUBS: Set[str] = {
 
 PW_NON_STANDARD_COLLECT_PATH_RE = re.compile(
     r'(?:/g/collect|/j/collect|/r/collect|/collect(?:/|$|\?)|/sgtm/|/sst/|/gtm\.js|/gtag/js|'
-    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi)',
+    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi|/cdn-cgi/zaraz/)',
     re.IGNORECASE,
 )
 
@@ -183,7 +184,7 @@ EXTRA_LEADERSHIP_PATH_KEYWORDS = (
     'team', 'our-team', 'leadership', 'management', 'executive', 'executives',
     'founders', 'people', 'who-we-are', 'company', 'career', 'careers', 'jobs',
     'karriere', 'vorstand', 'geschaeftsfuehrung', 'unsere-fuehrung',
-    'komanda', 'kerivnytstvo', 'equipe', 'equipo', 'zespol',
+    'komanda', 'kerivnytstvo', 'equipe', 'equipo', 'zespol', 'press', 'newsroom',
 )
 
 REGION_TO_PW_LOCALE: Dict[str, str] = {
@@ -985,7 +986,7 @@ async def fetch_waf_bypass_or_wayback_legal(
 
 
 # ==============================================================================
-# Playwright Shared Browser Pool & v24.3 XHR/Fetch + sGTM Traffic Capture Engine
+# Playwright Shared Browser Pool & v24.4 XHR/Fetch + Zaraz + sGTM Capture Engine
 # ==============================================================================
 
 def is_playwright_available() -> bool:
@@ -1108,10 +1109,11 @@ def _should_capture_pw_xhr(
     target_reg_dom: str,
 ) -> Tuple[bool, bool]:
     """
-    v24.3 XHR/Fetch/Ping Traffic Filter:
+    v24.4 XHR/Fetch/Ping Traffic Filter:
     Повертає кортеж (should_capture, is_first_party_collect_hit).
-    Перехоплює нестандартні першосторонні піддомени (напр. `x99.brand.de/collect`,
-    `fp-edge.brand.de/ev?tid=G-...`) та проксі-шляхи (`/sgtm/collect`, `/capi/`).
+    Перехоплює нестандартні першосторонні піддомени (`x99.brand.de/collect`,
+    `fp-edge.brand.de/ev?tid=G-...`), Cloudflare Zaraz (`/cdn-cgi/zaraz/`)
+    та першосторонні проксі-шляхи (`/sgtm/collect`, `/capi/`).
     """
     rt = (resource_type or '').lower().strip()
     if rt not in ('xhr', 'fetch', 'ping', 'beacon'):
@@ -1146,7 +1148,7 @@ async def fetch_html_playwright_fallback(
     """
     Рендерить сторінку у Playwright із кліком по CMP-банеру згоди, перехопленням
     мережевих запитів трекінгу (`pw_net_req`) та XHR/Fetch/Ping трафіку (`pw_xhr_req`,
-    `pw_runtime_summary`), а також резервним фолбеком проксі при `start_residential=True`.
+    `pw_runtime_summary`), включно з Cloudflare Zaraz (`/cdn-cgi/zaraz/`).
     Повертає: (html, final_url, status_str, incomplete_flag, attempts_made).
     """
     if not _PLAYWRIGHT_AVAILABLE:
