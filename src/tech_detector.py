@@ -309,8 +309,9 @@ def detect_agency_credits_from_html_and_gtm(
     brand_root: str = '',
 ) -> Optional[str]:
     """
-    v24.1 Competitive Agency Intelligence:
+    v24.1.1 Competitive Agency Intelligence:
     Виявляє веб-студію, розробника або performance-агенцію у футері сайту чи GTM-контейнері.
+    Використовує лише точні маркери агенцій (без загального підрядка 'dept', який збігається з department).
     """
     b_low = (brand_root or '').lower().strip()
     if html:
@@ -335,11 +336,14 @@ def detect_agency_credits_from_html_and_gtm(
             ('promodo', 'Promodo Agency'),
             ('inweb', 'Inweb Agency'),
             ('deptagency', 'DEPT Agency'),
+            ('by dept', 'DEPT Agency'),
+            ('powered by dept', 'DEPT Agency'),
+            ('created by dept', 'DEPT Agency'),
+            ('dept agency', 'DEPT Agency'),
             ('publicis', 'Publicis Media'),
             ('groupm', 'GroupM'),
             ('dentsu', 'Dentsu'),
             ('jellyfish', 'Jellyfish'),
-            ('dept', 'DEPT'),
         )
         for sig, label in known_gtm_agencies:
             if sig in gtm_low and (not b_low or sig != b_low):
@@ -389,7 +393,7 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.1 Enterprise MarTech & Account Intelligence:
+    v24.1.1 Enterprise MarTech & Account Intelligence:
     Розділяє джерела сигналів на 3 рівні підтвердження:
       - `runtime_verified` (мережевий запит Playwright `pw_net_req` або першосторонні кукі `FPID`/`_ga`/`_fbp`);
       - `configured_in_code` (HTML-код сторінки або внутрішній код розпакованого `gtm.js`);
