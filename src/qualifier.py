@@ -99,7 +99,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v24.1.1 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
+# v24.1.2 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -326,10 +326,11 @@ def resolve_prospect_timezone_and_locale_v23(
     html_lang_attr: str = "",
     page_title: str = "",
     gdpr_jurisdiction: str = "",
+    is_eu_gdpr: bool = False,
 ) -> Dict[str, str]:
     """
-    Виправлено (v24.1): Прив'язує дефолтну таймзону до юрисдикції (UK_GDPR -> Europe/London,
-    EU_EEA_GDPR -> Europe/Berlin, UA_PDP -> Europe/Kyiv), якщо TLD є загальним (.com/.eu/.net).
+    Виправлено (v24.1.2): Пріоритетно використовує вже обчислену юрисдикцію `gdpr_jurisdiction`
+    (або прапорець `is_eu_gdpr`) перед дефолтом США, усуваючи конфлікт на .com доменах (preply.com).
     """
     clean_dom = domain.lower().strip().rstrip(".")
     parts = clean_dom.split(".")
@@ -371,7 +372,7 @@ def resolve_prospect_timezone_and_locale_v23(
             tz, default_lang = ("Europe/Kyiv", "uk")
         elif jur_up == "CH_FADP":
             tz, default_lang = ("Europe/Zurich", "de")
-        elif jur_up == "EU_EEA_GDPR":
+        elif jur_up == "EU_EEA_GDPR" or is_eu_gdpr:
             tz, default_lang = ("Europe/Berlin", "en")
         elif cc_low == "us":
             tz, default_lang = ("America/New_York", "en")
@@ -454,7 +455,7 @@ def compute_account_change_triggers_v23(
 
 
 # ==============================================================================
-# v24.1.1 Decoupled Qualification Axes + Composite Actionable Priority Score
+# v24.1.2 Decoupled Qualification Axes + Composite Actionable Priority Score
 # ==============================================================================
 
 def compute_account_opportunity_score(
@@ -551,7 +552,7 @@ def compute_actionable_priority_score(
     sales_gap_confidence: str | None = None,
 ) -> int:
     """
-    Композитний індекс v24.1.1 (0–100):
+    Композитний індекс v24.1.2 (0–100):
     Поєднує цінність технічної проблеми, підтвердженість болю, повноту даних і реальну доступність контакту,
     щоб закриті домени без контактів (unreached) не перекривали готові до роботи ліди.
     """
@@ -608,7 +609,7 @@ def classify_company_category(
         'marketingbureau', 'internetbureau', 'online marketing bureau', 'mediabureau',
         'agencja marketingowa', 'agencja interaktywna', 'agencja seo', 'agencja reklamowa',
         'agência digital', 'agência de marketing', 'webbyrå', 'reklambyrå', 'kommunikationsbyrå', 'mediebyrå',
-        'promodo', 'netpeak'
+        'promodo', 'netpeak', 'inweb', 'newage'
     )
     if any(k in text for k in agency_keywords):
         return 'B2B Agency / Marketing Media', 'high'
@@ -653,6 +654,27 @@ def classify_company_category(
     ):
         return 'E-commerce / Retail Brand', 'high'
 
+    # v24.1.2: Пріоритет SaaS-маркерів ВИЩЕ за евристику spa_ecom_markers (фікс pipedrive.com)
+    saas_keywords = (
+        'saas', 'cloud platform', 'crm', 'sales crm', 'pipeline management', 'sales pipeline',
+        'api', 'b2b software', 'automation platform', 'document workflow', 'form builder',
+        'hr software', 'helpdesk', 'live chat', 'customer support platform',
+        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app',
+        'call tracking', 'колтрекінг', 'business phone', 'virtual pbx', 'telephony',
+        'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
+        'email service', 'automation service', 'chatbot', 'cloud-lösung', 'softwarelösung',
+        'logiciel saas', 'plateforme cloud', 'software de gestión', 'piattaforma cloud',
+        'oprogramowanie dla firm', 'system crm', 'ringostat', 'sendpulse', 'macpaw', 'readdle', 'grammarly',
+        'seo', 'serp', 'keyword', 'keywords', 'backlink', 'backlinks', 'site audit', 'rank tracker',
+        'website builder', 'конструктор сайтів', 'створення сайту', 'ai website builder',
+        'customer communication', 'customer data platform', 'cdp',
+        'omnichannel', 'no-code', 'low-code', 'workflow automation',
+        'serpstat', 'weblium', 'esputnik', 'creatio', 'helpcrunch',
+        'pipedrive', 'typeform', 'gorgias', 'personio', 'airslate', 'preply'
+    )
+    if any(k in text for k in saas_keywords):
+        return 'SaaS / Marketplace / Tech Platform', 'high'
+
     spa_ecom_markers = (
         'cdn.shopify.com',
         'myshopify.com',
@@ -670,23 +692,6 @@ def classify_company_category(
     spa_hits = sum(1 for m in spa_ecom_markers if m in html_low or m in text)
     if spa_hits >= 2:
         return 'E-commerce / Retail Brand', 'medium'
-
-    saas_keywords = (
-        'saas', 'cloud platform', 'crm', 'api', 'b2b software', 'automation platform',
-        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app',
-        'call tracking', 'колтрекінг', 'business phone', 'virtual pbx', 'telephony',
-        'end-to-end analytics', 'наскрізна аналітика', 'marketing performance platform',
-        'email service', 'automation service', 'chatbot', 'cloud-lösung', 'softwarelösung',
-        'logiciel saas', 'plateforme cloud', 'software de gestión', 'piattaforma cloud',
-        'oprogramowanie dla firm', 'system crm', 'ringostat', 'sendpulse', 'macpaw', 'readdle', 'grammarly',
-        'seo', 'serp', 'keyword', 'keywords', 'backlink', 'backlinks', 'site audit', 'rank tracker',
-        'website builder', 'конструктор сайтів', 'створення сайту', 'ai website builder',
-        'helpdesk', 'live chat', 'customer communication', 'customer data platform', 'cdp',
-        'omnichannel', 'no-code', 'low-code', 'workflow automation',
-        'serpstat', 'weblium', 'esputnik', 'creatio', 'helpcrunch'
-    )
-    if any(k in text for k in saas_keywords):
-        return 'SaaS / Marketplace / Tech Platform', 'high'
 
     has_commercial_stack = (
         'AW-' in html_sample
@@ -850,7 +855,7 @@ def build_sales_hook(
     active_ad_formats: list[str] | None = None,
 ) -> str:
     """
-    v24.1.1 Hyper-Specific Account Hook Generator:
+    v24.1.2 Hyper-Specific Account Hook Generator:
     1. На великих ритейлерах не підставляє мільярдерів-засновників холдингів (Ruslan Shostak, Галина Герега)
        як адресатів технічного листа — переадресовує на Head of Marketing / Digital Lead.
     2. Вшиває конкретні артефакти акаунта (кількість регіональних GA4 ID, ID контейнера GTM,
@@ -1368,7 +1373,6 @@ def evaluate_qualification_v180(
     )
     pred_email_clause = f'; test predicted DM email {predicted_dm_email} via verifier' if predicted_dm_email else ''
 
-    # Виправлено (v24.1.1): Згадуємо company_linkedin_people_url лише тоді, коли на сайті реально знайдено LinkedIn компанії
     has_company_li_people = bool(linkedin_url and 'linkedin.com/company/' in linkedin_url.lower())
     li_nav_hint = (
         'company_linkedin_people_url or decision_maker_search_query'
@@ -1617,7 +1621,13 @@ def build_manual_seed_record(
     c_hint = detect_country_hint(canonical_domain, '', '', primary_phone, '')
     jur_str = derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, '')
     tz_info = resolve_prospect_timezone_and_locale_v23(
-        canonical_domain, primary_phone, c_hint, '', page_title=seed.get('page_title') or '', gdpr_jurisdiction=jur_str
+        canonical_domain,
+        primary_phone,
+        c_hint,
+        '',
+        page_title=seed.get('page_title') or '',
+        gdpr_jurisdiction=jur_str,
+        is_eu_gdpr=is_eu_gdpr,
     )
 
     company_li_people_url = (
@@ -1661,12 +1671,14 @@ def build_manual_seed_record(
         ),
         'gdpr_eu_domain': is_eu_gdpr,
         'gdpr_jurisdiction': jur_str,
-        'legal_basis_for_processing': derive_legal_basis_for_processing(canonical_domain, c_hint, bool(best_email or dm_name or primary_phone)),
+        'legal_basis_for_processing': derive_legal_basis_for_processing(
+            canonical_domain, c_hint, bool(best_email or dm_name or primary_phone), gdpr_jurisdiction=jur_str
+        ),
         'data_source_sensitivity': derive_data_source_sensitivity(dm_src_type, seed.get('email_source_type', 'contact_page'), jur_str),
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, seed.get('decision_maker_linkedin_url')),
-        'compliance_note': build_compliance_note(canonical_domain, c_hint),
+        'compliance_note': build_compliance_note(canonical_domain, c_hint, gdpr_jurisdiction=jur_str),
         'playwright_available': playwright_available,
         'playwright_used': False,
         'playwright_status': 'not_attempted_manual_seed',
