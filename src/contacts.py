@@ -90,7 +90,6 @@ PATRONYMIC_SUFFIX_RE = re.compile(
     r"^(?:[А-ЯІЇЄҐA-Z][а-яіїєґa-z']+)(?:ович|івна|ївна|йович|ич|овна|евна|ична)$"
 )
 
-# v24.1.2: Суфікси українських/слов'янських прізвищ та словник поширених імен для автоінверсії ПІБ
 SLAVIC_SURNAME_SUFFIX_RE = re.compile(
     r"(?:ук|юк|чук|енко|єнко|ський|цький|зький|ська|цька|зька|ов|єв|ев|ова|єва|ева|ин|ін|ина|іна|ая|ич|ак|як)$",
     re.IGNORECASE
@@ -151,9 +150,33 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
     'спеціаліст', 'консультант', 'співробітник',
 }
 
+EXTRA_MARKETING_ROLE_MAP: Dict[str, str] = {
+    'vp marketing': 'VP of Marketing',
+    'vp of marketing': 'VP of Marketing',
+    'vice president of marketing': 'VP of Marketing',
+    'svp marketing': 'SVP of Marketing',
+    'head of performance': 'Performance Marketing Lead',
+    'head of performance marketing': 'Performance Marketing Lead',
+    'director of performance marketing': 'Performance Marketing Lead',
+    'head of digital marketing': 'Head of Digital',
+    'digital marketing director': 'Head of Digital',
+    'digital director': 'Head of Digital',
+    'head of analytics': 'Head of Analytics / Data',
+    'analytics director': 'Head of Analytics / Data',
+    'head of cro': 'Head of CRO / Conversion',
+    'cro lead': 'Head of CRO / Conversion',
+    'head of acquisition': 'Head of Growth / Acquisition',
+    'director of ecommerce': 'E-commerce Director',
+    'director of e-commerce': 'E-commerce Director',
+    'vp ecommerce': 'E-commerce Director',
+    'vp of ecommerce': 'E-commerce Director',
+    'vp of e-commerce': 'E-commerce Director',
+    'head of crm': 'Head of CRM & Retention',
+}
+
 
 # ==============================================================================
-# v24.1.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
+# v24.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
 # ==============================================================================
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
@@ -302,7 +325,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/24.1 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.2 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -843,8 +866,13 @@ def normalize_executive_role(raw_role: str | None) -> str | None:
     low = clean.lower()
     if not low or low in NON_EXECUTIVE_ROLE_REJECT_SET:
         return None
+    if low in EXTRA_MARKETING_ROLE_MAP:
+        return EXTRA_MARKETING_ROLE_MAP[low]
     if low in ROLE_NORMALIZATION_MAP:
         return ROLE_NORMALIZATION_MAP[low]
+    for k, v in EXTRA_MARKETING_ROLE_MAP.items():
+        if re.search(rf'\b{re.escape(k)}\b', low):
+            return v
     for k, v in ROLE_NORMALIZATION_MAP.items():
         if re.search(rf'\b{re.escape(k)}\b', low):
             return v
@@ -1504,26 +1532,62 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
     return 'product_or_service_page'
 
 
+def is_marketing_or_digital_role(role_str: str | None) -> bool:
+    r_low = (role_str or '').lower()
+    return any(
+        k in r_low for k in (
+            'cmo', 'marketing', 'e-commerce', 'ecommerce', 'growth',
+            'digital', 'performance', 'acquisition', 'cro', 'analytics',
+            'conversion', 'crm', 'retention', 'маркетинг', 'marketingleiter',
+            'marknadschef', 'markedssjef', 'hoofd marketing',
+        )
+    )
+
+
+def classify_dm_buyer_fit(dm_name: str | None, dm_role: str | None) -> str:
+    """
+    v24.2 Operational Buyer Fit Status:
+      - `direct_marketing_buyer`: знайдено операційного покупця MarTech/аналітики (CMO, Head of Digital,
+        Marketing Director, Head of E-commerce, Head of Growth, Analytics/CRO Lead).
+      - `escalation_needed_via_ceo`: знайдено лише CEO / Founder / Managing Director / Owner —
+        потрібне перенаправлення (escalation) на керівника маркетингу чи digital.
+      - `no_dm_found`: жодної особи не ідентифіковано.
+    """
+    if not dm_name:
+        return 'no_dm_found'
+    if is_marketing_or_digital_role(dm_role):
+        return 'direct_marketing_buyer'
+    return 'escalation_needed_via_ceo'
+
+
 def _dm_role_priority_weight(role_str: str | None) -> int:
+    """
+    v24.2: Зміщує пріоритет із юридичних CEO/Founder на операційних покупців маркетингу,
+    digital, e-commerce та аналітики.
+    """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
         return -30
-    if any(k in r_low for k in ('cmo', 'chief marketing', 'head of marketing', 'marketing director', 'head of e-commerce', 'e-commerce director', 'head of growth', 'head of digital', 'performance')):
-        return 38
-    if 'marketing' in r_low or 'digital' in r_low:
-        return 32
+    if any(
+        k in r_low for k in (
+            'cmo', 'chief marketing', 'vp of marketing', 'vp marketing', 'svp of marketing',
+            'head of marketing', 'marketing director', 'head of e-commerce', 'e-commerce director',
+            'head of digital', 'head of growth', 'performance marketing', 'head of analytics',
+            'head of cro', 'head of crm',
+        )
+    ):
+        return 70
+    if is_marketing_or_digital_role(role_str):
+        return 58
+    if any(k in r_low for k in ('commercial director',)):
+        return 26
     if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
         return 20
     if any(k in r_low for k in ('founder', 'co-founder')):
-        return 15
-    if 'owner' in r_low:
         return 14
+    if 'owner' in r_low:
+        return 12
     return 10
-
-
-def is_marketing_or_digital_role(role_str: str | None) -> bool:
-    r_low = (role_str or '').lower()
-    return any(k in r_low for k in ('cmo', 'marketing', 'e-commerce', 'ecommerce', 'growth', 'digital', 'performance', 'acquisition', 'cro', 'маркетинг'))
 
 
 def build_decision_makers_json_from_summary(
@@ -1555,6 +1619,7 @@ def build_decision_makers_json_from_summary(
         items.append({
             'name': name,
             'role': norm_role,
+            'buyer_fit': classify_dm_buyer_fit(name, norm_role),
             'source_url': src_url or None,
             'source_type': classify_dm_source_type(src_url) if src_url else None,
             'linkedin_url': li_match,
@@ -1584,7 +1649,7 @@ def extract_decision_maker_deep(
             imp in u_path for imp in ('impressum', 'mentions-legales', 'aviso-legal')
         )
         src_type = classify_dm_source_type(page_url)
-        page_bonus = 15 if src_type in ('impressum_page', 'team_or_leadership_page', 'about_page') else 0
+        page_bonus = 18 if src_type in ('team_or_leadership_page', 'about_page') else (12 if src_type == 'impressum_page' else 0)
 
         if raw_html:
             soup = BeautifulSoup(raw_html, 'lxml')
@@ -1606,14 +1671,17 @@ def extract_decision_maker_deep(
                         for node in (graph if isinstance(graph, list) else [obj]):
                             if not isinstance(node, dict):
                                 continue
-                            for key_role in ('founder', 'founders'):
+                            for key_role in ('employee', 'member', 'director', 'founder', 'founders'):
                                 val = node.get(key_role)
                                 p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
                                 for person in p_list:
                                     if not isinstance(person, dict):
                                         continue
                                     p_name = strip_role_tokens_from_name(str(person.get('name', '')))
-                                    p_job = str(person.get('jobTitle') or ('Co-Founder' if key_role == 'founders' else 'Founder'))
+                                    raw_job = str(person.get('jobTitle') or '')
+                                    if key_role in ('employee', 'member', 'director') and not is_marketing_or_digital_role(raw_job):
+                                        continue
+                                    p_job = raw_job or ('Co-Founder' if key_role == 'founders' else 'Founder')
                                     norm_r = normalize_executive_role(p_job)
                                     if is_valid_person_name(p_name, brand_root) and norm_r:
                                         sc = _dm_role_priority_weight(norm_r) + page_bonus + 10
@@ -1639,7 +1707,7 @@ def extract_decision_maker_deep(
             else:
                 role_label = 'Managing Director / CEO (Geschäftsführer)'
 
-            base_sc = _dm_role_priority_weight(role_label) + page_bonus + 12
+            base_sc = _dm_role_priority_weight(role_label) + page_bonus + 8
 
             raw_first = m.group(1)
             first_cand = strip_role_tokens_from_name(raw_first)
@@ -1722,12 +1790,18 @@ def extract_decision_maker_deep(
         for li_u in personal_linkedin_urls:
             if verify_person_linkedin_match(c_info['name'], li_u):
                 c_info['li_url'] = li_u
-                c_info['score'] += 35
+                c_info['score'] += 25
                 break
 
+    # v24.2: Операційні ролі маркетингу/digital/e-commerce завжди перемагають CEO/Founder
     sorted_cands = sorted(
         candidates.values(),
-        key=lambda item: (-1 if item['li_url'] else 0, -item['score'], item['name'])
+        key=lambda item: (
+            -1 if is_marketing_or_digital_role(item['role']) else 0,
+            -1 if item['li_url'] else 0,
+            -item['score'],
+            item['name'],
+        ),
     )
 
     best = sorted_cands[0]
@@ -1765,7 +1839,7 @@ async def fetch_dm_via_serp_fallback(
                 'X-API-KEY': api_key,
                 'Content-Type': 'application/json',
             },
-            json={'q': search_query, 'num': 5},
+            json={'q': search_query, 'num': 6},
             timeout=5.0,
         )
         if resp.status_code != 200:
@@ -1774,6 +1848,7 @@ async def fetch_dm_via_serp_fallback(
         organic = data.get('organic') or []
         role_re = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.I | re.U)
 
+        valid_matches: list[tuple[int, str, str, str, str]] = []
         for item in organic:
             link = str(item.get('link') or '').strip()
             title = str(item.get('title') or '').strip()
@@ -1801,7 +1876,13 @@ async def fetch_dm_via_serp_fallback(
             raw_role = r_match.group(1) if r_match else (segments[1] if len(segments) > 1 else 'Marketing / Executive Lead')
             norm_role = normalize_executive_role(raw_role) or 'Marketing / Executive Lead'
             dms_str = f'{cand_name} ({norm_role}) [{clean_li}]'
-            return cand_name, norm_role, clean_li, dms_str
+            prio = _dm_role_priority_weight(norm_role)
+            valid_matches.append((prio, cand_name, norm_role, clean_li, dms_str))
+
+        if valid_matches:
+            valid_matches.sort(key=lambda x: -x[0])
+            _, best_name, best_role, best_li, best_str = valid_matches[0]
+            return best_name, best_role, best_li, best_str
     except Exception:
         pass
 
