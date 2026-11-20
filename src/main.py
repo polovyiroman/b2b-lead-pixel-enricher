@@ -219,7 +219,7 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v24.1 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
+# v24.1.1 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -325,7 +325,9 @@ def _build_company_linkedin_people_url(linkedin_url: str | None) -> str | None:
 
 def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: str = 'US') -> dict:
     """
-    Гарантує 100% паритет усіх 143 ключів схеми v24.1 на кешованих, seed та резервних записах.
+    Гарантує 100% паритет усіх 143 ключів схеми v24.1.1 та повну гідратацію
+    кешованих записів (відновлення best_email_confidence, dm_predicted_email з email_source_note,
+    а також primary_sales_gap / sales_gap_confidence).
     """
     dm_sp = split_clean_executive_name(rec.get('decision_maker_name') or '')
     rec.setdefault('dm_first_name', dm_sp['dm_first_name'] or None)
@@ -334,8 +336,22 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     rec.setdefault('company_linkedin_people_url', _build_company_linkedin_people_url(rec.get('linkedin_url')))
 
     best_em = rec.get('best_email')
-    rec.setdefault('best_email_confidence', 'OBSERVED_ON_SITE' if best_em else 'NONE')
-    rec.setdefault('email_verification_confidence', rec['best_email_confidence'])
+    if best_em and (not rec.get('best_email_confidence') or rec.get('best_email_confidence') == 'NONE'):
+        rec['best_email_confidence'] = 'OBSERVED_ON_SITE'
+    else:
+        rec.setdefault('best_email_confidence', 'OBSERVED_ON_SITE' if best_em else 'NONE')
+    rec['email_verification_confidence'] = rec['best_email_confidence']
+
+    if not rec.get('dm_predicted_email') and rec.get('email_source_note'):
+        m_hyp = re.search(
+            r'DM Email Pattern Hypothesis\s*\(([^)]+)\):\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+            str(rec['email_source_note']),
+        )
+        if m_hyp:
+            rec['dm_predicted_email'] = m_hyp.group(2).lower()
+            rec['dm_predicted_email_status'] = (
+                'pattern_estimated_mx_valid' if 'mx valid' in m_hyp.group(1).lower() else 'pattern_estimated_mx_unverified'
+            )
     rec.setdefault('dm_predicted_email', None)
     rec.setdefault('dm_predicted_email_status', 'not_generated')
 
@@ -354,10 +370,27 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
     ga4_cnt = int(rec.get('all_ga4_ids_count') or 0)
     rec.setdefault('estimated_markets_count', max(1, ga4_cnt // 2) if ga4_cnt >= 4 else 1)
     rec.setdefault('detected_market_locales', [])
-    rec.setdefault('catalog_estimated_skus', 0)
+    if rec.get('catalog_estimated_skus') == 0:
+        rec['catalog_estimated_skus'] = None
+    rec.setdefault('catalog_estimated_skus', None)
     rec.setdefault('ecom_avg_price', None)
     rec.setdefault('ecom_currency', None)
     rec.setdefault('logistics_and_returns_stack', [])
+
+    if not rec.get('primary_sales_gap') and rec.get('company_category') != 'Non-Profit / Education / Institution':
+        ad_cnt = sum(
+            1 for k in ('has_meta_pixel', 'has_google_ads', 'has_tiktok_pixel', 'has_linkedin_pixel', 'has_pinterest_tag')
+            if rec.get(k) is True
+        )
+        if rec.get('ads_active_last_30d') is True and not rec.get('has_sgtm'):
+            rec['primary_sales_gap'] = 'ADS_ACTIVE_NO_SERVER_SIDE_TRACKING'
+            rec['sales_gap_confidence'] = 'issue_confirmed'
+        elif rec.get('gdpr_eu_domain') and rec.get('has_google_ads') and not rec.get('consent_mode_likely'):
+            rec['primary_sales_gap'] = 'EU_CONSENT_MODE_V2_GAP'
+            rec['sales_gap_confidence'] = 'issue_suspected'
+        elif ad_cnt >= 2 and not rec.get('has_sgtm'):
+            rec['primary_sales_gap'] = 'CLIENT_SIDE_MULTI_PIXEL_NO_SGTM'
+            rec['sales_gap_confidence'] = 'issue_suspected'
 
     rec.setdefault('primary_sales_gap', None)
     rec.setdefault('sales_gap_confidence', None)
@@ -429,7 +462,7 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         rec.get('company_category') or 'General Business / Corporate',
         fake_tech_info,
         rec.get('ads_active_last_30d'),
-        0,
+        1 if rec.get('primary_sales_gap') else 0,
         int(rec.get('min_estimated_saas_spend_usd') or 0),
         rec.get('open_positions_total'),
     )
@@ -768,7 +801,7 @@ def _build_early_abort_record(
         'spend_estimation_basis': [],
         'estimated_markets_count': 1,
         'detected_market_locales': [],
-        'catalog_estimated_skus': 0,
+        'catalog_estimated_skus': None,
         'ecom_avg_price': None,
         'ecom_currency': None,
         'logistics_and_returns_stack': [],
@@ -1751,9 +1784,6 @@ async def process_domain(
     open_jobs_count = int(open_jobs_raw) if open_jobs_raw is not None else None
     hiring_mkt_roles = ats_info.get('hiring_marketing_or_data_roles')
 
-    # ==========================================================================
-    # v24.1: Пріоритезований розрахунок primary_sales_gap + sales_gap_confidence
-    # ==========================================================================
     primary_sales_gap: Optional[str] = None
     sales_gap_confidence: Optional[str] = None
     scan_comp = str(tech_info.get('tech_scan_completeness') or 'full')
@@ -1770,6 +1800,9 @@ async def process_domain(
         )
         if tech_info.get(k) is True and tiers_map.get(label) != 'allowlisted_in_csp'
     )
+
+    raw_skus = wk_info.get('sitemap_estimated_skus')
+    catalog_skus = int(raw_skus) if (raw_skus is not None and int(raw_skus) > 0) else None
 
     if company_category != 'Non-Profit / Education / Institution':
         if tech_info.get('duplicate_ga4_ids'):
@@ -1793,7 +1826,7 @@ async def process_domain(
         elif (wk_info.get('ecom_avg_price') or 0) >= 150 and 'Klarna' not in (tech_info.get('payment_gateways') or []):
             primary_sales_gap = 'HIGH_AOV_BNPL_GAP'
             sales_gap_confidence = 'issue_suspected'
-        elif company_category == 'E-commerce / Retail Brand' and not pim_logistics_info.get('has_automated_returns_portal') and (wk_info.get('sitemap_estimated_skus') or 0) >= 500:
+        elif company_category == 'E-commerce / Retail Brand' and not pim_logistics_info.get('has_automated_returns_portal') and (catalog_skus or 0) >= 500:
             primary_sales_gap = 'HIGH_VOLUME_NO_RETURNS_PORTAL'
             sales_gap_confidence = 'issue_suspected'
 
@@ -1838,7 +1871,6 @@ async def process_domain(
         sales_gap_confidence=sales_gap_confidence,
     )
 
-    # Детекція поточної агенції (футер / GTM / Google Ads)
     detected_marketing_agency = detect_agency_credits_from_html_and_gtm(html, gtm_js, brand_root)
     if not detected_marketing_agency:
         adv_legal_name = ads_info.get('verified_advertiser_legal_name')
@@ -1846,7 +1878,6 @@ async def process_domain(
             if brand_root and brand_root not in adv_legal_name.lower():
                 detected_marketing_agency = adv_legal_name
 
-    # Сигнали масштабу бізнесу та логістики
     scale_signals = extract_account_scale_signals(
         html,
         ga4_ids_count=tech_info.get('all_ga4_ids_count'),
@@ -2012,7 +2043,7 @@ async def process_domain(
         'spend_estimation_basis': spend_info['spend_estimation_basis'],
         'estimated_markets_count': scale_signals['estimated_markets_count'],
         'detected_market_locales': scale_signals['detected_market_locales'],
-        'catalog_estimated_skus': int(wk_info.get('sitemap_estimated_skus') or 0),
+        'catalog_estimated_skus': catalog_skus,
         'ecom_avg_price': wk_info.get('ecom_avg_price'),
         'ecom_currency': wk_info.get('ecom_currency'),
         'logistics_and_returns_stack': logistics_stack,
