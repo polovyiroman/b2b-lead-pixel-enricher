@@ -99,7 +99,7 @@ CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
 
 # ==============================================================================
-# v24.1 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
+# v24.1.1 Enterprise MarTech & Account Intelligence: VIES, RDAP, Spend, Scoring
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -454,7 +454,7 @@ def compute_account_change_triggers_v23(
 
 
 # ==============================================================================
-# v24.1 Decoupled Qualification Axes + Composite Actionable Priority Score
+# v24.1.1 Decoupled Qualification Axes + Composite Actionable Priority Score
 # ==============================================================================
 
 def compute_account_opportunity_score(
@@ -551,7 +551,7 @@ def compute_actionable_priority_score(
     sales_gap_confidence: str | None = None,
 ) -> int:
     """
-    Новий композитний індекс v24.1 (0–100):
+    Композитний індекс v24.1.1 (0–100):
     Поєднує цінність технічної проблеми, підтвердженість болю, повноту даних і реальну доступність контакту,
     щоб закриті домени без контактів (unreached) не перекривали готові до роботи ліди.
     """
@@ -850,7 +850,7 @@ def build_sales_hook(
     active_ad_formats: list[str] | None = None,
 ) -> str:
     """
-    v24.1 Hyper-Specific Account Hook Generator:
+    v24.1.1 Hyper-Specific Account Hook Generator:
     1. На великих ритейлерах не підставляє мільярдерів-засновників холдингів (Ruslan Shostak, Галина Герега)
        як адресатів технічного листа — переадресовує на Head of Marketing / Digital Lead.
     2. Вшиває конкретні артефакти акаунта (кількість регіональних GA4 ID, ID контейнера GTM,
@@ -1368,6 +1368,14 @@ def evaluate_qualification_v180(
     )
     pred_email_clause = f'; test predicted DM email {predicted_dm_email} via verifier' if predicted_dm_email else ''
 
+    # Виправлено (v24.1.1): Згадуємо company_linkedin_people_url лише тоді, коли на сайті реально знайдено LinkedIn компанії
+    has_company_li_people = bool(linkedin_url and 'linkedin.com/company/' in linkedin_url.lower())
+    li_nav_hint = (
+        'company_linkedin_people_url or decision_maker_search_query'
+        if has_company_li_people
+        else 'decision_maker_search_query'
+    )
+
     if is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{pred_email_clause}{phone_note}"
     elif company_category == 'Non-Profit / Education / Institution':
@@ -1376,7 +1384,7 @@ def evaluate_qualification_v180(
         if pw_blocked_by_waf:
             next_action = (
                 f'Retry with residential proxy — Playwright blocked by WAF ({pw_status_str}); '
-                f'do NOT skip this lead (use decision_maker_search_query on LinkedIn meanwhile)'
+                f'do NOT skip this lead (use {li_nav_hint} on LinkedIn meanwhile)'
             )
         else:
             next_action = 'Skip or review website manually (no tech signals or contacts detected)'
@@ -1392,12 +1400,12 @@ def evaluate_qualification_v180(
         )
     elif dm_name and is_mp_founder_with_vendor_b2b:
         next_action = (
-            f"Locate operational CMO / Head of Digital via company_linkedin_people_url or decision_maker_search_query before pitching analytics "
+            f"Locate operational CMO / Head of Digital via {li_nav_hint} before pitching analytics "
             f"(listed DM {dm_name} is {dm_role}, and {best_email} is a commercial/vendor B2B desk){phone_note}"
         )
     elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
         next_action = (
-            f"Open company_linkedin_people_url or decision_maker_search_query to locate CMO/Head of Digital{pred_email_clause}, "
+            f"Open {li_nav_hint} to locate CMO/Head of Digital{pred_email_clause}, "
             f"or request warm referral via {best_email} (listed executive: {dm_name})"
         )
     elif best_email_type in (
@@ -1409,17 +1417,17 @@ def evaluate_qualification_v180(
         if predicted_dm_email and dm_name:
             next_action = (
                 f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-                f"test predicted DM email {predicted_dm_email} via verifier or message {dm_name} via LinkedIn{phone_note}"
+                f"test predicted DM email {predicted_dm_email} via verifier or message {dm_name} via {li_nav_hint}{phone_note}"
             )
         else:
             next_action = (
                 f"DO NOT send cold marketing pitch to {best_email} ({best_email_type}); "
-                f"locate Marketing Lead / DM{dm_hint} via company_linkedin_people_url or decision_maker_search_query{phone_note}"
+                f"locate Marketing Lead / DM{dm_hint} via {li_nav_hint}{phone_note}"
             )
     elif best_email_type == 'b2b_partnerships':
         next_action = (
             f"Send partnership/referral inquiry to {best_email} asking for introduction to Head of Marketing/Analytics; "
-            f"use company_linkedin_people_url or decision_maker_search_query to find CMO/Head of Marketing first{phone_note}"
+            f"use {li_nav_hint} to find CMO/Head of Marketing first{phone_note}"
         )
     elif best_email_type == 'marketing_or_exec_role':
         next_action = (
@@ -1429,14 +1437,14 @@ def evaluate_qualification_v180(
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
         dm_hint = f" ({dm_name})" if dm_name else ""
         next_action = (
-            f"Locate CMO / Head of E-commerce{dm_hint} via company_linkedin_people_url or decision_maker_search_query{pred_email_clause} first; "
+            f"Locate CMO / Head of E-commerce{dm_hint} via {li_nav_hint}{pred_email_clause} first; "
             f"use {best_email} only for warm gatekeeper routing / referral request"
         )
     elif primary_phone:
-        next_action = f"Use company_linkedin_people_url or decision_maker_search_query{pred_email_clause} or call {primary_phone} for routing"
+        next_action = f"Use {li_nav_hint}{pred_email_clause} or call {primary_phone} for routing"
     else:
         next_action = (
-            f"Run decision_maker_search_query in LinkedIn / Apollo{pred_email_clause} to locate marketing decision-maker{phone_note}"
+            f"Run {li_nav_hint} in LinkedIn / Apollo{pred_email_clause} to locate marketing decision-maker{phone_note}"
         )
 
     return (
@@ -1739,7 +1747,7 @@ def build_manual_seed_record(
         'spend_estimation_basis': [],
         'estimated_markets_count': 1,
         'detected_market_locales': [],
-        'catalog_estimated_skus': 0,
+        'catalog_estimated_skus': None,
         'ecom_avg_price': None,
         'ecom_currency': None,
         'logistics_and_returns_stack': [],
