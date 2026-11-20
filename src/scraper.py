@@ -127,7 +127,9 @@ PW_TRACKED_NET_KEYWORDS = (
     'google-analytics.com',
     'analytics.google.com',
     '/g/collect',
+    '/collect?',
     '/gtm.js',
+    '/gtag/js',
     'googleadservices.com',
     'doubleclick.net/pagead',
     'connect.facebook.net',
@@ -143,7 +145,15 @@ PW_TRACKED_NET_KEYWORDS = (
     'hs-analytics.net',
     'klaviyo.com',
     'cdn.shopify.com',
+    'stape.io',
+    'stape.net',
 )
+
+PW_FIRST_PARTY_SGTM_SUBS: Set[str] = {
+    'sgtm', 'gtm', 'sst', 'metrics', 'analytics', 'tag', 'tags',
+    'track', 'tracking', 'collect', 'data', 'stats', 'measure',
+    'measurement', 'events', 'server-side', 'ss', 'stape', 'telemetry',
+}
 
 REGION_TO_PW_LOCALE: Dict[str, str] = {
     'UA': 'uk-UA',
@@ -950,7 +960,7 @@ async def fetch_waf_bypass_or_wayback_legal(
 
 
 # ==============================================================================
-# Playwright Shared Browser Pool & v24.1.2 Resilient Proxy Fallback Engine
+# Playwright Shared Browser Pool & v24.2 Resilient Proxy + sGTM Capture Engine
 # ==============================================================================
 
 def is_playwright_available() -> bool:
@@ -1034,11 +1044,11 @@ def _build_pw_proxy_attempt_plan(
     max_attempts: int = 1,
 ) -> List[Tuple[str, Optional[str]]]:
     """
-    v24.1.2: Гарантує, що при `start_residential=True` Playwright НІКОЛИ не виходить мовчки
+    Гарантує, що при `start_residential=True` Playwright НІКОЛИ не виходить мовчки
     з `playwright_attempts_count: 0`:
       1. Якщо RESIDENTIAL проксі не видався (`None`) — одразу робить спробу через стандартний пул проксі.
-      2. Якщо спроба через RESIDENTIAL провалилась (відмова з'єднання, таймаут, WAF) — автоматично
-         виконує ще 1 резервну спробу через стандартний пул проксі (`std_proxy_url`).
+      2. Якщо спроба через RESIDENTIAL провалилась — автоматично виконує ще 1 резервну спробу
+         через стандартний пул проксі (`std_proxy_url`).
     """
     plan: List[Tuple[str, Optional[str]]] = []
     if start_residential:
@@ -1057,6 +1067,19 @@ def _build_pw_proxy_attempt_plan(
     return plan
 
 
+def _should_capture_pw_request(req_url: str, target_reg_dom: str) -> bool:
+    r_low = (req_url or '').lower()
+    if any(k in r_low for k in PW_TRACKED_NET_KEYWORDS):
+        return True
+    if target_reg_dom:
+        req_host = (urlparse(req_url).hostname or '').lower().strip('.')
+        if req_host.endswith(f'.{target_reg_dom}') and req_host != f'www.{target_reg_dom}':
+            sub_label = req_host[:-(len(target_reg_dom) + 1)].split('.')[0]
+            if sub_label in PW_FIRST_PARTY_SGTM_SUBS:
+                return True
+    return False
+
+
 async def fetch_html_playwright_fallback(
     url: str,
     proxy_url: str | None = None,
@@ -1066,11 +1089,14 @@ async def fetch_html_playwright_fallback(
 ) -> tuple[str, str, str, bool, int]:
     """
     Виконує рендеринг сторінки у Playwright із кліком по CMP-банеру згоди, перехопленням
-    мережевих запитів трекінгу (`pw_net_req`) та резервним фолбеком проксі при `start_residential=True`.
+    мережевих запитів трекінгу й першосторонніх sGTM-піддоменів (`pw_net_req`), а також
+    резервним фолбеком проксі при `start_residential=True`.
     Повертає: (html, final_url, status_str, incomplete_flag, attempts_made).
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', True, 0
+
+    target_reg_dom, _ = _extract_etld_local(url)
 
     res_proxy_url: Optional[str] = None
     if _ESCALATION_PROXY_CFG is not None and (start_residential or max_attempts >= 2):
@@ -1129,8 +1155,7 @@ async def fetch_html_playwright_fallback(
                 def _on_request(req: Any) -> None:
                     try:
                         r_url = str(req.url or '')
-                        r_low = r_url.lower()
-                        if len(captured_net_urls) < 60 and any(k in r_low for k in PW_TRACKED_NET_KEYWORDS):
+                        if len(captured_net_urls) < 70 and _should_capture_pw_request(r_url, target_reg_dom):
                             if r_url not in captured_net_urls:
                                 captured_net_urls.append(r_url)
                     except Exception:
@@ -1153,7 +1178,7 @@ async def fetch_html_playwright_fallback(
                 if nav_resp is not None:
                     resp_headers_obj = nav_resp.headers
 
-                # Клік по банеру згоди на cookie для активації GA4/Consent Mode v2 тегів
+                # Клік по банеру згоди на cookie для активації GA4/Consent Mode v2 та sGTM тегів
                 for sel in CMP_ACCEPT_SELECTORS:
                     try:
                         loc = page.locator(sel).first
@@ -1196,7 +1221,7 @@ async def fetch_html_playwright_fallback(
                 if resp_headers_obj:
                     enriched_html = append_safe_headers_comment_v23_1(enriched_html, resp_headers_obj)
                 if captured_net_urls:
-                    net_comments = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_net_urls[:50])
+                    net_comments = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_net_urls[:60])
                     enriched_html = f'{enriched_html}\n{net_comments}'
 
                 return enriched_html, fin_u, 'rendered', incomplete_flag, attempts_made
