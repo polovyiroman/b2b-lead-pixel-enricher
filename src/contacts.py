@@ -70,6 +70,7 @@ _DNS_MX_CACHE: dict[str, str] = {}
 _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
 
 _STANDALONE_NAME_FINDER = re.compile(rf'\b{NAME_REGEX_PART}\b', re.UNICODE)
+_COMPILED_ROLES_RE = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.IGNORECASE | re.UNICODE)
 
 WIKIDATA_SEMAPHORE = asyncio.Semaphore(4)
 WP_AVATAR_HASH_RE = re.compile(r"/avatar/([a-f0-9]{64}|[a-f0-9]{32})\b", re.IGNORECASE)
@@ -155,29 +156,57 @@ EXTRA_MARKETING_ROLE_MAP: Dict[str, str] = {
     'vp of marketing': 'VP of Marketing',
     'vice president of marketing': 'VP of Marketing',
     'svp marketing': 'SVP of Marketing',
+    'svp of marketing': 'SVP of Marketing',
     'head of performance': 'Performance Marketing Lead',
     'head of performance marketing': 'Performance Marketing Lead',
     'director of performance marketing': 'Performance Marketing Lead',
+    'performance marketing director': 'Performance Marketing Lead',
     'head of digital marketing': 'Head of Digital',
     'digital marketing director': 'Head of Digital',
     'digital director': 'Head of Digital',
     'head of analytics': 'Head of Analytics / Data',
     'analytics director': 'Head of Analytics / Data',
+    'head of data': 'Head of Analytics / Data',
     'head of cro': 'Head of CRO / Conversion',
     'cro lead': 'Head of CRO / Conversion',
     'head of acquisition': 'Head of Growth / Acquisition',
+    'head of paid media': 'Performance Marketing Lead',
     'director of ecommerce': 'E-commerce Director',
     'director of e-commerce': 'E-commerce Director',
     'vp ecommerce': 'E-commerce Director',
     'vp of ecommerce': 'E-commerce Director',
     'vp of e-commerce': 'E-commerce Director',
     'head of crm': 'Head of CRM & Retention',
+    'crm director': 'Head of CRM & Retention',
+    'head of retention': 'Head of CRM & Retention',
+    'head of brand': 'Brand Director',
+    'brand director': 'Brand Director',
 }
 
 
 # ==============================================================================
-# v24.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
+# v24.3 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
 # ==============================================================================
+
+def is_server_verified_email_confidence(
+    best_email_confidence: str | None,
+    deliverability_check: str | None = None,
+) -> bool:
+    """
+    v24.3: Повертає True лише тоді, коли email справді підтверджено поштовим сервером:
+    `M365_AD_VERIFIED` або `SMTP_API_VERIFIED` (Reoon / MillionVerifier) за наявності
+    сконфігурованих MX-записів (`domain_mail_configured`).
+    Профільні збіги (`GRAVATAR_OR_PGP_MATCH`) НЕ вважаються серверною верифікацією скриньки.
+    """
+    conf = (best_email_confidence or '').strip().upper()
+    deliv = (deliverability_check or '').lower()
+    if conf in ('M365_AD_VERIFIED', 'SMTP_API_VERIFIED'):
+        if not deliv or 'domain_mail_configured' in deliv or 'mailbox_verified' in deliv:
+            return True
+    if 'mailbox_verified_m365_active_directory' in deliv or 'mailbox_verified_deliverable' in deliv:
+        return True
+    return False
+
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
     """
@@ -325,7 +354,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/24.2 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.3 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -539,7 +568,7 @@ async def verify_candidates_via_gravatar_two_step(
             )
             if head_resp.status_code == 200:
                 result["verified_email"] = clean_email
-                result["verification_status"] = "identity_verified_gravatar_profile"
+                result["verification_status"] = "profile_matched_gravatar_deliverability_unverified"
                 try:
                     j_resp = await http_session.get(
                         f"https://en.gravatar.com/{md5_hash}.json", timeout=1.5
@@ -563,6 +592,10 @@ async def verify_ceo_email_cascade_port443_v23_1(
     mx_records_str: str,
     has_seg_gateway: bool = False
 ) -> Dict[str, Any]:
+    """
+    v24.3: Чітко розділяє серверну верифікацію (`M365_AD_VERIFIED`) від профільних
+    збігів без підтвердження доставлюваності (`GRAVATAR_OR_PGP_MATCH`).
+    """
     if not candidate_emails:
         return {
             "verified_email": None,
@@ -598,8 +631,8 @@ async def verify_ceo_email_cascade_port443_v23_1(
     if grav_res.get("verified_email"):
         return {
             "verified_email": grav_res["verified_email"],
-            "verification_status": "identity_verified_gravatar_profile",
-            "email_verification_confidence": "API_VERIFIED",
+            "verification_status": "profile_matched_gravatar_deliverability_unverified",
+            "email_verification_confidence": "GRAVATAR_OR_PGP_MATCH",
             "detected_federated_idp": fed_idp,
         }
 
@@ -610,8 +643,8 @@ async def verify_ceo_email_cascade_port443_v23_1(
             if resp.status_code == 200:
                 return {
                     "verified_email": cand.strip().lower(),
-                    "verification_status": "identity_verified_openpgp_key",
-                    "email_verification_confidence": "API_VERIFIED",
+                    "verification_status": "profile_matched_openpgp_deliverability_unverified",
+                    "email_verification_confidence": "GRAVATAR_OR_PGP_MATCH",
                     "detected_federated_idp": fed_idp,
                 }
         except Exception:
@@ -1060,7 +1093,15 @@ def generate_dm_email_pattern_candidates(
     dm_name: str | None,
     canonical_domain: str,
     observed_emails: list[str] | None = None,
+    best_email_type: str | None = None,
 ) -> list[str]:
+    """
+    v24.3: Генерує гіпотези корпоративного email для знайденого ЛПР:
+      1. Якщо на сайті вже спостерігались іменні пошти (`f.last@` або `first.last@`) — наслідує корпоративний патерн.
+      2. Якщо відомий лише загальний/рольовий `best_email_type` (напр., `general_office_inbox` як `info@domain.com`,
+         `marketing_or_exec_role`, `b2b_partnerships`) — першим кандидатом генерує `first@domain.com`,
+         далі `first.last@domain.com` та `f.last@domain.com`.
+    """
     if not dm_name or not canonical_domain:
         return []
     dom = canonical_domain.lower().strip().replace('www.', '')
@@ -1103,6 +1144,15 @@ def generate_dm_email_pattern_candidates(
     if detected_pattern == 'first.last':
         return [f'{first}.{last}@{dom}', f'{f_init}.{last}@{dom}', f'{first}@{dom}']
 
+    if best_email_type in (
+        'general_office_inbox',
+        'marketing_or_exec_role',
+        'b2b_partnerships',
+        'wholesale_or_sales_inbox',
+        'customer_support_inbox',
+    ):
+        return [f'{first}@{dom}', f'{first}.{last}@{dom}', f'{f_init}.{last}@{dom}', f'{f_init}{last}@{dom}']
+
     return [f'{f_init}.{last}@{dom}', f'{first}.{last}@{dom}', f'{first}@{dom}']
 
 
@@ -1126,7 +1176,7 @@ async def verify_predicted_emails_via_api(
                     data = resp.json()
                     st = str(data.get('status') or '').lower()
                     if st in ('safe', 'valid', 'deliverable'):
-                        return cand, f'mailbox_verified_deliverable (Reoon: {st})'
+                        return cand, f'mailbox_verified_deliverable (Reoon SMTP: {st})'
             except Exception:
                 pass
         if mv_key:
@@ -1137,7 +1187,7 @@ async def verify_predicted_emails_via_api(
                     data = resp.json()
                     res_code = str(data.get('result') or '').lower()
                     if res_code in ('ok', 'valid', 'deliverable'):
-                        return cand, f'mailbox_verified_deliverable (MillionVerifier: {res_code})'
+                        return cand, f'mailbox_verified_deliverable (MillionVerifier SMTP: {res_code})'
             except Exception:
                 pass
 
@@ -1237,7 +1287,7 @@ def classify_email_source_type_and_note(
         src_type = 'impressum_or_legal_page'
     elif any(k in path for k in ('contact', 'kontakt', 'kontakty', 'contatti', 'contacto')):
         src_type = 'contact_page'
-    elif any(k in path for k in ('about', 'team', 'komanda', 'ueber-uns', 'uber-uns', 'pro-nas')):
+    elif any(k in path for k in ('about', 'team', 'komanda', 'ueber-uns', 'uber-uns', 'pro-nas', 'leadership')):
         src_type = 'about_or_team_page'
     else:
         src_type = 'homepage_or_footer'
@@ -1517,7 +1567,7 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
     path = urlparse(source_url).path.lower()
     if any(k in path for k in ('impressum', 'mentions-legales', 'aviso-legal')):
         return 'impressum_page'
-    if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'board', 'vorstand')):
+    if any(k in path for k in ('team', 'komanda', 'leadership', 'management', 'founders', 'board', 'vorstand', 'people', 'executive')):
         return 'team_or_leadership_page'
     if any(k in path for k in ('about', 'ueber-uns', 'uber-uns', 'pro-nas', 'o-nas', 'company', 'qui-sommes-nous')):
         return 'about_page'
@@ -1538,21 +1588,14 @@ def is_marketing_or_digital_role(role_str: str | None) -> bool:
         k in r_low for k in (
             'cmo', 'marketing', 'e-commerce', 'ecommerce', 'growth',
             'digital', 'performance', 'acquisition', 'cro', 'analytics',
-            'conversion', 'crm', 'retention', 'маркетинг', 'marketingleiter',
-            'marknadschef', 'markedssjef', 'hoofd marketing',
+            'conversion', 'crm', 'retention', 'brand director', 'head of brand',
+            'маркетинг', 'діджитал', 'marketingleiter', 'marknadschef',
+            'markedssjef', 'hoofd marketing', 'hoofd digital', 'hoofd e-commerce',
         )
     )
 
 
 def classify_dm_buyer_fit(dm_name: str | None, dm_role: str | None) -> str:
-    """
-    v24.2 Operational Buyer Fit Status:
-      - `direct_marketing_buyer`: знайдено операційного покупця MarTech/аналітики (CMO, Head of Digital,
-        Marketing Director, Head of E-commerce, Head of Growth, Analytics/CRO Lead).
-      - `escalation_needed_via_ceo`: знайдено лише CEO / Founder / Managing Director / Owner —
-        потрібне перенаправлення (escalation) на керівника маркетингу чи digital.
-      - `no_dm_found`: жодної особи не ідентифіковано.
-    """
     if not dm_name:
         return 'no_dm_found'
     if is_marketing_or_digital_role(dm_role):
@@ -1562,8 +1605,7 @@ def classify_dm_buyer_fit(dm_name: str | None, dm_role: str | None) -> str:
 
 def _dm_role_priority_weight(role_str: str | None) -> int:
     """
-    v24.2: Зміщує пріоритет із юридичних CEO/Founder на операційних покупців маркетингу,
-    digital, e-commerce та аналітики.
+    v24.3: Пріоритет №1 — операційні керівники маркетингу, digital, e-commerce, growth, analytics.
     """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
@@ -1576,9 +1618,9 @@ def _dm_role_priority_weight(role_str: str | None) -> int:
             'head of cro', 'head of crm',
         )
     ):
-        return 70
+        return 85
     if is_marketing_or_digital_role(role_str):
-        return 58
+        return 72
     if any(k in r_low for k in ('commercial director',)):
         return 26
     if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
@@ -1649,7 +1691,7 @@ def extract_decision_maker_deep(
             imp in u_path for imp in ('impressum', 'mentions-legales', 'aviso-legal')
         )
         src_type = classify_dm_source_type(page_url)
-        page_bonus = 18 if src_type in ('team_or_leadership_page', 'about_page') else (12 if src_type == 'impressum_page' else 0)
+        page_bonus = 22 if src_type in ('team_or_leadership_page', 'about_page') else (10 if src_type == 'impressum_page' else 0)
 
         if raw_html:
             soup = BeautifulSoup(raw_html, 'lxml')
@@ -1659,6 +1701,43 @@ def extract_decision_maker_deep(
                     clean_li = clean_and_validate_social_url('linkedin', href)
                     if clean_li and clean_li not in personal_linkedin_urls:
                         personal_linkedin_urls.append(clean_li)
+
+            # v24.3: Парсинг структурованих HTML-карток команди (/team, /leadership, /about)
+            for card in soup.find_all(['div', 'li', 'article', 'figure']):
+                if card.find_all(['section', 'main', 'header', 'footer', 'nav']):
+                    continue
+                card_txt = ' '.join(card.get_text(' ', strip=True).split())
+                if len(card_txt) < 8 or len(card_txt) > 190:
+                    continue
+                if any(tm in card_txt.lower() for tm in TESTIMONIAL_TEXT_MARKERS):
+                    continue
+                heading = card.find(['h2', 'h3', 'h4', 'h5', 'strong', 'b'])
+                if not heading:
+                    continue
+                head_txt = ' '.join(heading.get_text(' ', strip=True).split())
+                rest_txt = card_txt.replace(head_txt, '', 1).strip(' ,—–-:|•')
+                if not head_txt or not rest_txt:
+                    continue
+                cand_name = strip_role_tokens_from_name(head_txt)
+                if not is_valid_person_name(cand_name, brand_root):
+                    continue
+                r_m = _COMPILED_ROLES_RE.search(rest_txt)
+                if not r_m:
+                    continue
+                norm_r = normalize_executive_role(r_m.group(1))
+                if not norm_r:
+                    continue
+                sc = _dm_role_priority_weight(norm_r) + page_bonus + 14
+                k_low = cand_name.lower()
+                if k_low not in candidates or sc > candidates[k_low]['score']:
+                    candidates[k_low] = {
+                        'name': cand_name,
+                        'role': norm_r,
+                        'url': page_url,
+                        'is_legal': is_legal_doc,
+                        'src_type': src_type,
+                        'score': sc,
+                    }
 
             for ld_script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
                 try:
@@ -1793,7 +1872,7 @@ def extract_decision_maker_deep(
                 c_info['score'] += 25
                 break
 
-    # v24.2: Операційні ролі маркетингу/digital/e-commerce завжди перемагають CEO/Founder
+    # v24.3: Операційні ролі маркетингу/digital/e-commerce/growth мають пріоритет №1 над CEO/Founder
     sorted_cands = sorted(
         candidates.values(),
         key=lambda item: (
@@ -1846,7 +1925,6 @@ async def fetch_dm_via_serp_fallback(
             return None, None, None, None
         data = resp.json()
         organic = data.get('organic') or []
-        role_re = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.I | re.U)
 
         valid_matches: list[tuple[int, str, str, str, str]] = []
         for item in organic:
@@ -1872,7 +1950,7 @@ async def fetch_dm_via_serp_fallback(
                 continue
 
             combined_role_ctx = ' '.join(segments[1:]) + ' ' + snippet
-            r_match = role_re.search(combined_role_ctx)
+            r_match = _COMPILED_ROLES_RE.search(combined_role_ctx)
             raw_role = r_match.group(1) if r_match else (segments[1] if len(segments) > 1 else 'Marketing / Executive Lead')
             norm_role = normalize_executive_role(raw_role) or 'Marketing / Executive Lead'
             dms_str = f'{cand_name} ({norm_role}) [{clean_li}]'
