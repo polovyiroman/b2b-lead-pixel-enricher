@@ -5,7 +5,7 @@ import re
 import socket
 import ssl
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
@@ -175,7 +175,7 @@ PW_NON_STANDARD_COLLECT_PATH_RE = re.compile(
 )
 
 PW_TRACKING_QUERY_MARKERS = (
-    'tid=g-', 'v=2&', 'en=page_view', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=',
+    'tid=g-', 'v=2&', 'en=page_view', 'en=purchase', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=',
 )
 
 PW_STATIC_SUB_PREFIXES = ('cdn.', 'static.', 'assets.', 'img.', 'images.', 'media.', 'fonts.')
@@ -986,7 +986,7 @@ async def fetch_waf_bypass_or_wayback_legal(
 
 
 # ==============================================================================
-# Playwright Shared Browser Pool & v24.4 XHR/Fetch + Zaraz + sGTM Capture Engine
+# Playwright Shared Browser Pool & v24.5 XHR/Fetch + GA4 Hit-Seq Capture Engine
 # ==============================================================================
 
 def is_playwright_available() -> bool:
@@ -1108,13 +1108,6 @@ def _should_capture_pw_xhr(
     resource_type: str,
     target_reg_dom: str,
 ) -> Tuple[bool, bool]:
-    """
-    v24.4 XHR/Fetch/Ping Traffic Filter:
-    Повертає кортеж (should_capture, is_first_party_collect_hit).
-    Перехоплює нестандартні першосторонні піддомени (`x99.brand.de/collect`,
-    `fp-edge.brand.de/ev?tid=G-...`), Cloudflare Zaraz (`/cdn-cgi/zaraz/`)
-    та першосторонні проксі-шляхи (`/sgtm/collect`, `/capi/`).
-    """
     rt = (resource_type or '').lower().strip()
     if rt not in ('xhr', 'fetch', 'ping', 'beacon'):
         return False, False
@@ -1138,6 +1131,34 @@ def _should_capture_pw_xhr(
     return False, False
 
 
+def _tag_ga4_collect_hit(req_url: str, seq_counter: Dict[str, int]) -> Tuple[str, List[str]]:
+    """
+    v24.5: Додає унікальний фрагмент `#pw_hit=N` до кожного `/g/collect` або `/collect?` запиту,
+    щоб ідентичні подвійні спрацювання GA4 (`page_view`, `purchase`) НЕ зливались при
+    дедуплікації між `pw_net_req` і `pw_xhr_req`, але один і той самий запит не рахувався двічі.
+    """
+    r_low = (req_url or '').lower()
+    if '/g/collect' not in r_low and '/collect?' not in r_low:
+        return req_url, []
+
+    seq_counter['n'] = int(seq_counter.get('n', 0)) + 1
+    hit_id = seq_counter['n']
+    clean_base = req_url.split('#', 1)[0]
+    tagged = f'{clean_base}#pw_hit={hit_id}'
+
+    events: List[str] = []
+    try:
+        qs = parse_qs(urlparse(clean_base).query)
+        tids = [t.upper() for t in qs.get('tid', []) if t.upper().startswith('G-')]
+        ens = [e.lower() for e in qs.get('en', [])] or ['hit']
+        for tid in tids:
+            for en_val in ens:
+                events.append(f'{tid}:{en_val}')
+    except Exception:
+        pass
+    return tagged, events
+
+
 async def fetch_html_playwright_fallback(
     url: str,
     proxy_url: str | None = None,
@@ -1148,8 +1169,8 @@ async def fetch_html_playwright_fallback(
     """
     Рендерить сторінку у Playwright із кліком по CMP-банеру згоди, перехопленням
     мережевих запитів трекінгу (`pw_net_req`) та XHR/Fetch/Ping трафіку (`pw_xhr_req`,
-    `pw_runtime_summary`), включно з Cloudflare Zaraz (`/cdn-cgi/zaraz/`).
-    Повертає: (html, final_url, status_str, incomplete_flag, attempts_made).
+    `pw_runtime_summary`), зберігаючи кожен окремий GA4 `/g/collect` хіт для доведення
+    `RUNTIME_NETWORK_VERIFIED` подвійних спрацювань.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return '', url, 'disabled', True, 0
@@ -1189,7 +1210,9 @@ async def fetch_html_playwright_fallback(
             captured_net_urls: List[str] = []
             captured_xhr_entries: List[Tuple[str, str]] = []
             first_party_collect_hits: List[str] = []
+            ga4_runtime_events: List[str] = []
             xhr_counter = {'total': 0}
+            collect_seq = {'n': 0}
             resp_headers_obj: Any = None
 
             try:
@@ -1217,20 +1240,25 @@ async def fetch_html_playwright_fallback(
                     try:
                         r_url = str(req.url or '')
                         r_type = str(getattr(req, 'resource_type', '') or '').lower()
+                        tagged_url, ev_tags = _tag_ga4_collect_hit(r_url, collect_seq)
+                        if ev_tags and len(ga4_runtime_events) < 40:
+                            ga4_runtime_events.extend(ev_tags)
+
                         if r_type in ('xhr', 'fetch', 'ping', 'beacon'):
                             xhr_counter['total'] += 1
                             cap_xhr, is_fp_collect = _should_capture_pw_xhr(r_url, r_type, target_reg_dom)
                             if cap_xhr and len(captured_xhr_entries) < 60:
-                                entry = (r_type, r_url)
+                                entry = (r_type, tagged_url)
                                 if entry not in captured_xhr_entries:
                                     captured_xhr_entries.append(entry)
                             if is_fp_collect and len(first_party_collect_hits) < 15:
-                                if r_url not in first_party_collect_hits:
-                                    first_party_collect_hits.append(r_url[:160])
+                                clean_fp = r_url[:160]
+                                if clean_fp not in first_party_collect_hits:
+                                    first_party_collect_hits.append(clean_fp)
 
                         if len(captured_net_urls) < 70 and _should_capture_pw_request(r_url, target_reg_dom):
-                            if r_url not in captured_net_urls:
-                                captured_net_urls.append(r_url)
+                            if tagged_url not in captured_net_urls:
+                                captured_net_urls.append(tagged_url)
                     except Exception:
                         pass
 
@@ -1305,6 +1333,7 @@ async def fetch_html_playwright_fallback(
                     'xhr_fetch_analyzed': True,
                     'total_xhr_fetch_count': xhr_counter['total'],
                     'first_party_collect_hits': first_party_collect_hits[:10],
+                    'ga4_events': ga4_runtime_events[:30],
                 }
                 enriched_html = (
                     f'{enriched_html}\n<!-- pw_runtime_summary: {json.dumps(runtime_summary, ensure_ascii=False)} -->'
