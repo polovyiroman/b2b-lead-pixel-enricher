@@ -35,6 +35,7 @@ from .domain_helpers import (
     derive_data_source_sensitivity,
     derive_gdpr_jurisdiction,
     derive_sales_actionability_class,
+    detect_country_hint,
 )
 from .qualifier import (
     build_linkedin_xray_query,
@@ -156,7 +157,7 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 32 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.1).
+    Виконує 36 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.1.1).
     """
     # 1. Domain preparation & canonicalization
     prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
@@ -356,7 +357,7 @@ def run_startup_regression_gate(
     assert wa_num in ('+380671234567', None)
 
     # 22. Decoupled Qualification, Actionable Priority Score, Contactability & DSK Compliance
-    verdict, _, tech_sig_str, c_tier, _, _, _, _, _ = evaluate_qualification_v180(
+    verdict, _, tech_sig_str, c_tier, _, _, _, _, nba_with_li = evaluate_qualification_v180(
         'E-commerce / Retail Brand', t_info, 'marketing@shop.de', 'marketing_or_exec_role',
         '+49 30 123456', 'Max Mustermann', 'Chief Marketing Officer (CMO)',
         'https://www.linkedin.com/in/max-mustermann', False, 'impressum_page',
@@ -388,7 +389,7 @@ def run_startup_regression_gate(
     assert derive_gdpr_jurisdiction('global-brand.com', None, '', '<div>Subtotal: 129,00 € incl. VAT</div>') == 'EU_EEA_GDPR'
     assert derive_data_source_sensitivity('impressum_page', 'contact_page', 'EU_EEA_GDPR') == 'impressum_statutory_disclosure_restricted'
 
-    # 23. Hyper-specific sales_hook & Holding Founder Exclusion (Eva / Notino / Netpeak)
+    # 23. Hyper-specific sales_hook & Holding Founder Exclusion (Eva / Netpeak)
     hook_eva = build_sales_hook(
         'eva.ua', 'E-commerce / Retail Brand', t_info,
         'Ruslan Shostak', 'Founder', 'https://www.linkedin.com/in/ruslan-shostak', 'info@eva.ua',
@@ -404,7 +405,7 @@ def run_startup_regression_gate(
     )
     assert 'Named Contact: n.koshel@netpeak.net' in hook_netpeak
 
-    # 24. Account Intelligence Scale, Agency Credits & Multi-ATS Detection (v24.1)
+    # 24. Account Intelligence Scale, Agency Credits & Multi-ATS Detection
     scale_res = extract_account_scale_signals(
         '<link rel="alternate" hreflang="de-DE" href="https://notino.de/" />'
         '<link rel="alternate" hreflang="pl-PL" href="https://notino.pl/" />',
@@ -449,5 +450,31 @@ def run_startup_regression_gate(
     assert CACHE_SCHEMA_VERSION >= 30
     _run_fetch_html_safely_sync_check()
 
+    # 27. QA Polish Checks (Build 0.0.308 / v24.1.1)
+    assert detect_agency_credits_from_html_and_gtm('', 'var department = "shoes"; // dept_id=1', 'bergfreunde') is None
+    assert detect_agency_credits_from_html_and_gtm('', 'console.log("Powered by DEPT");', 'brand') == 'DEPT Agency'
+
+    ua_title = 'Netpeak Journal — Медіа про інтернет-маркетинг'
+    assert detect_country_hint('netpeak.net', ua_title, '', None, '') == 'UA'
+    assert derive_gdpr_jurisdiction('netpeak.net', None, '', f'<title>{ua_title}</title>') == 'UA_PDP'
+    tz_netpeak = resolve_prospect_timezone_and_locale_v23(
+        'netpeak.net', None, 'UA', 'uk', page_title=ua_title, gdpr_jurisdiction='UA_PDP'
+    )
+    assert tz_netpeak['prospect_iana_timezone'] == 'Europe/Kyiv'
+
+    _, _, _, _, _, _, _, _, nba_no_li = evaluate_qualification_v180(
+        'E-commerce / Retail Brand', t_info, 'info@shop.ua', 'general_office_inbox',
+        '+380441234567', 'Іван Коваль', 'CEO', None, False, 'about_page',
+        None, False, 'rendered'
+    )
+    assert 'company_linkedin_people_url' not in nba_no_li
+
+    _, _, _, _, _, _, _, _, nba_has_li = evaluate_qualification_v180(
+        'E-commerce / Retail Brand', t_info, 'info@shop.ua', 'general_office_inbox',
+        '+380441234567', 'Іван Коваль', 'CEO', None, False, 'about_page',
+        'https://www.linkedin.com/company/shop', False, 'rendered'
+    )
+    assert 'company_linkedin_people_url' in nba_has_li
+
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 32/32 unit & integration tests green (v24.1 Enterprise MarTech & Account Intelligence).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 36/36 unit & integration tests green (v24.1.1 Store Release).')
