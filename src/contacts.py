@@ -90,6 +90,30 @@ PATRONYMIC_SUFFIX_RE = re.compile(
     r"^(?:[А-ЯІЇЄҐA-Z][а-яіїєґa-z']+)(?:ович|івна|ївна|йович|ич|овна|евна|ична)$"
 )
 
+# v24.1.2: Суфікси українських/слов'янських прізвищ та словник поширених імен для автоінверсії ПІБ
+SLAVIC_SURNAME_SUFFIX_RE = re.compile(
+    r"(?:ук|юк|чук|енко|єнко|ський|цький|зький|ська|цька|зька|ов|єв|ев|ова|єва|ева|ин|ін|ина|іна|ая|ич|ак|як)$",
+    re.IGNORECASE
+)
+COMMON_UA_FIRST_NAMES: Set[str] = {
+    'людмила', 'олександр', 'олександра', 'олена', 'тетяна', 'наталія', 'наталя', 'наталка',
+    'ірина', 'ольга', 'світлана', 'юлія', 'анна', 'ганна', 'марія', 'катерина', 'вікторія',
+    'анастасія', 'дарія', "дар'я", 'дар’я', 'софія', 'аліна', 'діана', 'христина', 'оксана',
+    'галина', 'лариса', 'валентина', 'інна', 'яна', 'марина', 'леся', 'надія', 'віра', 'любов',
+    'алла', 'тамара', 'ніна', 'зоя', 'лілія', 'ліна', 'жана', 'жанна', 'євгенія', 'валерія',
+    'вероніка', 'каріна', "мар'яна", 'мар’яна', 'уляна', 'соломія', 'роксолана', 'ярослава',
+    'іван', 'андрій', 'сергій', 'дмитро', 'олексій', 'володимир', 'микола', 'василь', 'віктор',
+    'віталій', 'максим', 'євген', 'євгеній', 'роман', 'ігор', 'олег', 'юрій', 'богдан', 'тарас',
+    'павло', 'михайло', 'петро', 'владислав', 'артем', 'денис', 'антон', 'вадим', 'руслан',
+    'станіслав', 'ярослав', 'костянтин', "в'ячеслав", 'в’ячеслав', 'валерій', 'анатолій',
+    'геннадій', 'леонід', 'григорій', 'степан', 'назар', 'ілля', 'кирило', 'тимур', 'марко',
+    'орест', 'любомир', 'остап', 'борис', 'федір', 'артур', 'едуард', 'георгій', 'данило',
+    'матвій', 'захар', 'гліб', 'микита', 'єгор', 'тимофій', 'святослав', 'мирослав',
+    'александр', 'елена', 'татьяна', 'наталья', 'ирина', 'светлана', 'юлия', 'мария',
+    'екатерина', 'виктория', 'дмитрий', 'алексей', 'владимир', 'николай', 'сергей', 'андрей',
+    'евгений', 'михаил', 'павел', 'игорь', 'вячеслав', 'константин',
+}
+
 FAX_CONTEXT_RE = re.compile(
     r"(?:telefax|fax|факс|faks|télécopie)\s*[:.\-/]?\s*[\+\d\s()/.-]{6,22}",
     re.IGNORECASE
@@ -129,10 +153,14 @@ NON_EXECUTIVE_ROLE_REJECT_SET = {
 
 
 # ==============================================================================
-# v24.0 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
+# v24.1.2 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
 # ==============================================================================
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
+    """
+    Очищає академічні титули, українські по батькові та автоматично виправляє
+    порядок `Прізвище Ім'я` -> `Ім'я Прізвище` (напр., `Бойчук Людмила` -> `Людмила Бойчук`).
+    """
     if not raw_full_name:
         return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
     clean = raw_full_name.strip()
@@ -159,6 +187,20 @@ def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
                 "dm_last_name": tokens[2],
             }
         if PATRONYMIC_SUFFIX_RE.match(tokens[2]):
+            return {
+                "dm_clean_full_name": f"{tokens[1]} {tokens[0]}",
+                "dm_first_name": tokens[1],
+                "dm_last_name": tokens[0],
+            }
+
+    if len(tokens) == 2:
+        t0_low = tokens[0].lower().strip(".,")
+        t1_low = tokens[1].lower().strip(".,")
+        if (
+            t1_low in COMMON_UA_FIRST_NAMES
+            and t0_low not in COMMON_UA_FIRST_NAMES
+            and SLAVIC_SURNAME_SUFFIX_RE.search(t0_low)
+        ):
             return {
                 "dm_clean_full_name": f"{tokens[1]} {tokens[0]}",
                 "dm_first_name": tokens[1],
@@ -260,7 +302,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/24.0 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.1 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -870,10 +912,6 @@ def is_valid_person_name(candidate: str | None, brand_root: str = '') -> bool:
 
 
 def verify_person_email_match(dm_name: str | None, email: str | None) -> bool:
-    """
-    Виправлено (v24.0): Підтримує формат `first@domain` (напр. `matthias@bergfreunde.de` для `Matthias Gebhard`),
-    коли ім'я має >= 3 літер і не є службовим префіксом.
-    """
     if not dm_name or not email or '@' not in email:
         return False
     local = clean_escaped_email_prefix(email).split('@', 1)[0].lower()
@@ -1467,10 +1505,6 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
 
 
 def _dm_role_priority_weight(role_str: str | None) -> int:
-    """
-    Виправлено (v24.0): Операційні керівники маркетингу / e-commerce / growth отримують
-    найвищий пріоритет (38 балів), випереджаючи засновників холдингів (14–16 балів).
-    """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
         return -30
