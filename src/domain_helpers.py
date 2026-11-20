@@ -54,6 +54,102 @@ SCAN_FAILED_CLASSES: set[str] = {
     'scan_failed_dns_error',
 }
 
+SCAN_FAILED_COMPLETENESS: set[str] = {
+    'partial_blocked',
+    'partial_timeout',
+    'partial_empty_render',
+    'http_404',
+}
+
+KNOWN_DTC_ECOM_DOMAINS: set[str] = {
+    'glossier.com',
+    'chubbiesshorts.com',
+    'cher17.com',
+    'asos.com',
+    'laredoute.fr',
+    'docmorris.de',
+    'coolblue.nl',
+    'notino.de',
+    'flaconi.de',
+    'douglas.de',
+    'thomann.de',
+    'bergfreunde.de',
+    'moyo.ua',
+    'yakaboo.ua',
+    'apteka911.ua',
+    'stls.store',
+    'stylus.ua',
+    'adidas.com',
+    'adidas.de',
+    'nike.com',
+    'skims.com',
+    'homedepot.com',
+    'breuninger.com',
+    'gymshark.com',
+    'allbirds.com',
+    'huckberry.com',
+    'vovk.com',
+}
+
+KNOWN_SAAS_FINTECH_DOMAINS: set[str] = {
+    'stripe.com',
+    'asana.com',
+    'notion.so',
+    'notion.com',
+    'zapier.com',
+    'clickup.com',
+    'pipedrive.com',
+    'typeform.com',
+    'gorgias.com',
+    'personio.de',
+    'personio.com',
+    'airslate.com',
+    'preply.com',
+    'creatio.com',
+    'ringostat.com',
+    'sendpulse.com',
+    'serpstat.com',
+    'weblium.com',
+    'esputnik.com',
+    'helpcrunch.com',
+    'macpaw.com',
+    'readdle.com',
+    'grammarly.com',
+    'hubspot.com',
+    'klaviyo.com',
+    'linear.app',
+    'figma.com',
+    'slack.com',
+    'monday.com',
+    'atlassian.com',
+    'intercom.com',
+    'zendesk.com',
+    'adyen.com',
+    'mollie.com',
+    'klarna.com',
+    'shopify.com',
+}
+
+SAAS_FINTECH_STRONG_RE = re.compile(
+    r'\b(?:software|saas|b2b\s+platform|cloud\s+platform|work\s+management|project\s+management|'
+    r'financial\s+infrastructure|payment\s+infrastructure|payments?\s+platform|payment\s+processing|'
+    r'fintech|crm|sales\s+crm|pipeline\s+management|sales\s+pipeline|workflow\s+automation|'
+    r'no-?code|low-?code|api\s+platform|developer\s+platform|productivity\s+software|'
+    r'connected\s+workspace|knowledge\s+base|helpdesk|customer\s+support\s+platform|'
+    r'hr\s+software|payroll\s+software|analytics\s+platform|marketing\s+automation|'
+    r'email\s+marketing\s+platform|customer\s+data\s+platform|cdp|call\s+tracking|'
+    r'virtual\s+pbx|form\s+builder|document\s+workflow|e-?signature|website\s+builder|'
+    r'cloud-lösung|softwarelösung|logiciel\s+saas|plateforme\s+cloud|oprogramowanie\s+dla\s+firm|'
+    r'наскрізна\s+аналітика|колтрекінг|конструктор\s+сайтів)\b',
+    re.IGNORECASE,
+)
+
+SAAS_FINTECH_COMBO_TOKENS: tuple[str, ...] = (
+    'software', 'saas', 'platform', 'infrastructure', 'payments', 'payment',
+    'crm', 'api', 'workflow', 'automation', 'workspace', 'fintech', 'cloud',
+    'billing', 'developers', 'integration', 'integrations', 'analytics',
+)
+
 TECH_BOOL_FIELDS = (
     'has_meta_pixel',
     'has_tiktok_pixel',
@@ -78,6 +174,185 @@ EU_VAT_BODY_RE = re.compile(
 )
 
 UA_SPECIFIC_CYRILLIC_RE = re.compile(r'[іїєґІЇЄҐ]')
+
+
+def classify_company_category(
+    domain: str,
+    page_title: str,
+    meta_desc: str,
+    detected_tech: list[str],
+    html_sample: str = ''
+) -> tuple[str, str]:
+    """
+    v24.5 Посилена категоризація бізнесу (Крок 4 аудиту):
+      1. B2B Agency / Marketing Media.
+      2. SaaS / FinTech / Infrastructure — суворий пріоритет над E-commerce, якщо в метаданих
+         наявні маркери `software`, `saas`, `platform`, `infrastructure`, `payments`, `crm`
+         (усуває хибну класифікацію Stripe, Asana, Notion, Zapier, ClickUp як E-commerce).
+      3. E-commerce / Retail Brand (підтверджені ритейл-домени, e-com CMS, Product Schema, кошик).
+      4. Non-Profit / Education / Institution.
+      5. General Business / Corporate.
+    """
+    dom_low = (domain or '').lower().replace('www.', '').strip()
+    meta_text = f'{page_title or ""} {meta_desc or ""}'.lower()
+    text = f'{dom_low} {meta_text}'.lower()
+    if len(html_sample) > 60000:
+        html_low = (html_sample[:40000] + '\n' + html_sample[-20000:]).lower()
+    else:
+        html_low = (html_sample or '').lower()
+
+    agency_keywords = (
+        'агентство', 'агенція', 'agency', 'digital marketing', 'діджитал-маркетинг',
+        'онлайн-маркетинг', 'маркетингова агенція', 'seo agency', 'ppc agency',
+        'web studio', 'веб-студія', 'розробка сайтів', 'software development',
+        'медіа про інтернет-маркетинг', 'performance marketing agency', 'агентство інтернет-маркетингу',
+        'werbeagentur', 'digitalagentur', 'marketingagentur', 'online-marketing-agentur', 'seo-agentur',
+        'agence digitale', 'agence web', 'agence marketing', 'agence de communication', 'agence seo',
+        'agencia de marketing', 'agencia digital', 'agencia seo', 'agencia de publicidad',
+        'agenzia web', 'agenzia di marketing', 'agenzia digitale', 'agenzia comunicazione',
+        'marketingbureau', 'internetbureau', 'online marketing bureau', 'mediabureau',
+        'agencja marketingowa', 'agencja interaktywna', 'agencja seo', 'agencja reklamowa',
+        'agência digital', 'agência de marketing', 'webbyrå', 'reklambyrå', 'kommunikationsbyrå', 'mediebyrå',
+        'promodo', 'netpeak', 'inweb', 'newage'
+    )
+    if any(k in text for k in agency_keywords):
+        return 'B2B Agency / Marketing Media', 'high'
+
+    is_explicit_retail = (dom_low in KNOWN_MARKETPLACE_DOMAINS or dom_low in KNOWN_DTC_ECOM_DOMAINS)
+
+    # Пріоритетна перевірка SaaS / FinTech / Infrastructure (фікс Stripe, Asana, Notion, Zapier)
+    if dom_low in KNOWN_SAAS_FINTECH_DOMAINS:
+        return 'SaaS / Marketplace / Tech Platform', 'high'
+
+    if not is_explicit_retail:
+        if SAAS_FINTECH_STRONG_RE.search(meta_text):
+            return 'SaaS / Marketplace / Tech Platform', 'high'
+        saas_combo_hits = sum(
+            1 for tok in SAAS_FINTECH_COMBO_TOKENS
+            if re.search(rf'\b{re.escape(tok)}\b', meta_text)
+        )
+        if saas_combo_hits >= 2 and any(
+            core in meta_text for core in ('software', 'saas', 'platform', 'infrastructure', 'payments', 'crm', 'fintech')
+        ):
+            return 'SaaS / Marketplace / Tech Platform', 'high'
+
+    ecom_keywords = (
+        'інтернет-магазин', 'интернет-магазин', 'онлайн магазин', 'online store',
+        'купити', 'купить', 'купуй', 'доставка по', 'колекція', 'бренд одягу',
+        'бренд взуття', 'жіночого одягу', 'женского белья', 'каталог товарів',
+        'add to cart', 'кошик', 'shoes', 'apparel', 'clothing',
+        'млн товарів', 'знижки до', 'кешбек', 'доставка ліків', 'замовити ліки',
+        'аптека', 'apteka', 'ліки', 'pharmacy', 'онлайн-аптека', 'медикаменти',
+        'onlineshop', 'online-shop', 'warenkorb', 'versandkostenfrei', 'jetzt kaufen', 'bestellen',
+        'parfümerie', 'parfumerie', 'drogerie', 'outdoor', 'klettern', 'bergfreunde', 'musikhaus',
+        'boutique en ligne', 'livraison gratuite', 'panier', 'acheter en ligne', 'magasin en ligne',
+        'tienda online', 'carrito', 'envío gratis', 'comprar online', 'tienda en línea',
+        'negozio online', 'carrello', 'spedizione gratuita', 'acquista online', 'shopping online',
+        'webwinkel', 'webshop', 'winkelwagen', 'gratis verzending', 'bestel online',
+        'sklep internetowy', 'koszyk', 'darmowa dostawa', 'kup teraz', 'zakupy online',
+        'loja online', 'frete grátis', 'carrinho', 'comprar agora',
+        'webbutik', 'varukorg', 'fri frakt', 'handla online', 'nettbutikk', 'handlekurv',
+        'fashion', 'fashion online', 'accessories', 'footwear', 'sportswear', 'streetwear',
+        'skincare', 'makeup', 'fragrance', 'cosmetics', 'beauty products', 'body care', 'shorts', 'swimwear',
+        'mode', 'bekleidung', 'kleidung', 'schuhe', 'taschen', 'accessoires',
+        'damenmode', 'herrenmode', 'online-shop für mode', 'top-marken', 'versandapotheke', 'online-apotheke',
+        'prêt-à-porter', 'vêtements', 'chaussures', 'sacs', 'mode en ligne',
+        'moda', 'abbigliamento', 'scarpe', 'borse', 'moda online',
+        'kleding', 'schoenen', 'tassen', 'modewinkel',
+        'odzież', 'buty', 'torebki', 'moda online',
+        'ropa', 'zapatos', 'bolsos', 'moda mujer', 'vestuário', 'calçado'
+    )
+    has_product_schema = (
+        '"@type":"product"' in html_low
+        or '"@type": "product"' in html_low
+        or 'og:type" content="product"' in html_low
+    )
+    if (
+        is_explicit_retail
+        or any(cms in (detected_tech or []) for cms in ('Shopify', 'WooCommerce', 'Magento', 'Shopware'))
+        or has_product_schema
+        or any(k in text for k in ecom_keywords)
+    ):
+        return 'E-commerce / Retail Brand', 'high'
+
+    secondary_saas_keywords = (
+        'майданчик', 'тендер', 'prozorro', 'прозорро', 'закупівлі', 'mobility app',
+        'marketing performance platform', 'email service', 'automation service', 'chatbot',
+        'seo', 'serp', 'keyword', 'keywords', 'backlink', 'backlinks', 'site audit', 'rank tracker',
+        'customer communication', 'omnichannel', 'project tracking', 'task management',
+    )
+    if any(k in text for k in secondary_saas_keywords):
+        return 'SaaS / Marketplace / Tech Platform', 'high'
+
+    spa_ecom_markers = (
+        'cdn.shopify.com',
+        'myshopify.com',
+        'window.shopify',
+        'shopify.theme',
+        '/cart.js',
+        '"cart"',
+        '"variant"',
+        'add to cart',
+        'add-to-cart',
+        'addtocart',
+    )
+    spa_hits = sum(1 for m in spa_ecom_markers if m in html_low or m in text)
+    if spa_hits >= 2:
+        return 'E-commerce / Retail Brand', 'medium'
+
+    has_commercial_stack = (
+        'AW-' in (html_sample or '')
+        or 'snap.licdn.com' in html_low
+        or 'googleadservices.com' in html_low
+        or any(t in (detected_tech or []) for t in ('Google Ads Conversion', 'LinkedIn Insight Tag', 'Meta Pixel', 'TikTok Pixel', 'Intercom'))
+    )
+    is_explicit_npo = (
+        dom_low.endswith(('.edu', '.edu.ua', '.ac.uk', '.gov', '.gov.ua', '.org', '.org.ua', '.gob.es', '.gouv.fr'))
+        or any(
+            phrase in text for phrase in (
+                'благодійний фонд', 'charitable foundation', 'громадська організація',
+                'gemeinnützige', 'eingetragener verein', 'association loi 1901',
+                'fundación sin ánimo de lucro', 'fondazione onlus', 'stichting',
+                'fundacja', 'stowarzyszenie', 'allmännyttig stiftelse'
+            )
+        )
+    )
+
+    if is_explicit_npo or (
+        not has_commercial_stack and any(
+            re.search(rf'\b{re.escape(w)}\b', text) for w in (
+                'університет', 'university', 'college', 'академія', 'інститут', 'ngo',
+                'universität', 'hochschule', 'université', 'universidad', 'università',
+                'universiteit', 'uniwersytet', 'universidade'
+            )
+        )
+    ):
+        return 'Non-Profit / Education / Institution', 'high' if is_explicit_npo else 'medium'
+
+    if has_commercial_stack:
+        if any(k in text for k in ('platform', 'software', 'app', 'apps', 'cloud', 'security system', 'analytics')):
+            return 'SaaS / Marketplace / Tech Platform', 'medium'
+        return 'General Business / Corporate', 'high'
+
+    return 'General Business / Corporate', 'medium'
+
+
+def is_scan_failed_completeness(
+    scan_completeness: str | None,
+    fail_status: str | None = None,
+    err_msg: str = '',
+) -> bool:
+    """
+    v24.5 (Крок 2 P0): Повертає True, якщо сканування було заблоковано, перервано таймаутом
+    або повернуло HTTP 404/403/429. Для таких записів усі числові оцінки примусово скидаються в `None`
+    (`null`), а статус виставляється в `UNVERIFIED_SCAN_FAILED`.
+    """
+    comp = (scan_completeness or '').strip().lower()
+    if comp in SCAN_FAILED_COMPLETENESS:
+        return True
+    if derive_scan_failure_class(fail_status, err_msg) is not None:
+        return True
+    return False
 
 
 def remaining_run_seconds() -> float | None:
@@ -421,22 +696,15 @@ def derive_human_contact_tier(contact_quality_tier: str | None, company_category
 
 
 def derive_scan_failure_class(fail_status: str | None, err_msg: str = '') -> str | None:
-    """
-    Класифікує технічно невдалі сканування окремо від некваліфікованих лідів:
-      - `scan_failed_waf_block` (HTTP 403 / 429 / 404 / 503 / WAF / SSL block)
-      - `scan_failed_timeout` (таймаут завантаження або бюджету виконання)
-      - `scan_failed_dns_error` (NXDOMAIN / DNS / unreachable)
-    Для цих класів усі скорингові поля встановлюються в `None` (`null`), а статус — `SCAN_FAILED`.
-    """
     st = (fail_status or '').lower().strip()
     err = (err_msg or '').lower()
     if not st or st in ('success', 'no_contacts_found', 'ssrf_blocked') or st.startswith(('cached_', 'seeded_')):
         return None
-    if st in ('timeout', 'run_timeout_unfinished') or 'timeout' in st or 'timed out' in err or 'budget' in err:
+    if st in ('timeout', 'run_timeout_unfinished', 'partial_timeout') or 'timeout' in st or 'timed out' in err or 'budget' in err:
         return 'scan_failed_timeout'
     if st in ('dns_error', 'unreachable') or 'nxdomain' in err or 'could not resolve' in err:
         return 'scan_failed_dns_error'
-    if st in ('blocked', 'ssl_error') or st.startswith('http_') or any(
+    if st in ('blocked', 'ssl_error', 'partial_blocked', 'partial_empty_render') or st.startswith('http_') or any(
         k in err for k in ('403', '429', '404', '503', 'waf', 'captcha', 'denied')
     ):
         return 'scan_failed_waf_block'
@@ -493,11 +761,6 @@ def domain_weight(item: tuple[str, str, list[str]]) -> int:
 
 
 def contact_link_priority(url: str) -> int:
-    """
-    v24.4: Пріоритет №0 — сторінки команд, керівництва та прес-центрів
-    (/team, /leadership, /management, /people, /press, /newsroom)
-    для максимізації виявлення операційних маркетологів (CMO / Head of Digital / E-commerce Director).
-    """
     path = urlparse(url).path.lower()
     if any(k in path for k in ('team', 'leadership', 'management', 'executive', 'people', 'komanda', 'kerivnytstvo', 'equipe')):
         return 0
@@ -727,12 +990,13 @@ def build_safe_cache_payload(result_record: dict, prior_cached: dict | None = No
 
 def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     """
-    v24.4: 156-колонкова заглушка для таймауту зі статусом `sales_readiness_status = 'SCAN_FAILED'`,
+    v24.5: 156-колонкова заглушка для таймауту зі статусом `sales_readiness_status = 'UNVERIFIED_SCAN_FAILED'`,
     класом `scan_failed_timeout` та `None` (`null`) у всіх 8 числових оцінках.
     """
     aliases_str = '; '.join(aliases) if aliases else domain_key
     clean_url = f'https://{domain_key}/'
     stub_jur = derive_gdpr_jurisdiction(domain_key)
+    cat, cat_conf = classify_company_category(domain_key, '', '', [])
     return {
         'input_domain': domain_key,
         'canonical_domain': domain_key,
@@ -745,7 +1009,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'cached_snapshot_source': 'none (run_timeout)',
         'cached_snapshot_age_days': None,
         'error_message': 'Domain processing exceeded run time budget',
-        'sales_readiness_status': 'SCAN_FAILED',
+        'sales_readiness_status': 'UNVERIFIED_SCAN_FAILED',
         'account_potential_score': None,
         'evidence_confidence_score': None,
         'sales_readiness_score': None,
@@ -757,10 +1021,10 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'contactability_level': 'unreached',
         'dm_buyer_fit_status': 'no_dm_found',
         'outreach_compliance_block': 'none',
-        'sales_readiness_verdict': 'Scan Failed — Timeout (Run Time Budget Exceeded)',
+        'sales_readiness_verdict': 'Unverified — Scan Failed (Run Time Budget Exceeded)',
         'sales_actionability_class': 'scan_failed_timeout',
-        'company_category': 'General Business / Corporate',
-        'category_confidence': 'low',
+        'company_category': cat,
+        'category_confidence': cat_conf,
         'marketplace_platform': domain_key in KNOWN_MARKETPLACE_DOMAINS,
         'marketplace_platform_pollution_detected': False,
         'icp_fit_tier': 'Unverified (Timeout)',
@@ -856,7 +1120,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'xhr_fetch_traffic_analyzed': False,
         'xhr_fetch_requests_inspected': 0,
         'xhr_first_party_collect_endpoints': [],
-        'server_side_tracking_assessment': 'not_checked',
+        'server_side_tracking_assessment': 'SERVER_SIDE_TRACKING_STATUS_UNKNOWN',
         'account_scale_tier': None,
         'account_scale_basis': [],
         'martech_stack_tier': None,
