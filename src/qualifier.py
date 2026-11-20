@@ -98,7 +98,7 @@ EXACT_TLD_TO_TZ_AND_LANG: Dict[str, Tuple[str, str]] = {
 NAME_TOKEN_RE = re.compile(r"[a-zа-яіїєґäöüß]{3,}", re.IGNORECASE)
 CYRILLIC_TEXT_RE = re.compile(r"[а-яіїєґА-ЯІЇЄҐ]{3,}")
 
-# v24.3: Суворо розділені MarTech-інструменти (без локалей, SKU та CDN)
+# v24.4: Суворо підтверджені MarTech-платформи (без CDN, сертифікатів, локалей та CSP-allowlist)
 ENTERPRISE_STACK_TOOLS: Set[str] = {
     "Adobe Analytics", "Salesforce", "Salesforce Marketing Cloud", "Segment", "Tealium",
     "Shopify Plus", "Dynamic Yield", "Optimizely", "Braze", "Snowplow",
@@ -114,7 +114,7 @@ MID_MARKET_STACK_TOOLS: Set[str] = {
 
 
 # ==============================================================================
-# v24.3 Enterprise MarTech & Account Intelligence: VIES, RDAP, Scale vs Stack, 3 Axes
+# v24.4 Enterprise MarTech & Account Intelligence: VIES, RDAP, Scale vs Stack
 # ==============================================================================
 
 async def verify_eu_entity_vies_and_gleif(
@@ -288,11 +288,6 @@ def classify_account_scale_tier(
     ads_active_last_30d: Optional[bool] = None,
     is_marketplace: bool = False,
 ) -> Dict[str, Any]:
-    """
-    v24.3: Окрема метрика масштабу бізнесу (`account_scale_tier`), повністю відокремлена
-    від технологічної зрілості MarTech (`martech_stack_tier`).
-    Базується на кількості ринків, локалей hreflang, розмірі каталогу SKU, активному наймі та рекламі.
-    """
     basis: List[str] = []
     if is_marketplace:
         basis.append("Multi-brand marketplace / large platform")
@@ -346,14 +341,9 @@ def classify_martech_stack_tier(
     tech_verification_tiers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    v24.3: Чиста оцінка технологічної зрілості MarTech (`Enterprise` / `Mid-Market` / `SMB` /
-    `Unverified / Minimal`), що ґрунтується ВИКЛЮЧНО на підтверджених MarTech-інструментах
-    у коді або рантаймі (без локалей, SKU, CDN та `allowlisted_in_csp`).
-      - Enterprise: Adobe Analytics, Salesforce, Segment, Tealium, sGTM, Braze, Dynamic Yield,
-        Optimizely, Snowplow, Shopify Plus тощо.
-      - Mid-Market: HubSpot, Klaviyo, Amplitude, Mixpanel, Zendesk, Gorgias, Shopware, Magento
-        або зв'язка GA4 + GTM.
-      - SMB: базові пікселі або CMS без виділеної Mid-Market/Enterprise архітектури.
+    v24.4: Оцінює зрілість MarTech-стеку ВИКЛЮЧНО за підтвердженими MarTech-платформами
+    (`runtime_verified` або `configured_in_code`) — повністю ігнорує CDN, TLS/VMC сертифікати,
+    локалі hreflang та `allowlisted_in_csp`.
     """
     tiers_map = tech_verification_tiers or {}
     confirmed = sorted(
@@ -391,6 +381,40 @@ def classify_martech_stack_tier(
         "martech_stack_tier": tier,
         "martech_stack_tier_basis": basis[:6],
     }
+
+
+def extract_buying_intent_signals(
+    hiring_marketing_or_data_roles: Optional[bool] = None,
+    open_positions_total: Optional[int] = None,
+    ads_active_last_30d: Optional[bool] = None,
+    active_ad_formats: Optional[List[str]] = None,
+    recent_change_triggers: Optional[List[str]] = None,
+    primary_sales_gap: Optional[str] = None,
+    sales_gap_confidence: Optional[str] = None,
+) -> List[str]:
+    """
+    v24.4 Buying Intent Signals (P1):
+    Агрегує реальні комерційні тригери наміру купівлі:
+      - найм на ролі Marketing / Analytics / Data;
+      - активний масовий найм за ATS-фідами;
+      - верифікована активна реклама Google Ads (30d);
+      - зафіксована зміна ЛПР або технологічного стеку (`recent_change_triggers`);
+      - технічно підтверджений розрив атрибуції (`issue_confirmed`).
+    """
+    signals: List[str] = []
+    if hiring_marketing_or_data_roles is True:
+        signals.append("HIRING_MARKETING_OR_DATA_ROLES")
+    if open_positions_total is not None and int(open_positions_total) >= 5:
+        signals.append(f"ACTIVE_HIRING ({int(open_positions_total)} open roles)")
+    if ads_active_last_30d is True:
+        fmts = ", ".join((active_ad_formats or [])[:3]) or "Search"
+        signals.append(f"ACTIVE_GOOGLE_ADS_30D ({fmts})")
+    if primary_sales_gap and sales_gap_confidence == "issue_confirmed":
+        signals.append(f"CONFIRMED_TECH_GAP: {primary_sales_gap}")
+    for trig in (recent_change_triggers or []):
+        if trig and trig not in signals:
+            signals.append(str(trig))
+    return signals[:8]
 
 
 def resolve_prospect_timezone_and_locale_v23(
@@ -525,7 +549,7 @@ def compute_account_change_triggers_v23(
 
 
 # ==============================================================================
-# v24.3: 3 Розділені Осі Скорингу (Account Fit / Technical Opportunity / Sales Actionability)
+# v24.4: Програмний комплаєнс-гардрейл та 3 Незалежні Осі Скорингу
 # ==============================================================================
 
 def is_impressum_cold_email_blocked(
@@ -540,7 +564,71 @@ def is_impressum_cold_email_blocked(
     )
 
 
-def compute_account_fit_score(
+def is_cold_email_compliance_blocked(
+    gdpr_jurisdiction: str | None,
+    data_source_sensitivity: str | None,
+    canonical_domain: str = '',
+    country_hint: str = '',
+    has_confirmed_legitimate_interest: bool = False,
+) -> Tuple[bool, str]:
+    """
+    v24.4: Програмна перевірка заборони холодного email-аутрічу:
+      1. `eu_impressum_cold_email_blocked` — EU_EEA_GDPR + дані з Impressum без opt-in.
+      2. `de_at_uwg7_cold_email_blocked` — Німеччина / Австрія (`.de`, `.at` або country_hint DE/AT)
+         згідно з жорсткою вимогою §7 UWG (холодний B2B email заборонено без попередньої згоди).
+    """
+    if has_confirmed_legitimate_interest:
+        return False, 'none'
+    if is_impressum_cold_email_blocked(gdpr_jurisdiction, data_source_sensitivity, False):
+        return True, 'eu_impressum_cold_email_blocked'
+    dom_low = (canonical_domain or '').strip().lower()
+    cc_up = (country_hint or '').strip().upper()
+    if dom_low.endswith(('.de', '.at')) or cc_up in ('DE', 'AT'):
+        return True, 'de_at_uwg7_cold_email_blocked'
+    return False, 'none'
+
+
+def enforce_outreach_compliance_guardrail(
+    next_best_action: str,
+    compliance_block_code: str,
+    dm_name: str | None = None,
+    dm_role: str | None = None,
+    dm_buyer_fit_status: str = 'no_dm_found',
+    has_company_li_people: bool = True,
+) -> str:
+    """
+    v24.4 Programmatic Post-Filter (P0/P1):
+    Якщо активовано будь-який комплаєнс-блок (`eu_impressum_cold_email_blocked` або
+    `de_at_uwg7_cold_email_blocked`), жорстко перезаписує `next_best_action`, повністю
+    виключаючи будь-які рекомендації щодо email-аутрічу та залишаючи виключно LinkedIn / теплий інтро.
+    """
+    if not compliance_block_code or compliance_block_code == 'none':
+        return next_best_action
+
+    li_hint = (
+        'company_linkedin_people_url or decision_maker_search_query'
+        if has_company_li_people
+        else 'decision_maker_search_query'
+    )
+    if dm_name and dm_buyer_fit_status == 'direct_marketing_buyer':
+        target_desc = f'{dm_name} ({dm_role})'
+    elif dm_name:
+        target_desc = f'Head of Marketing / Head of Digital (or request warm LinkedIn intro via {dm_role or "CEO"} {dm_name})'
+    else:
+        target_desc = 'Head of Marketing / Head of Digital'
+
+    reason_lbl = (
+        'EU/DE Impressum (§7 UWG & DSK)'
+        if compliance_block_code == 'eu_impressum_cold_email_blocked'
+        else 'DE/AT §7 UWG strict opt-in law'
+    )
+    return (
+        f'COMPLIANCE BLOCK ({reason_lbl}): Unsolicited cold email is programmatically blocked. '
+        f'Connect with {target_desc} via LinkedIn only ({li_hint}) or obtain prior written opt-in / warm intro.'
+    )
+
+
+def compute_account_potential_score(
     company_category: str,
     account_scale_tier: str = 'SMB / Local Scale',
     martech_stack_tier: str = 'SMB',
@@ -549,11 +637,12 @@ def compute_account_fit_score(
     ads_active_last_30d: Optional[bool] = None,
     open_positions_total: Optional[int] = None,
     hiring_marketing_or_data_roles: Optional[bool] = None,
+    buying_intent_count: int = 0,
 ) -> int:
     """
-    Вісь 1 — Account Fit (0–100):
-    Масштаб бізнесу (`account_scale_tier`), відповідність ICP, мультинаціональність, розмір каталогу,
-    зрілість стеку, живий рекламний бюджет та найм.
+    Вісь 1 (v24.4) — Account Potential Score (0–100):
+    Наскільки компанія комерційно приваблива (ICP, масштаб, підтверджений MarTech-стек,
+    жива реклама Google Ads, найм та Buying Intent Signals) — незалежно від якості контактів.
     """
     if company_category == 'Non-Profit / Education / Institution':
         return 5
@@ -568,19 +657,10 @@ def compute_account_fit_score(
     elif company_category == 'B2B Agency / Marketing Media':
         score += 20
 
-    scale_pts = {
-        'Enterprise Scale': 20,
-        'Mid-Market Scale': 14,
-        'SMB / Local Scale': 8,
-    }
+    scale_pts = {'Enterprise Scale': 20, 'Mid-Market Scale': 14, 'SMB / Local Scale': 8}
     score += scale_pts.get(account_scale_tier, 8)
 
-    stack_pts = {
-        'Enterprise': 14,
-        'Mid-Market': 11,
-        'SMB': 6,
-        'Unverified / Minimal': 2,
-    }
+    stack_pts = {'Enterprise': 14, 'Mid-Market': 11, 'SMB': 6, 'Unverified / Minimal': 2}
     score += stack_pts.get(martech_stack_tier, 2)
 
     if estimated_markets_count >= 10:
@@ -606,6 +686,105 @@ def compute_account_fit_score(
     elif open_positions_total is not None and int(open_positions_total) >= 3:
         score += 5
 
+    score += min(6, int(buying_intent_count or 0) * 2)
+    return max(0, min(100, score))
+
+
+def compute_account_fit_score(
+    company_category: str,
+    account_scale_tier: str = 'SMB / Local Scale',
+    martech_stack_tier: str = 'SMB',
+    estimated_markets_count: int = 1,
+    catalog_estimated_skus: Optional[int] = None,
+    ads_active_last_30d: Optional[bool] = None,
+    open_positions_total: Optional[int] = None,
+    hiring_marketing_or_data_roles: Optional[bool] = None,
+) -> int:
+    return compute_account_potential_score(
+        company_category,
+        account_scale_tier,
+        martech_stack_tier,
+        estimated_markets_count,
+        catalog_estimated_skus,
+        ads_active_last_30d,
+        open_positions_total,
+        hiring_marketing_or_data_roles,
+        buying_intent_count=0,
+    )
+
+
+def compute_evidence_confidence_score(
+    scan_completeness: str = 'full',
+    techs_count: int = 0,
+    confirmed_martech_count: int = 0,
+    xhr_fetch_traffic_analyzed: bool = False,
+    pw_status_str: str = 'not_needed',
+    tls_trust_status: str = 'not_checked',
+    best_email_confidence: str = 'NONE',
+    sales_gap_confidence: Optional[str] = None,
+    is_cached_or_seed: bool = False,
+) -> int:
+    """
+    Вісь 2 (v24.4) — Evidence Confidence Score (0–100):
+    Наскільки ми об'єктивно впевнені у зібраних даних:
+      - повнота сканування (`full` vs `partial_*`);
+      - кількість підтверджених у коді/рантаймі MarTech-платформ (без CSP-only);
+      - виконання аналізу XHR/Fetch трафіку Playwright;
+      - серверна верифікація email (`M365_AD_VERIFIED` / `SMTP_API_VERIFIED`);
+      - рівень доказовості технічної проблеми (`issue_confirmed` > `issue_suspected`);
+      - штрафи за таймаути/помилки Playwright та TLS.
+    """
+    score = 0
+    if scan_completeness == 'full':
+        score += 34
+    elif scan_completeness in ('partial_gtm', 'partial_cached'):
+        score += 18
+    elif scan_completeness == 'partial_csp_headers':
+        score += 8
+    else:
+        score += 4
+
+    if confirmed_martech_count >= 3:
+        score += 18
+    elif confirmed_martech_count >= 1:
+        score += 10
+    elif techs_count >= 1:
+        score += 4
+
+    if xhr_fetch_traffic_analyzed:
+        score += 16
+
+    if best_email_confidence in ('M365_AD_VERIFIED', 'SMTP_API_VERIFIED'):
+        score += 18
+    elif best_email_confidence == 'OBSERVED_ON_SITE':
+        score += 9
+    elif best_email_confidence == 'GRAVATAR_OR_PGP_MATCH':
+        score += 6
+
+    if sales_gap_confidence == 'issue_confirmed':
+        score += 14
+    elif sales_gap_confidence == 'issue_suspected':
+        score += 8
+    elif sales_gap_confidence == 'server_side_tracking_not_detected_in_client':
+        score += 3
+
+    pw_low = (pw_status_str or '').lower()
+    pw_err = any(tok in pw_low for tok in ('timeout', 'error', 'blocked', 'empty', 'rejected', 'failed'))
+    tls_low = (tls_trust_status or '').lower()
+    tls_err = tls_low in ('tls_timeout', 'tls_handshake_failed', 'unreachable')
+
+    if pw_err:
+        score -= 18
+    if tls_err:
+        score -= 10
+    if is_cached_or_seed:
+        score -= 10
+
+    if scan_completeness != 'full':
+        score = min(score, 62)
+    if pw_err or tls_err:
+        score = min(score, 68)
+
     return max(0, min(100, score))
 
 
@@ -618,12 +797,6 @@ def compute_technical_opportunity_score(
     red_flags_count: int = 0,
     xhr_fetch_traffic_analyzed: bool = False,
 ) -> int:
-    """
-    Вісь 2 — Technical Opportunity (0–100):
-    Враховує підтверджені баги (`DUPLICATE_GA4_TRACKING`, `EU_CONSENT_MODE_V2_GAP`) та
-    рівень доказовості відсутності sGTM (вищий бал, коли XHR/Fetch/Ping трафік реально
-    проінспектовано в Playwright, нижчий — якщо сканувався лише статичний HTML).
-    """
     if company_category == 'Non-Profit / Education / Institution':
         return 0
 
@@ -738,20 +911,124 @@ def compute_sales_actionability_score(
     return max(0, min(100, score))
 
 
-def compute_actionable_priority_score(
-    account_fit_score: int,
+def compute_sales_readiness_score(
+    company_category: str,
+    dm_buyer_fit_status: str,
+    contactability_level: str,
+    evidence_confidence_score: int,
     technical_opportunity_score: int,
-    sales_actionability_score: int,
+    best_email_confidence: str = 'NONE',
+    compliance_blocked: bool = False,
+    has_company_li_people: bool = False,
+    buying_intent_count: int = 0,
+) -> int:
+    """
+    Вісь 3 (v24.4) — Sales Readiness Score (0–100):
+    Зважена оцінка готовності ліда до передачі у відділ продажів:
+      - операційний покупець (`direct_marketing_buyer`), а не лише CEO;
+      - валідний канал зв'язку;
+      - рівень доведеності даних (`evidence_confidence_score`);
+      - юридичний дозвіл на контакт (`not compliance_blocked`).
+    Жорсткі стелі гарантують, що акаунти з низькою впевненістю даних (<35),
+    лише з CEO (`<=64`) або під комплаєнс-блоком (`<=58`) НЕ отримують статус `SALES_READY`.
+    """
+    if company_category == 'Non-Profit / Education / Institution':
+        return 0
+
+    score = 0
+    if dm_buyer_fit_status == 'direct_marketing_buyer':
+        score += 38
+    elif dm_buyer_fit_status == 'escalation_needed_via_ceo':
+        score += 16
+    elif contactability_level == 'role_inbox_ready':
+        score += 18
+    elif contactability_level == 'gatekeeper_only':
+        score += 8
+
+    if contactability_level == 'direct_dm_verified':
+        score += 20 if best_email_confidence in ('M365_AD_VERIFIED', 'SMTP_API_VERIFIED') else 14
+    elif contactability_level == 'role_inbox_ready':
+        score += 14
+    elif contactability_level == 'gatekeeper_only':
+        score += 6
+    if has_company_li_people:
+        score += 4
+
+    score += int(round(technical_opportunity_score * 0.18))
+    score += int(round(evidence_confidence_score * 0.14))
+    score += min(6, int(buying_intent_count or 0) * 2)
+
+    if dm_buyer_fit_status == 'escalation_needed_via_ceo':
+        score = min(score, 64)
+    if dm_buyer_fit_status == 'no_dm_found' and contactability_level != 'role_inbox_ready':
+        score = min(score, 48)
+    if evidence_confidence_score < 35:
+        score = min(score, 35)
+    if compliance_blocked:
+        score = min(score - 15, 58)
+    if company_category == 'B2B Agency / Marketing Media':
+        score = min(score, 55)
+
+    return max(0, min(100, score))
+
+
+def derive_sales_readiness_status(
+    company_category: str,
+    account_potential_score: int,
+    evidence_confidence_score: int,
+    sales_readiness_score: int,
+    dm_buyer_fit_status: str,
+    compliance_blocked: bool = False,
+) -> str:
+    """
+    v24.4 Суворий комерційний статус готовності ліда:
+      - `SALES_READY`: лише при `sales_readiness_score >= 70`, `evidence_confidence_score >= 55`,
+        наявності операційного маркетолога (`direct_marketing_buyer`) та відсутності юридичного блоку.
+      - `ESCALATION_NEEDED`: знайдено лише CEO / Founder / Managing Director (`escalation_needed_via_ceo`).
+      - `RESEARCH_PRIORITY`: високий потенціал (`account_potential_score >= 55`), але бракує
+        операційного покупця, впевненості даних або діє комплаєнс-блок email.
+      - `PARTNER_PIPELINE`: B2B-агенція / медіа.
+      - `DISQUALIFIED`: некомерційна / освітня установа.
+      - `UNVERIFIED`: низький потенціал та недостатньо доказів.
+    """
+    if company_category == 'Non-Profit / Education / Institution':
+        return 'DISQUALIFIED'
+    if company_category == 'B2B Agency / Marketing Media':
+        return 'PARTNER_PIPELINE'
+    if (
+        sales_readiness_score >= 70
+        and evidence_confidence_score >= 55
+        and dm_buyer_fit_status == 'direct_marketing_buyer'
+        and not compliance_blocked
+    ):
+        return 'SALES_READY'
+    if dm_buyer_fit_status == 'escalation_needed_via_ceo':
+        return 'ESCALATION_NEEDED'
+    if account_potential_score >= 55:
+        return 'RESEARCH_PRIORITY'
+    return 'UNVERIFIED'
+
+
+def compute_actionable_priority_score(
+    account_potential_score: int,
+    evidence_confidence_score: int,
+    sales_readiness_score: int,
     company_category: str = '',
 ) -> int:
+    """
+    Зведений рейтинг черги (0–100) із домінуванням `sales_readiness_score` (55%),
+    щоб акаунти з низькою якістю даних не виходили на високий пріоритет (~60).
+    """
     if company_category == 'Non-Profit / Education / Institution':
         return 5
 
     raw = (
-        (sales_actionability_score * 0.40)
-        + (technical_opportunity_score * 0.35)
-        + (account_fit_score * 0.25)
+        (sales_readiness_score * 0.55)
+        + (evidence_confidence_score * 0.25)
+        + (account_potential_score * 0.20)
     )
+    if evidence_confidence_score < 35:
+        raw = min(raw, 38)
     return max(0, min(100, int(round(raw))))
 
 
@@ -852,7 +1129,7 @@ def classify_company_category(
         'customer communication', 'customer data platform', 'cdp',
         'omnichannel', 'no-code', 'low-code', 'workflow automation',
         'serpstat', 'weblium', 'esputnik', 'creatio', 'helpcrunch',
-        'pipedrive', 'typeform', 'gorgias', 'personio', 'airslate', 'preply'
+        'pipedrive', 'typeform', 'gorgias', 'personio', 'airslate', 'preply', 'zapier'
     )
     if any(k in text for k in saas_keywords):
         return 'SaaS / Marketplace / Tech Platform', 'high'
@@ -971,14 +1248,6 @@ def compute_data_quality_score(
     best_email_confidence: str = 'NONE',
     email_deliverability_check: str | None = None,
 ) -> int:
-    """
-    v24.3 Чесний Data Quality Score (0–100):
-      1. Знижує оцінку при таймаутах/помилках Playwright (-15) та TLS (-10).
-      2. Максимальний бал (85–100) доступний ЛИШЕ за серверної верифікації пошти
-         (`domain_mail_configured` + `M365_AD_VERIFIED` або `SMTP_API_VERIFIED`).
-      3. Профільні збіги (`GRAVATAR_OR_PGP_MATCH`) та `OBSERVED_ON_SITE` без серверної
-         перевірки обмежуються стелею 84 (і <=75 при будь-якому таймауті сканування).
-    """
     if company_category == 'Non-Profit / Education / Institution':
         return 10
 
@@ -1165,12 +1434,12 @@ def build_sales_hook(
     if ads_active_last_30d is True and not has_sgtm:
         formats_str = ', '.join(active_ad_formats) if active_ad_formats else 'Search & Display'
         sgtm_scope_lbl = (
-            'issue_suspected_via_xhr_traffic_audit'
+            'issue_suspected (XHR/Fetch checked; custom API/Worker possible)'
             if xhr_analyzed
             else 'server_side_tracking_not_detected_in_client'
         )
         obs_detail = (
-            "our browser XHR/Fetch traffic check didn't observe first-party /collect or sGTM requests"
+            "our browser XHR/Fetch traffic check didn't observe first-party /collect or Zaraz/sGTM requests"
             if xhr_analyzed
             else "we didn't spot a client-facing sGTM endpoint in the public markup"
         )
@@ -1197,8 +1466,8 @@ def build_sales_hook(
         paid_str = ' + '.join(paid_channels)
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
-            f"Stack: {stack_str} (Server-Side GTM verified){cm_v2_gap_note}. "
-            f"Opening Hook: \"Saw {brand} has {paid_str} tags configured alongside Server-Side GTM — "
+            f"Stack: {stack_str} (Server-Side Tracking verified){cm_v2_gap_note}. "
+            f"Opening Hook: \"Saw {brand} has {paid_str} tags configured alongside server-side tracking — "
             f"how are you currently benchmarking CAPI event match quality and attribution across channels?\""
         )
 
@@ -1220,7 +1489,7 @@ def build_sales_hook(
                 f"Opening Hook: \"Noticed {brand} has {paid_str} tags configured in the EU market without observable "
                 f"Google Consent Mode v2 (gcs/gcd) parameters — have you audited EEA conversion modeling yet?\""
             )
-        sgtm_note = 'issue_suspected_via_xhr_traffic_audit' if xhr_analyzed else 'server_side_tracking_not_detected_in_client'
+        sgtm_note = 'issue_suspected' if xhr_analyzed else 'server_side_tracking_not_detected_in_client'
         return (
             f"{brand} ({company_category}{cms_str}) — Target: {dm_intro}{li_badge}. "
             f"Stack: {stack_str}. Client-side ad tracking tags ({paid_str}) configured on site ({sgtm_note}). "
@@ -1272,6 +1541,8 @@ def evaluate_qualification_v180(
     has_confirmed_legitimate_interest: bool = False,
     dm_buyer_fit_status: str | None = None,
     company_linkedin_people_url: str | None = None,
+    canonical_domain: str = '',
+    country_hint: str = '',
 ) -> tuple[str, str, str, str, str, str, str, str, str]:
     detected_list = tech_info.get('detected_technologies_list', [])
     ad_tags = []
@@ -1324,8 +1595,12 @@ def evaluate_qualification_v180(
 
     is_agency = (company_category == 'B2B Agency / Marketing Media')
     buyer_fit = dm_buyer_fit_status or classify_dm_buyer_fit(dm_name, dm_role)
-    impressum_blocked = is_impressum_cold_email_blocked(
-        gdpr_jurisdiction, data_source_sensitivity, has_confirmed_legitimate_interest
+    compliance_blocked, compliance_block_code = is_cold_email_compliance_blocked(
+        gdpr_jurisdiction,
+        data_source_sensitivity,
+        canonical_domain=canonical_domain,
+        country_hint=country_hint,
+        has_confirmed_legitimate_interest=has_confirmed_legitimate_interest,
     )
 
     if company_category == 'E-commerce / Retail Brand':
@@ -1377,10 +1652,10 @@ def evaluate_qualification_v180(
     )
 
     source_extra_note = ''
-    if impressum_blocked:
+    if compliance_blocked:
         source_extra_note = (
-            ' COMPLIANCE BLOCK: EU/DE Impressum data is legally restricted under §7 UWG & DSK — '
-            'do NOT send unsolicited cold email; use LinkedIn or warm intro.'
+            f' COMPLIANCE BLOCK ({compliance_block_code}): Unsolicited cold email is prohibited under §7 UWG / DSK — '
+            f'use LinkedIn or warm intro only.'
         )
     elif dm_source_is_legal and dm_source_type not in ('impressum_page', 'impressum_page_cached'):
         source_extra_note = ' DM identified from legal/terms document — verify active operational role via LinkedIn before outbound.'
@@ -1543,6 +1818,7 @@ def evaluate_qualification_v180(
             enrichment_status = 'no_public_contacts_found'
             confidence_warning = 'Warning: Zero public contacts on site; requires external B2B enrichment.'
 
+    # Вердикт із жорсткою забороною статусу Sales-Ready для CEO-only або комплаєнс-блоку
     if company_category == 'Non-Profit / Education / Institution':
         readiness_verdict = 'Disqualified (Non-Target Institutional / NGO Segment)'
     elif is_agency:
@@ -1552,32 +1828,31 @@ def evaluate_qualification_v180(
             readiness_verdict = 'Unverified (Playwright Blocked by WAF — Retry with Residential Proxy)'
         else:
             readiness_verdict = 'Unverified (No Tech Signals & No Public Contacts Observed — Needs Manual Review)'
-    elif impressum_blocked:
+    elif compliance_blocked:
         if dm_name and dm_is_direct_mkt_buyer:
-            readiness_verdict = f'LinkedIn / Warm-Intro Only ({dm_name} Identified; Impressum Cold Email Restricted under EU/DE §7 UWG)'
+            readiness_verdict = f'LinkedIn / Warm-Intro Only ({dm_name} Identified; Cold Email Blocked under §7 UWG)'
         elif dm_name:
-            readiness_verdict = f'LinkedIn / Warm-Intro Only (Escalation via {dm_name}; Impressum Cold Email Restricted under EU/DE §7 UWG)'
+            readiness_verdict = f'LinkedIn / Warm-Intro Only (Escalation via {dm_name}; Cold Email Blocked under §7 UWG)'
         else:
-            readiness_verdict = 'LinkedIn / Warm-Intro Only (Impressum Contact Restricted under EU/DE §7 UWG)'
-    elif dm_name and is_same_person_li:
+            readiness_verdict = 'LinkedIn / Warm-Intro Only (Cold Email Restricted under §7 UWG)'
+    elif dm_name and is_same_person_li and dm_is_direct_mkt_buyer:
         if all_signals:
-            readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name} Profile Verified + Tech Stack Confirmed)'
+            readiness_verdict = f'Sales-Ready via LinkedIn Outbound ({dm_name}, {dm_role} Verified + Tech Stack Confirmed)'
         else:
             readiness_verdict = f'Contact-Ready via LinkedIn Outbound ({dm_name} Profile Verified; Tech Stack Unverified — Check Manually)'
     elif dm_name and is_same_person_email and dm_is_direct_mkt_buyer:
-        readiness_verdict = 'Sales-Ready Tier 1 (Verified Marketing Buyer + Matching Direct Email)'
-    elif dm_name and is_same_person_email:
-        readiness_verdict = f'Escalation-Ready via CEO ({dm_name} Verified Direct Email — Request Intro to CMO / Head of Digital)'
+        readiness_verdict = f'Sales-Ready Tier 1 (Verified Marketing Buyer: {dm_name}, {dm_role} + Matching Direct Email)'
+    elif dm_name and not dm_is_direct_mkt_buyer:
+        if is_same_person_email or is_same_person_li:
+            readiness_verdict = f'Escalation-Ready via CEO ({dm_name} Verified — Request Intro to CMO / Head of Digital)'
+        elif is_mp_founder_with_vendor_b2b:
+            readiness_verdict = (
+                f'Escalation-Needed (Marketplace Founder {dm_name} + Commercial B2B Desk — Locate CMO/Head of Digital)'
+            )
+        else:
+            readiness_verdict = f'Escalation-Needed ({dm_name}, {dm_role} Listed — Locate CMO / Head of Digital via LinkedIn)'
     elif best_email_type == 'marketing_or_exec_role' and all_signals and scan_comp != 'partial_csp_headers':
-        readiness_verdict = 'Sales-Ready Tier 2 (Direct Marketing / Executive Role Inbox)'
-    elif dm_name and is_mp_founder_with_vendor_b2b:
-        readiness_verdict = (
-            f'Partnership-Ready Only (Marketplace Founder {dm_name} + Commercial B2B Desk — Locate CMO/Head of Digital for MarTech Pitch)'
-        )
-    elif dm_name and best_email_type in ('b2b_partnerships', 'wholesale_or_sales_inbox'):
-        readiness_verdict = (
-            f'Partnership-Ready + DM Known ({dm_name} + {best_email} — Request Referral to CMO / Head of Digital)'
-        )
+        readiness_verdict = 'Research Priority + Marketing Role Inbox (Locate Named CMO / Head of Digital on LinkedIn)'
     elif not all_signals or scan_comp == 'partial_csp_headers':
         if best_email_type in ('b2b_partnerships', 'marketing_or_exec_role'):
             dm_part = f' + {dm_name}' if dm_name else ''
@@ -1589,14 +1864,10 @@ def evaluate_qualification_v180(
             readiness_verdict = 'Unverified (Support/Non-Sales Contact Only & No Verified Tech Signals)'
     elif best_email_type == 'b2b_partnerships':
         readiness_verdict = 'Partnership-Ready Only (B2B Inbox Found — Needs CMO Referral for Analytics/Tech Pitch)'
-    elif enrichment_status == 'owner_identified_paired_with_brand_webmail':
-        readiness_verdict = f'Gatekeeper-Ready + Owner Known ({dm_name} Identified — Route via Brand Webmail or LinkedIn)'
-    elif dm_name and best_email_type == 'general_office_inbox':
-        readiness_verdict = f'Gatekeeper-Ready + DM Known ({dm_name} Identified — Route via Office Inbox or LinkedIn)'
     elif best_email_type in ('general_office_inbox', 'brand_webmail_general_inbox', 'brand_webmail_support_inbox'):
         readiness_verdict = 'Gatekeeper-Ready Only (Office/Brand Inbox — Locate DM on LinkedIn Before Cold Outbound)'
     else:
-        readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn DM Enrichment Before Outbound)'
+        readiness_verdict = 'Tech-Qualified Account Only (Needs LinkedIn Marketing Buyer Enrichment Before Outbound)'
 
     if is_agency:
         opportunity = (
@@ -1641,21 +1912,6 @@ def evaluate_qualification_v180(
 
     if company_category == 'Non-Profit / Education / Institution':
         next_action = 'Exclude from commercial B2B cold outreach'
-    elif impressum_blocked:
-        target_desc = (
-            f"{dm_name} ({dm_role})"
-            if (dm_name and dm_is_direct_mkt_buyer)
-            else (
-                f"Head of Marketing / Head of Digital (or request warm intro via listed {dm_role or 'CEO'} {dm_name})"
-                if dm_name
-                else "Head of Marketing / Head of Digital"
-            )
-        )
-        blocked_em_ref = f" ({best_email})" if best_email else ""
-        next_action = (
-            f"COMPLIANCE BLOCK (EU/DE §7 UWG & DSK): Do NOT send unsolicited cold email to Impressum address{blocked_em_ref}. "
-            f"Instead, connect with {target_desc} via LinkedIn ({li_nav_hint}) or obtain a warm intro / prior consent."
-        )
     elif is_agency:
         next_action = f"Route to Agency Partnership pipeline; reach out via {best_email or linkedin_url or 'LinkedIn'}{pred_email_clause}{phone_note}"
     elif not all_signals and not best_email and not primary_phone:
@@ -1736,6 +1992,17 @@ def evaluate_qualification_v180(
     else:
         next_action = (
             f"Run {li_nav_hint} in LinkedIn / Apollo{pred_email_clause} to locate marketing decision-maker{phone_note}"
+        )
+
+    # Фінальний програмний пост-фільтр комплаєнсу: унеможливлює пропозицію email при блоці §7 UWG / Impressum
+    if company_category != 'Non-Profit / Education / Institution':
+        next_action = enforce_outreach_compliance_guardrail(
+            next_action,
+            compliance_block_code,
+            dm_name=dm_name,
+            dm_role=dm_role,
+            dm_buyer_fit_status=buyer_fit,
+            has_company_li_people=has_company_li_people,
         )
 
     return (
@@ -1819,6 +2086,7 @@ def build_manual_seed_record(
         'xhr_first_party_collect_endpoints': [],
         'server_side_tracking_assessment': 'not_detected_in_static_html',
         'detected_technologies_list': seed_tech_list,
+        'confirmed_martech_platforms': seed_tech_list,
         'technology_evidence': seed.get('technology_evidence', 'Verified via manual_seed'),
         'technology_evidence_summary': seed.get('technology_evidence_summary', 'GTM, GA4, Meta Pixel (Manual Seed)'),
         'technology_evidence_json': build_evidence_json_from_cached_record(seed, source_label='manual_seed'),
@@ -1828,7 +2096,7 @@ def build_manual_seed_record(
     c_hint = detect_country_hint(canonical_domain, '', '', primary_phone, '')
     jur_str = derive_gdpr_jurisdiction(canonical_domain, primary_phone, c_hint, '')
     data_sens = derive_data_source_sensitivity(dm_src_type, seed.get('email_source_type', 'contact_page'), jur_str)
-    impressum_blk = is_impressum_cold_email_blocked(jur_str, data_sens, False)
+    comp_blk, comp_code = is_cold_email_compliance_blocked(jur_str, data_sens, canonical_domain, c_hint, False)
 
     company_li_people_url = (
         f"{li_url.rstrip('/')}/people/?keywords=marketing"
@@ -1866,6 +2134,8 @@ def build_manual_seed_record(
         has_confirmed_legitimate_interest=False,
         dm_buyer_fit_status=dm_buyer_fit,
         company_linkedin_people_url=company_li_people_url,
+        canonical_domain=canonical_domain,
+        country_hint=c_hint,
     )
 
     sales_hook = build_sales_hook(
@@ -1903,6 +2173,7 @@ def build_manual_seed_record(
     )
     dms_json_str = build_decision_makers_json_from_summary(dms_found_str, seed.get('decision_maker_linkedin_url'), dm_src)
 
+    em_conf = 'OBSERVED_ON_SITE' if best_email else 'NONE'
     dq_score = compute_data_quality_score(
         contact_quality_tier,
         len(seed_tech_list),
@@ -1916,7 +2187,7 @@ def build_manual_seed_record(
         is_same_person_email=verify_person_email_match(dm_name, best_email),
         pw_status_str='not_attempted_manual_seed',
         tls_trust_status='not_checked',
-        best_email_confidence='OBSERVED_ON_SITE' if best_email else 'NONE',
+        best_email_confidence=em_conf,
         email_deliverability_check=deliv_str,
     )
 
@@ -1928,21 +2199,26 @@ def build_manual_seed_record(
         dm_name,
         seed.get('decision_maker_linkedin_url'),
         primary_phone,
-        'OBSERVED_ON_SITE' if best_email else 'NONE',
+        em_conf,
     )
-    acc_fit = compute_account_fit_score(
+    acc_pot = compute_account_potential_score(
         cat, scale_tier_info['account_scale_tier'], stack_tier_info['martech_stack_tier'], 1, None, None
+    )
+    ev_conf = compute_evidence_confidence_score(
+        'full', len(seed_tech_list), len(seed_tech_list), False,
+        'not_attempted_manual_seed', 'not_checked', em_conf, None, is_cached_or_seed=True
     )
     tech_opp = compute_technical_opportunity_score(cat, tech_info, None, None, None, 0, False)
     sales_act = compute_sales_actionability_score(
-        contact_lvl,
-        dm_buyer_fit,
-        'OBSERVED_ON_SITE' if best_email else 'NONE',
-        bool(company_li_people_url),
-        impressum_blk,
-        cat,
+        contact_lvl, dm_buyer_fit, em_conf, bool(company_li_people_url), comp_blk, cat
     )
-    actionable_score = compute_actionable_priority_score(acc_fit, tech_opp, sales_act, cat)
+    sales_readiness = compute_sales_readiness_score(
+        cat, dm_buyer_fit, contact_lvl, ev_conf, tech_opp, em_conf, comp_blk, bool(company_li_people_url), 0
+    )
+    readiness_status = derive_sales_readiness_status(
+        cat, acc_pot, ev_conf, sales_readiness, dm_buyer_fit, comp_blk
+    )
+    actionable_score = compute_actionable_priority_score(acc_pot, ev_conf, sales_readiness, cat)
 
     tz_info = resolve_prospect_timezone_and_locale_v23(
         canonical_domain,
@@ -1966,14 +2242,18 @@ def build_manual_seed_record(
         'cached_snapshot_source': 'manual_seed',
         'cached_snapshot_age_days': age_days,
         'error_message': truncate_error_msg(f'Live {short_err_msg}; served verified manual_seed from {verified_at}'),
+        'sales_readiness_status': readiness_status,
+        'account_potential_score': acc_pot,
+        'evidence_confidence_score': ev_conf,
+        'sales_readiness_score': sales_readiness,
         'data_quality_score': dq_score,
-        'account_fit_score': acc_fit,
+        'account_fit_score': acc_pot,
         'technical_opportunity_score': tech_opp,
         'sales_actionability_score': sales_act,
         'actionable_priority_score': actionable_score,
         'contactability_level': contact_lvl,
         'dm_buyer_fit_status': dm_buyer_fit,
-        'outreach_compliance_block': 'eu_impressum_cold_email_blocked' if impressum_blk else 'none',
+        'outreach_compliance_block': comp_code,
         'sales_readiness_verdict': sales_readiness_verdict,
         'sales_actionability_class': derive_sales_actionability_class(sales_readiness_verdict, cat),
         'company_category': cat,
@@ -2011,14 +2291,14 @@ def build_manual_seed_record(
         'best_email': best_email,
         'email_domain': f'{canonical_domain} (matches_site)' if best_email else None,
         'best_email_type': best_email_type,
-        'best_email_confidence': 'OBSERVED_ON_SITE' if best_email else 'NONE',
+        'best_email_confidence': em_conf,
         'dm_predicted_email': None,
         'dm_predicted_email_status': 'not_generated',
         'email_source_type': seed.get('email_source_type', 'contact_page'),
         'email_source_note': seed.get('email_source_note', 'Verified via manual audit seed'),
         'named_email_owner_role_hint': None,
         'email_deliverability_check': deliv_str,
-        'email_verification_confidence': 'OBSERVED_ON_SITE' if best_email else 'NONE',
+        'email_verification_confidence': em_conf,
         'all_emails_deliverability': all_emails_deliv_str,
         'all_emails_classification': all_emails_class_str,
         'email_source_url': seed.get('email_source_url', clean_website_url),
@@ -2073,6 +2353,7 @@ def build_manual_seed_record(
         'all_ga4_ids': tech_info['all_ga4_ids'],
         'all_ga4_ids_count': 1 if tech_info['all_ga4_ids'] else None,
         'detected_technologies': seed.get('detected_technologies'),
+        'confirmed_martech_platforms': seed_tech_list,
         'detected_payment_gateways': [],
         'xhr_fetch_traffic_analyzed': False,
         'xhr_fetch_requests_inspected': 0,
@@ -2082,6 +2363,7 @@ def build_manual_seed_record(
         'account_scale_basis': scale_tier_info['account_scale_basis'],
         'martech_stack_tier': stack_tier_info['martech_stack_tier'],
         'martech_stack_tier_basis': stack_tier_info['martech_stack_tier_basis'],
+        'buying_intent_signals': [],
         'estimated_markets_count': 1,
         'detected_market_locales': [],
         'catalog_estimated_skus': None,
