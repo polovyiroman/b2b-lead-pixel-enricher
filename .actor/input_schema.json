@@ -1,167 +1,171 @@
 {
-  "title": "B2B MarTech & Account Intelligence Enricher (v24.1)",
-  "description": "Built for MarTech/Analytics Agencies, Performance Agencies, CRO Consultants & MarTech SaaS Vendors: deep GTM container unpacking, runtime GA4 duplicate detection, sGTM & EU Consent Mode v2 gap analysis, Google Ads Transparency active spend verification, multi-ATS hiring feeds (Greenhouse/Lever/Workable/SmartRecruiters/Personio), market scale signals, composite actionable_priority_score, 1-click LinkedIn Marketing People links, and GDPR / German §7 UWG compliance.",
+  "title": "B2B Lead Tech Stack, Pixel & Decision-Maker Enricher (v24.2)",
+  "description": "Pilot-ready B2B MarTech & Account Intelligence engine: 3-axis scoring (Account Fit, Technical Opportunity, Sales Actionability), first-party sGTM detection, operational Marketing Buyer targeting, and EU/DE §7 UWG compliance guardrails.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "domains": {
-      "sectionCaption": "1. Target Domains, Scan Mode & Output Format",
-      "sectionDescription": "Provide target company domains or URLs to audit their MarTech stack, ad spend signals, business scale, hiring feeds, and outbound contacts.",
-      "title": "Target Domains / URLs",
+      "title": "Target Company Domains",
       "type": "array",
-      "description": "List of company domains or URLs to enrich (e.g., 'notino.de', 'yakaboo.ua', 'bergfreunde.de', 'stls.store').",
+      "description": "List of company domains or URLs to audit (e.g., breuninger.com, pipedrive.com, vovk.com). Supports bulk paste of 200+ domains with automatic canonical deduplication and holding-level outreach dedup.",
       "editor": "stringList",
       "prefill": [
-        "notino.de",
-        "yakaboo.ua",
+        "pipedrive.com",
+        "gorgias.com",
         "bergfreunde.de",
-        "stls.store"
-      ]
+        "huckberry.com",
+        "vovk.com"
+      ],
+      "default": [],
+      "sectionCaption": "1. Target Accounts & Output Configuration",
+      "sectionDescription": "Provide target B2B/E-commerce domains and choose your scan depth and dataset layout."
     },
     "scanMode": {
-      "title": "Scan Execution Mode",
+      "title": "Scan Mode",
       "type": "string",
-      "description": "Choose 'full_audit' to allow Playwright headless browser fallback when needed, or 'fast_http_only' for sub-second browserless HTTP/TLS/DNS execution (ideal for large 200+ domain batches and Standby API).",
+      "description": "full_audit: HTTP + Playwright browser rescue (clicks CMP consent banners, captures first-party sGTM network requests) + full OSINT. fast_http_only: Rapid HTTP + OSINT scan without headless browser (ideal for Standby API or high-volume pre-filtering).",
       "editor": "select",
-      "default": "full_audit",
       "enum": [
         "full_audit",
         "fast_http_only"
       ],
       "enumTitles": [
-        "Full Audit (HTTP + Playwright Browser Fallback)",
-        "Fast HTTP Only (Browserless Sub-Second Mode)"
-      ]
+        "Full Audit (HTTP + Playwright Rescue + sGTM Runtime + OSINT)",
+        "Fast HTTP Only (No Browser Render — Rapid Pre-Filter / API)"
+      ],
+      "default": "full_audit"
     },
     "outputView": {
-      "title": "Output Dataset View",
+      "title": "Dataset Output Schema",
       "type": "string",
-      "description": "Choose 'full_audit' for all 143 technical, scale & compliance columns, or 'sdr_compact' for a clean 42-column CRM-ready outbound view.",
+      "description": "full_audit outputs all 144 fields (3-axis scoring, full tech evidence JSON, KYB/compliance IDs, OSINT provenance). sdr_compact outputs 46 curated sales-ready columns optimized for immediate CRM / outreach import.",
       "editor": "select",
-      "default": "full_audit",
       "enum": [
         "full_audit",
         "sdr_compact"
       ],
       "enumTitles": [
-        "Full MarTech & Account Intelligence Audit (143 Columns)",
-        "SDR / Agency Outbound View (42 Columns)"
-      ]
-    },
-    "disableDeepOsint": {
-      "title": "Disable 2-Wave Deep OSINT DAG (Minimal HTTP Mode)",
-      "type": "boolean",
-      "description": "By default (false), runs fast browserless OSINT waves: TLS X.509 SANs, DoH DNS/DKIM/DMARC/SEG, Google Ads Transparency RPC, multi-ATS job feeds, Wikidata, VIES/GLEIF, RDAP, and M365 AD email verification.",
-      "editor": "checkbox",
-      "default": false
+        "Full Technical, OSINT & Compliance Audit (144 Fields)",
+        "SDR Compact Sales View (46 Actionable Columns)"
+      ],
+      "default": "full_audit"
     },
     "skipUnqualifiedInOutput": {
-      "title": "Exclude Unreachable / NXDOMAIN Domains from Output Dataset",
+      "title": "Exclude Unreachable / NXDOMAIN Records from Dataset",
       "type": "boolean",
-      "description": "If enabled, domains that fail DNS resolution or SSRF checks with zero data quality score are omitted from the output dataset.",
-      "editor": "checkbox",
+      "description": "If enabled, dead domains (dns_error, unreachable, ssrf_blocked with 0 data quality) are omitted from the output dataset so your team only reviews live accounts.",
+      "default": false
+    },
+    "scanContactPages": {
+      "title": "Deep Crawl Contact, Team, About & Impressum Pages",
+      "type": "boolean",
+      "description": "Automatically discovers and crawls leadership, team, about, contact, and statutory Impressum pages (respecting robots.txt) to locate operational Marketing Buyers (CMO, Head of Digital, Head of E-commerce) and corporate contacts.",
+      "default": true,
+      "sectionCaption": "2. Deep Tech Stack, OSINT & Extraction Controls",
+      "sectionDescription": "Fine-tune GTM unpacking, OSINT enrichment, regional phone parsing, and concurrency."
+    },
+    "unpackGtmContainers": {
+      "title": "Unpack Google Tag Manager (gtm.js) Containers",
+      "type": "boolean",
+      "description": "Downloads and inspects active GTM containers to detect GA4 measurement IDs, duplicate GA4 tagging red flags, Google Ads AW- conversions, sGTM transport URLs, and agency credits.",
+      "default": true
+    },
+    "disableDeepOsint": {
+      "title": "Disable Deep OSINT Wave (Ads Transparency, ATS Hiring, DNS/TLS, KYB)",
+      "type": "boolean",
+      "description": "Turn on to skip secondary OSINT lookups (Google Ads Transparency RPC, Greenhouse/Lever/Personio ATS job counts, DoH DMARC/SEG, TLS X.509, Wikidata, EU VIES/GLEIF) for faster minimal runs.",
       "default": false
     },
     "defaultPhoneRegion": {
-      "title": "Default Phone Region Fallback",
+      "title": "Default Phone Parsing Region (ISO 2-Letter Code)",
       "type": "string",
-      "description": "ISO 2-letter country code used when a domain TLD is generic (.com, .io, .store) and language hints are ambiguous.",
+      "description": "Fallback country code for parsing national phone formats on generic .com/.net domains when no country TLD or Cyrillic/DACH marker is detected (e.g., US, DE, GB, UA, PL).",
       "editor": "textfield",
-      "default": "US"
+      "default": "US",
+      "maxLength": 2
     },
-    "serperApiKey": {
-      "sectionCaption": "2. Optional LinkedIn X-Ray & Email Verifier Keys",
-      "sectionDescription": "Connect Serper.dev to discover operational CMO / Head of Marketing LinkedIn profiles, and Reoon / MillionVerifier for live SMTP verification of predicted DM emails.",
-      "title": "Serper.dev API Key (CMO / Head of Marketing LinkedIn X-Ray)",
-      "type": "string",
-      "description": "Optional API key from serper.dev. Automatically finds CMO / Head of Digital / Marketing Director on LinkedIn when the website only lists legal CEOs or general inboxes.",
-      "editor": "textfield",
-      "isSecret": true
+    "maxConcurrency": {
+      "title": "Max HTTP/OSINT Concurrency",
+      "type": "integer",
+      "description": "Number of domains processed concurrently in the async HTTP/OSINT pool (15 to 30).",
+      "default": 25,
+      "minimum": 15,
+      "maximum": 30
     },
-    "reoonApiKey": {
-      "title": "Reoon Email Verifier API Key",
-      "type": "string",
-      "description": "Optional API key from reoon.com. Verifies predicted DM email patterns in real time and promotes deliverable addresses to best_email.",
-      "editor": "textfield",
-      "isSecret": true
-    },
-    "millionVerifierApiKey": {
-      "title": "MillionVerifier API Key",
-      "type": "string",
-      "description": "Optional API key from millionverifier.com (alternative to Reoon for live verification of predicted DM emails).",
-      "editor": "textfield",
-      "isSecret": true
+    "maxBrowserConcurrency": {
+      "title": "Max Playwright Browser Concurrency",
+      "type": "integer",
+      "description": "Maximum concurrent headless Chromium contexts for WAF rescue and consent-gated rendering (1 to 8). Keep at 2 for 4GB RAM containers.",
+      "default": 2,
+      "minimum": 1,
+      "maximum": 8
     },
     "forceFreshScan": {
-      "sectionCaption": "3. Cache Freshness, Anti-Bot WAF & Webhook Integration",
-      "sectionDescription": "Control snapshot cache TTL, force Playwright rendering on strict WAF domains, or push results directly to n8n / Make / Clay / HubSpot / Slack.",
       "title": "Force 100% Fresh Live Scan (Ignore Cache)",
       "type": "boolean",
-      "description": "If enabled, completely bypasses prior cached snapshots in Key-Value Store and performs a strictly live scan.",
-      "editor": "checkbox",
-      "default": false
+      "description": "Ignores the Apify Key-Value domain cache and executes a completely fresh live crawl for every domain. Recommended for blind QA tests and fresh pilot audits.",
+      "default": false,
+      "sectionCaption": "3. Cache Freshness, Anti-Bot WAF & Webhook Integration",
+      "sectionDescription": "Control snapshot caching, proxy routing, and automated downstream delivery."
     },
     "maxCacheAgeDays": {
-      "title": "Maximum Cache Age (Days)",
+      "title": "Max Cache Snapshot Age (Days)",
       "type": "integer",
-      "description": "Maximum allowed age (in days) for fallback cache snapshots. Set to 0 to disable cache reads.",
+      "description": "Maximum age of cached domain snapshots used as fallback if a target temporarily blocks live requests (0 disables cache reads; ignored when forceFreshScan is enabled).",
       "default": 30,
       "minimum": 0,
       "maximum": 180
     },
     "bypassHopelessWaf": {
-      "title": "Force Playwright on Strict WAF Domains (Bypass Hopeless List)",
+      "title": "Attempt Playwright on Hard-WAF Domains",
       "type": "boolean",
-      "description": "If enabled, forces Playwright browser rendering even on known strict DataDome/Cloudflare domains (coolblue.nl, zalando.de, otto.de, grammarly.com).",
-      "editor": "checkbox",
+      "description": "Overrides the built-in skip list for notoriously aggressive enterprise WAF targets (e.g., Zalando, Otto, Douglas). Uses more compute and residential proxy bandwidth.",
       "default": false
-    },
-    "webhookUrl": {
-      "title": "Outbound Webhook URL (n8n / Make / Clay / CRM / Slack)",
-      "type": "string",
-      "description": "Optional HTTPS URL. When the run finishes, the Actor automatically sends a JSON POST payload containing run telemetry and enriched account records.",
-      "editor": "textfield"
-    },
-    "scanContactPages": {
-      "sectionCaption": "4. Performance & Proxy Configuration",
-      "sectionDescription": "Fine-tune subpage crawling, GTM container unpacking, concurrency, and Apify Proxy settings.",
-      "title": "Crawl Contact, About, Team & Impressum Subpages",
-      "type": "boolean",
-      "description": "Automatically discovers and scans /contact, /about, /team, /leadership, /b2b, and /impressum pages for marketing leaders and B2B emails.",
-      "editor": "checkbox",
-      "default": true
-    },
-    "unpackGtmContainers": {
-      "title": "Unpack Raw GTM Container JS (gtm.js)",
-      "type": "boolean",
-      "description": "Downloads and inspects raw Google Tag Manager container code to detect hidden GA4 measurement IDs, ad pixels, and duplicate tagging.",
-      "editor": "checkbox",
-      "default": true
-    },
-    "maxConcurrency": {
-      "title": "Max HTTP Concurrency",
-      "type": "integer",
-      "description": "Maximum number of parallel fast HTTP workers (curl_cffi).",
-      "default": 25,
-      "minimum": 5,
-      "maximum": 100
-    },
-    "maxBrowserConcurrency": {
-      "title": "Max Playwright Browser Concurrency",
-      "type": "integer",
-      "description": "Maximum number of parallel headless browser contexts for JS rendering (2 is optimal for 2048 MB RAM).",
-      "default": 2,
-      "minimum": 1,
-      "maximum": 8
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Apify Proxy settings. Residential proxies are automatically used for WAF escalation if available on your account.",
+      "description": "Apify Proxy settings for HTTP retries and Playwright fallback. Datacenter or Automatic proxy is recommended; RESIDENTIAL proxy is used selectively for WAF escalation with automatic fallback to standard pool.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true
       }
+    },
+    "webhookUrl": {
+      "title": "Completion Webhook URL (Optional)",
+      "type": "string",
+      "description": "Public HTTPS endpoint (e.g., Make, n8n, Zapier, CRM webhook) to receive a POST JSON payload with run telemetry and up to 250 enriched records upon completion.",
+      "editor": "textfield"
+    },
+    "serperApiKey": {
+      "title": "Serper.dev API Key (Optional — LinkedIn Marketing Buyer X-Ray)",
+      "type": "string",
+      "description": "Optional Google SERP API key to automatically enrich operational Marketing Buyers (CMO, Head of Digital, Head of E-commerce) via LinkedIn X-Ray when only CEO/Founder or no DM is listed on-site.",
+      "editor": "textfield",
+      "isSecret": true,
+      "sectionCaption": "4. Optional External Enrichment & Verification Keys",
+      "sectionDescription": "Bring your own keys to unlock automated LinkedIn DM discovery and SMTP-level email verification."
+    },
+    "reoonApiKey": {
+      "title": "Reoon Email Verifier API Key (Optional)",
+      "type": "string",
+      "description": "Optional Reoon API key to verify predicted decision-maker corporate email patterns in real time.",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "millionVerifierApiKey": {
+      "title": "MillionVerifier API Key (Optional)",
+      "type": "string",
+      "description": "Optional MillionVerifier API key used as fallback or primary SMTP verifier for predicted decision-maker emails.",
+      "editor": "textfield",
+      "isSecret": true
+    },
+    "manualSeeds": {
+      "title": "Custom Manual Audit Seeds (Optional JSON)",
+      "type": "object",
+      "description": "Optional JSON object mapping canonical domains (e.g., \"example.com\": {...}) to verified manual audit records used as fallback when a target is completely blocked.",
+      "editor": "json",
+      "default": {}
     }
   },
   "required": []
