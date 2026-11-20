@@ -264,8 +264,8 @@ def derive_gdpr_jurisdiction(
     html_sample: str = '',
 ) -> str:
     """
-    Виправлено (v24.1.1): Розпізнає українську кирилицю [іїєґІЇЄҐ] на .net/.com доменах
-    (напр. netpeak.net) як UA_PDP, а європейські ціни/VAT на .com як EU_EEA_GDPR.
+    Розпізнає українську кирилицю [іїєґІЇЄҐ] на .net/.com доменах (напр. netpeak.net) як UA_PDP,
+    а європейські ціни/VAT на .com як EU_EEA_GDPR.
     """
     dom_low = (canonical_domain or '').lower().strip()
     if dom_low in KNOWN_JURISDICTION_HINTS:
@@ -334,8 +334,15 @@ def derive_legal_basis_for_processing(
     canonical_domain: str,
     country_hint: str = '',
     has_personal_data: bool = False,
+    gdpr_jurisdiction: str | None = None,
 ) -> str:
-    jur = derive_gdpr_jurisdiction(canonical_domain, None, country_hint, '')
+    """
+    Виправлено (v24.1.2): Приймає вже обчислене значення `gdpr_jurisdiction`, щоб уникнути
+    конфлікту між `EU_EEA_GDPR` (визначеним із HTML/EUR) та `US_CAN_SPAM` на `.com` доменах (preply.com).
+    """
+    jur = (gdpr_jurisdiction or '').strip().upper() or derive_gdpr_jurisdiction(
+        canonical_domain, None, country_hint, ''
+    )
     dom_low = (canonical_domain or '').lower()
     if dom_low.endswith(('.de', '.at')) or (country_hint or '').upper() in ('DE', 'AT'):
         return (
@@ -352,14 +359,24 @@ def derive_legal_basis_for_processing(
     return 'us_can_spam_b2b_commercial_outreach (physical_address_and_opt_out_required)'
 
 
-def build_compliance_note(canonical_domain: str, country_hint: str = '') -> str:
+def build_compliance_note(
+    canonical_domain: str,
+    country_hint: str = '',
+    gdpr_jurisdiction: str | None = None,
+) -> str:
     dom_low = (canonical_domain or '').lower()
+    jur = (gdpr_jurisdiction or '').strip().upper()
     if dom_low.endswith(('.de', '.at')) or (country_hint or '').upper() in ('DE', 'AT'):
         return (
             '[Actor Retention Policy: 365d] DACH Compliance Notice: Under German §7 UWG and DSK guidance, '
             'contact details published solely to satisfy statutory Impressum obligations do not constitute '
             'consent for unsolicited cold email or cold telephone marketing. Verify prior opt-in or documented '
             'business relationship before initiating outreach.'
+        )
+    if jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP'):
+        return (
+            '[Actor Retention Policy: 365d] EU/UK/CH Public Web Data: Collected from publicly accessible corporate pages '
+            'for B2B account intelligence. Verify local ePrivacy rules and honor all GDPR Art. 17 opt-out/erasure requests.'
         )
     return (
         '[Actor Retention Policy: 365d] B2B Public Web Data: Collected from publicly accessible corporate pages '
@@ -657,6 +674,7 @@ def build_safe_cache_payload(result_record: dict, prior_cached: dict | None = No
 def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
     aliases_str = '; '.join(aliases) if aliases else domain_key
     clean_url = f'https://{domain_key}/'
+    stub_jur = derive_gdpr_jurisdiction(domain_key)
     return {
         'input_domain': domain_key,
         'canonical_domain': domain_key,
@@ -687,14 +705,14 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'contact_quality_tier_human': 'No Contact',
         'contact_enrichment_status': 'run_timeout_unfinished',
         'data_confidence_warning': 'Run time budget exceeded before domain completed.',
-        'gdpr_eu_domain': domain_key.endswith(EU_GDPR_TLDS),
-        'gdpr_jurisdiction': derive_gdpr_jurisdiction(domain_key),
+        'gdpr_eu_domain': stub_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP'),
+        'gdpr_jurisdiction': stub_jur,
         'legal_basis_for_processing': None,
         'data_source_sensitivity': 'none',
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': 'none (timeout)',
-        'compliance_note': build_compliance_note(domain_key),
+        'compliance_note': build_compliance_note(domain_key, '', stub_jur),
         'playwright_available': True,
         'playwright_used': False,
         'playwright_status': 'skipped_timeout',
