@@ -72,6 +72,31 @@ _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
 _STANDALONE_NAME_FINDER = re.compile(rf'\b{NAME_REGEX_PART}\b', re.UNICODE)
 _COMPILED_ROLES_RE = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.IGNORECASE | re.UNICODE)
 
+_PRESS_MKT_ROLES_PART = (
+    r'CMO|Chief Marketing Officer|VP of Marketing|VP Marketing|SVP Marketing|SVP of Marketing|'
+    r'Head of Marketing|Marketing Director|Director of Marketing|Head of Digital Marketing|'
+    r'Digital Marketing Director|Head of Digital|Digital Director|Head of E-commerce|Head of Ecommerce|'
+    r'E-commerce Director|Ecommerce Director|Director of E-commerce|VP of E-commerce|VP E-commerce|'
+    r'Head of Growth|Growth Director|VP of Growth|VP Growth|Growth Lead|'
+    r'Head of Performance Marketing|Head of Performance|Performance Marketing Director|Performance Lead|'
+    r'Head of Acquisition|Head of Paid Media|Head of CRM|CRM Director|Head of Retention|'
+    r'Head of Analytics|Analytics Director|Head of Data|Head of CRO|CRO Lead|'
+    r'Директор з маркетингу|Керівник відділу маркетингу|Керівник маркетингу|Маркетинг-директор|'
+    r'Керівник діджитал|Керівник e-commerce|Директор з e-commerce|Керівник з розвитку|'
+    r'Marketingleiter|Marketingleiterin|Leiter Marketing|Leitung Marketing|Leiter E-Commerce|Leiter Digital|'
+    r'Directeur Marketing|Directrice Marketing|Responsable Marketing|Directeur Digital|Directeur E-commerce|'
+    r'Director de Marketing|Directora de Marketing|Director Digital|Director de E-commerce|'
+    r'Direttore Marketing|Direttore Digitale|Direttore E-commerce|Marketing Directeur|Hoofd Marketing|'
+    r'Dyrektor Marketingu|Dyrektor E-commerce|Dyrektor Digital|Marknadschef|Markedssjef'
+)
+
+PRESS_QUOTE_MARKETING_PATTERN = re.compile(
+    rf'(?i:said|says|explains|explained|notes|noted|adds|added|commented|according\s+to|'
+    rf'erklärt|erklärte|sagt|sagte|betont|betonte|зазначив|зазначила|розповів|розповіла|каже)\s+'
+    rf'{NAME_REGEX_PART}\s*,\s*(?i:the\s+|our\s+|new\s+)?(?i:({_PRESS_MKT_ROLES_PART}))\b',
+    re.UNICODE
+)
+
 WIKIDATA_SEMAPHORE = asyncio.Semaphore(4)
 WP_AVATAR_HASH_RE = re.compile(r"/avatar/([a-f0-9]{64}|[a-f0-9]{32})\b", re.IGNORECASE)
 
@@ -185,7 +210,7 @@ EXTRA_MARKETING_ROLE_MAP: Dict[str, str] = {
 
 
 # ==============================================================================
-# v24.3 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
+# v24.4 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
 # ==============================================================================
 
 def is_server_verified_email_confidence(
@@ -193,7 +218,7 @@ def is_server_verified_email_confidence(
     deliverability_check: str | None = None,
 ) -> bool:
     """
-    v24.3: Повертає True лише тоді, коли email справді підтверджено поштовим сервером:
+    Повертає True лише тоді, коли email підтверджено поштовим сервером:
     `M365_AD_VERIFIED` або `SMTP_API_VERIFIED` (Reoon / MillionVerifier) за наявності
     сконфігурованих MX-записів (`domain_mail_configured`).
     Профільні збіги (`GRAVATAR_OR_PGP_MATCH`) НЕ вважаються серверною верифікацією скриньки.
@@ -209,10 +234,6 @@ def is_server_verified_email_confidence(
 
 
 def split_clean_executive_name(raw_full_name: str) -> Dict[str, str]:
-    """
-    Очищає академічні титули, українські по батькові та автоматично виправляє
-    порядок `Прізвище Ім'я` -> `Ім'я Прізвище` (напр., `Бойчук Людмила` -> `Людмила Бойчук`).
-    """
     if not raw_full_name:
         return {"dm_clean_full_name": "", "dm_first_name": "", "dm_last_name": ""}
     clean = raw_full_name.strip()
@@ -354,7 +375,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/24.3 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.4 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -592,10 +613,6 @@ async def verify_ceo_email_cascade_port443_v23_1(
     mx_records_str: str,
     has_seg_gateway: bool = False
 ) -> Dict[str, Any]:
-    """
-    v24.3: Чітко розділяє серверну верифікацію (`M365_AD_VERIFIED`) від профільних
-    збігів без підтвердження доставлюваності (`GRAVATAR_OR_PGP_MATCH`).
-    """
     if not candidate_emails:
         return {
             "verified_email": None,
@@ -1095,13 +1112,6 @@ def generate_dm_email_pattern_candidates(
     observed_emails: list[str] | None = None,
     best_email_type: str | None = None,
 ) -> list[str]:
-    """
-    v24.3: Генерує гіпотези корпоративного email для знайденого ЛПР:
-      1. Якщо на сайті вже спостерігались іменні пошти (`f.last@` або `first.last@`) — наслідує корпоративний патерн.
-      2. Якщо відомий лише загальний/рольовий `best_email_type` (напр., `general_office_inbox` як `info@domain.com`,
-         `marketing_or_exec_role`, `b2b_partnerships`) — першим кандидатом генерує `first@domain.com`,
-         далі `first.last@domain.com` та `f.last@domain.com`.
-    """
     if not dm_name or not canonical_domain:
         return []
     dom = canonical_domain.lower().strip().replace('www.', '')
@@ -1605,7 +1615,7 @@ def classify_dm_buyer_fit(dm_name: str | None, dm_role: str | None) -> str:
 
 def _dm_role_priority_weight(role_str: str | None) -> int:
     """
-    v24.3: Пріоритет №1 — операційні керівники маркетингу, digital, e-commerce, growth, analytics.
+    v24.4: Пріоритет №1 — операційні керівники маркетингу, digital, e-commerce, growth, analytics.
     """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
@@ -1618,9 +1628,9 @@ def _dm_role_priority_weight(role_str: str | None) -> int:
             'head of cro', 'head of crm',
         )
     ):
-        return 85
+        return 90
     if is_marketing_or_digital_role(role_str):
-        return 72
+        return 75
     if any(k in r_low for k in ('commercial director',)):
         return 26
     if any(k in r_low for k in ('ceo', 'chief executive', 'managing director', 'general manager', 'vorstand', 'president', 'geschäftsführer')):
@@ -1669,6 +1679,16 @@ def build_decision_makers_json_from_summary(
     return json.dumps(items, ensure_ascii=False) if items else None
 
 
+def _extract_person_linkedin_from_same_as(same_as_val: Any) -> Optional[str]:
+    items = same_as_val if isinstance(same_as_val, list) else ([same_as_val] if isinstance(same_as_val, str) else [])
+    for u in items:
+        if isinstance(u, str) and 'linkedin.com/in/' in u.lower():
+            clean_li = clean_and_validate_social_url('linkedin', u)
+            if clean_li:
+                return clean_li
+    return None
+
+
 def extract_decision_maker_deep(
     pages_with_urls: list[tuple[str, str, str]]
 ) -> tuple[str | None, str | None, str | None, str | None, bool, str | None, str | None, str | None]:
@@ -1682,6 +1702,30 @@ def extract_decision_maker_deep(
     candidates: dict[str, dict] = {}
     personal_linkedin_urls: list[str] = []
 
+    def _register_candidate(
+        cand_name: str,
+        norm_r: str,
+        page_url: str,
+        is_legal_doc: bool,
+        src_type: Optional[str],
+        sc: int,
+        direct_li: Optional[str] = None,
+    ) -> None:
+        k_low = cand_name.lower()
+        existing = candidates.get(k_low)
+        if not existing or sc > existing['score']:
+            candidates[k_low] = {
+                'name': cand_name,
+                'role': norm_r,
+                'url': page_url,
+                'is_legal': is_legal_doc,
+                'src_type': src_type,
+                'score': sc,
+                'direct_li': direct_li or (existing.get('direct_li') if existing else None),
+            }
+        elif direct_li and not existing.get('direct_li'):
+            existing['direct_li'] = direct_li
+
     for page_url, raw_html, page_text in pages_with_urls:
         u_path = urlparse(page_url).path.lower()
         if DM_SOURCE_BLACKLIST.search(u_path):
@@ -1691,7 +1735,7 @@ def extract_decision_maker_deep(
             imp in u_path for imp in ('impressum', 'mentions-legales', 'aviso-legal')
         )
         src_type = classify_dm_source_type(page_url)
-        page_bonus = 22 if src_type in ('team_or_leadership_page', 'about_page') else (10 if src_type == 'impressum_page' else 0)
+        page_bonus = 24 if src_type in ('team_or_leadership_page', 'about_page') else (10 if src_type == 'impressum_page' else 0)
 
         if raw_html:
             soup = BeautifulSoup(raw_html, 'lxml')
@@ -1702,12 +1746,12 @@ def extract_decision_maker_deep(
                     if clean_li and clean_li not in personal_linkedin_urls:
                         personal_linkedin_urls.append(clean_li)
 
-            # v24.3: Парсинг структурованих HTML-карток команди (/team, /leadership, /about)
+            # 1. Структуровані HTML-картки команди (/team, /leadership, /about) із вкладеними LinkedIn-посиланнями
             for card in soup.find_all(['div', 'li', 'article', 'figure']):
                 if card.find_all(['section', 'main', 'header', 'footer', 'nav']):
                     continue
                 card_txt = ' '.join(card.get_text(' ', strip=True).split())
-                if len(card_txt) < 8 or len(card_txt) > 190:
+                if len(card_txt) < 8 or len(card_txt) > 200:
                     continue
                 if any(tm in card_txt.lower() for tm in TESTIMONIAL_TEXT_MARKERS):
                     continue
@@ -1727,18 +1771,17 @@ def extract_decision_maker_deep(
                 norm_r = normalize_executive_role(r_m.group(1))
                 if not norm_r:
                     continue
-                sc = _dm_role_priority_weight(norm_r) + page_bonus + 14
-                k_low = cand_name.lower()
-                if k_low not in candidates or sc > candidates[k_low]['score']:
-                    candidates[k_low] = {
-                        'name': cand_name,
-                        'role': norm_r,
-                        'url': page_url,
-                        'is_legal': is_legal_doc,
-                        'src_type': src_type,
-                        'score': sc,
-                    }
+                card_li = None
+                for card_a in card.find_all('a', href=True):
+                    if 'linkedin.com/in/' in str(card_a['href']).lower():
+                        c_li = clean_and_validate_social_url('linkedin', str(card_a['href']))
+                        if c_li and verify_person_linkedin_match(cand_name, c_li):
+                            card_li = c_li
+                            break
+                sc = _dm_role_priority_weight(norm_r) + page_bonus + 16
+                _register_candidate(cand_name, norm_r, page_url, is_legal_doc, src_type, sc, direct_li=card_li)
 
+            # 2. JSON-LD структуровані дані (@type: Person + employee/member/director/founder)
             for ld_script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
                 try:
                     data = json.loads(ld_script.string or '')
@@ -1750,6 +1793,23 @@ def extract_decision_maker_deep(
                         for node in (graph if isinstance(graph, list) else [obj]):
                             if not isinstance(node, dict):
                                 continue
+
+                            node_type = node.get('@type')
+                            node_types = [str(t).lower() for t in (node_type if isinstance(node_type, list) else [node_type])]
+                            if 'person' in node_types:
+                                p_name = strip_role_tokens_from_name(str(node.get('name', '')))
+                                raw_job = str(node.get('jobTitle') or '')
+                                norm_r = normalize_executive_role(raw_job) if raw_job else None
+                                if is_valid_person_name(p_name, brand_root) and norm_r:
+                                    p_li = _extract_person_linkedin_from_same_as(node.get('sameAs'))
+                                    if p_li and p_li not in personal_linkedin_urls:
+                                        personal_linkedin_urls.append(p_li)
+                                    sc = _dm_role_priority_weight(norm_r) + page_bonus + 14
+                                    _register_candidate(
+                                        p_name, norm_r, page_url, is_legal_doc, src_type, sc,
+                                        direct_li=p_li if verify_person_linkedin_match(p_name, p_li) else None,
+                                    )
+
                             for key_role in ('employee', 'member', 'director', 'founder', 'founders'):
                                 val = node.get(key_role)
                                 p_list = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
@@ -1763,19 +1823,26 @@ def extract_decision_maker_deep(
                                     p_job = raw_job or ('Co-Founder' if key_role == 'founders' else 'Founder')
                                     norm_r = normalize_executive_role(p_job)
                                     if is_valid_person_name(p_name, brand_root) and norm_r:
-                                        sc = _dm_role_priority_weight(norm_r) + page_bonus + 10
-                                        k_low = p_name.lower()
-                                        if k_low not in candidates or sc > candidates[k_low]['score']:
-                                            candidates[k_low] = {
-                                                'name': p_name,
-                                                'role': norm_r,
-                                                'url': page_url,
-                                                'is_legal': is_legal_doc,
-                                                'src_type': src_type,
-                                                'score': sc,
-                                            }
+                                        p_li = _extract_person_linkedin_from_same_as(person.get('sameAs'))
+                                        sc = _dm_role_priority_weight(norm_r) + page_bonus + 12
+                                        _register_candidate(
+                                            p_name, norm_r, page_url, is_legal_doc, src_type, sc,
+                                            direct_li=p_li if verify_person_linkedin_match(p_name, p_li) else None,
+                                        )
                 except Exception:
                     pass
+
+        # 3. Прес-цитати та новини (виключно операційні маркетингові/digital/e-commerce ролі)
+        for pm in PRESS_QUOTE_MARKETING_PATTERN.finditer(page_text):
+            start_w = max(0, pm.start() - 100)
+            end_w = min(len(page_text), pm.end() + 100)
+            if any(tm in page_text[start_w:end_w].lower() for tm in TESTIMONIAL_TEXT_MARKERS):
+                continue
+            cand_name = strip_role_tokens_from_name(pm.group(1))
+            norm_r = normalize_executive_role(pm.group(2))
+            if is_valid_person_name(cand_name, brand_root) and norm_r and is_marketing_or_digital_role(norm_r):
+                sc = _dm_role_priority_weight(norm_r) + page_bonus + 12
+                _register_candidate(cand_name, norm_r, page_url, is_legal_doc, src_type, sc)
 
         for m in VERTRETEN_DURCH_PATTERN.finditer(page_text):
             full_match_low = m.group(0).lower()
@@ -1804,16 +1871,7 @@ def extract_decision_maker_deep(
 
             for idx_exec, exec_name in enumerate(extracted_co_execs[:4]):
                 sc = base_sc - idx_exec
-                k_low = exec_name.lower()
-                if k_low not in candidates or sc > candidates[k_low]['score']:
-                    candidates[k_low] = {
-                        'name': exec_name,
-                        'role': role_label,
-                        'url': page_url,
-                        'is_legal': is_legal_doc,
-                        'src_type': src_type,
-                        'score': sc,
-                    }
+                _register_candidate(exec_name, role_label, page_url, is_legal_doc, src_type, sc)
 
         for pattern, name_grp, role_grp in (
             (NAME_BEFORE_ROLE_PATTERN, 1, 2),
@@ -1834,45 +1892,29 @@ def extract_decision_maker_deep(
                 if not norm_r:
                     continue
                 sc = _dm_role_priority_weight(norm_r) + page_bonus
-                k_low = cand_name.lower()
-                if k_low not in candidates or sc > candidates[k_low]['score']:
-                    candidates[k_low] = {
-                        'name': cand_name,
-                        'role': norm_r,
-                        'url': page_url,
-                        'is_legal': is_legal_doc,
-                        'src_type': src_type,
-                        'score': sc,
-                    }
+                _register_candidate(cand_name, norm_r, page_url, is_legal_doc, src_type, sc)
 
         for m in FOP_OWNER_PATTERN.finditer(page_text):
             cand_name = strip_role_tokens_from_name(m.group(1))
             if is_valid_person_name(cand_name, brand_root):
                 norm_r = 'Owner'
                 sc = _dm_role_priority_weight(norm_r) + page_bonus
-                k_low = cand_name.lower()
-                if k_low not in candidates or sc > candidates[k_low]['score']:
-                    candidates[k_low] = {
-                        'name': cand_name,
-                        'role': norm_r,
-                        'url': page_url,
-                        'is_legal': is_legal_doc,
-                        'src_type': src_type,
-                        'score': sc,
-                    }
+                _register_candidate(cand_name, norm_r, page_url, is_legal_doc, src_type, sc)
 
     if not candidates:
         return None, None, None, None, False, None, None, None
 
     for c_info in candidates.values():
-        c_info['li_url'] = None
-        for li_u in personal_linkedin_urls:
-            if verify_person_linkedin_match(c_info['name'], li_u):
-                c_info['li_url'] = li_u
-                c_info['score'] += 25
-                break
+        c_info['li_url'] = c_info.get('direct_li')
+        if not c_info['li_url']:
+            for li_u in personal_linkedin_urls:
+                if verify_person_linkedin_match(c_info['name'], li_u):
+                    c_info['li_url'] = li_u
+                    break
+        if c_info['li_url']:
+            c_info['score'] += 25
 
-    # v24.3: Операційні ролі маркетингу/digital/e-commerce/growth мають пріоритет №1 над CEO/Founder
+    # Жорсткий пріоритет операційного покупця маркетингу/digital/e-commerce над CEO/Founder
     sorted_cands = sorted(
         candidates.values(),
         key=lambda item: (
