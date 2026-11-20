@@ -21,6 +21,7 @@ from .config import (
     GTM_JSON_GA4_REGEX,
     LOGISTICS_AND_RETURNS_SIGNATURES,
     MAX_DISPLAY_GA4_IDS,
+    MULTI_PART_TLDS,
     SAFE_DEMO_SCHEDULER_PATTERNS,
     SGTM_CUSTOM_LOADER_REGEX,
     SGTM_FIRST_PARTY_COLLECT_REGEX,
@@ -38,6 +39,21 @@ SHOPIFY_SHOP_DOMAIN_RE = re.compile(
 HREFLANG_LINK_RE = re.compile(
     r'<link[^>]+rel=["\']alternate["\'][^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\']|'
     r'<link[^>]+hreflang=["\']([a-zA-Z]{2}(?:-[a-zA-Z]{2})?)["\'][^>]+rel=["\']alternate["\']',
+    re.IGNORECASE,
+)
+
+SGTM_SUBDOMAIN_PREFIXES: Tuple[str, ...] = (
+    'sgtm', 'gtm', 'sst', 'metrics', 'analytics', 'tag', 'tags',
+    'track', 'tracking', 'collect', 'data', 'stats', 'measure',
+    'measurement', 'events', 'server-side', 'ss', 'stape', 'telemetry',
+)
+
+SGTM_STRICT_RUNTIME_PREFIXES: Set[str] = {
+    'sgtm', 'sst', 'metrics', 'analytics', 'tracking', 'collect', 'measure', 'measurement', 'stape', 'server-side',
+}
+
+SGTM_TRANSPORT_URL_RE = re.compile(
+    r'["\'](?:transport_url|server_container_url|sgtm_url)["\']\s*[:=]\s*["\'](https?://[^"\'\s<>]+)["\']',
     re.IGNORECASE,
 )
 
@@ -119,6 +135,85 @@ PAYMENT_HTML_SIGNATURES: Dict[str, tuple[str, ...]] = {
     'Checkout.com': ('cdn.checkout.com',),
     'PayPal': ('paypal.com/sdk/js', 'paypalobjects.com/api/checkout'),
 }
+
+
+def _extract_reg_domain_for_sgtm(page_url: str) -> str:
+    host = (urlparse(page_url or '').hostname or '').lower().removeprefix('www.').strip('.')
+    parts = [p for p in host.split('.') if p]
+    if len(parts) < 2:
+        return host
+    last_two = f'{parts[-2]}.{parts[-1]}'
+    if last_two in MULTI_PART_TLDS and len(parts) >= 3:
+        return f'{parts[-3]}.{last_two}'
+    return last_two
+
+
+def detect_first_party_sgtm_endpoints(
+    html_clean: str,
+    gtm_str: str,
+    net_urls: list[str],
+    page_url: str,
+) -> list[tuple[str, str]]:
+    """
+    v24.2 First-Party sGTM Subdomain Detector:
+    Виявляє серверний трекінг (sGTM / CAPI / First-Party Collector) на першосторонніх піддоменах
+    (metrics.<domain>, analytics.<domain>, sgtm.<domain>, sst.<domain>, tag.<domain>, track.<domain> тощо)
+    у мережевих запитах Playwright, параметрах transport_url/server_container_url та коді HTML/GTM.
+    """
+    reg_dom = _extract_reg_domain_for_sgtm(page_url)
+    if not reg_dom or '.' not in reg_dom:
+        return []
+
+    hits: list[tuple[str, str]] = []
+    seen_ev: Set[str] = set()
+
+    # 1. Мережеві запити Playwright на першосторонні трекінг-піддомени (runtime_verified)
+    for n_url in (net_urls or []):
+        parsed = urlparse(n_url)
+        nh = (parsed.hostname or '').lower().strip('.')
+        if nh.endswith(f'.{reg_dom}') and nh != f'www.{reg_dom}':
+            sub_label = nh[:-(len(reg_dom) + 1)].split('.')[0]
+            path_q = f'{parsed.path}?{parsed.query}'.lower()
+            if sub_label in SGTM_SUBDOMAIN_PREFIXES and (
+                sub_label in SGTM_STRICT_RUNTIME_PREFIXES
+                or any(tok in path_q for tok in ('/g/collect', '/gtm.js', '/gtag/js', 'tid=g-', 'v=2&', '/collect', '/metrics', '/events'))
+            ):
+                ev = f'1st-party sGTM subdomain request: {nh}{parsed.path[:60]}'
+                if ev not in seen_ev:
+                    seen_ev.add(ev)
+                    hits.append(('runtime_verified', ev))
+
+    combined = f'{html_clean or ""}\n{gtm_str or ""}'
+
+    # 2. Явна конфігурація transport_url / server_container_url у HTML або GTM
+    for m_url in SGTM_TRANSPORT_URL_RE.findall(combined):
+        m_low = m_url.lower()
+        if not any(g in m_low for g in ('google-analytics.com', 'googletagmanager.com', 'doubleclick.net')):
+            ev = f'sGTM transport/server container URL: {m_url[:100]}'
+            if ev not in seen_ev:
+                seen_ev.add(ev)
+                hits.append(('configured_in_code', ev))
+
+    # 3. Посилання на першосторонні трекінг-піддомени в HTML/GTM (metrics.domain.com, analytics.domain.com тощо)
+    sub_alt = '|'.join(re.escape(p) for p in SGTM_SUBDOMAIN_PREFIXES)
+    fp_sub_re = re.compile(
+        rf'https?://((?:{sub_alt})\.{re.escape(reg_dom)})(?:/[^\s"\'<>]*)?',
+        re.IGNORECASE,
+    )
+    for m in fp_sub_re.finditer(combined):
+        full_u = m.group(0).lower()
+        sub_host = m.group(1).lower()
+        sub_prefix = sub_host.split('.', 1)[0]
+        if (
+            sub_prefix in SGTM_STRICT_RUNTIME_PREFIXES
+            or any(tok in full_u for tok in ('/gtm.js', '/gtag', '/g/collect', '/collect', 'sgtm', 'sst.', 'stape.'))
+        ):
+            ev = f'1st-party sGTM endpoint in code: {sub_host}'
+            if ev not in seen_ev:
+                seen_ev.add(ev)
+                hits.append(('configured_in_code', ev))
+
+    return hits
 
 
 def cap_ga4_ids_and_confidence(
@@ -274,7 +369,6 @@ def extract_account_scale_signals(
     advertiser_sister_domains: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
-    v24.1 Account Scale Intelligence:
     Визначає географічний масштаб бізнесу (estimated_markets_count, detected_market_locales)
     на основі <link rel="alternate" hreflang="...">, мульти-властивостей GA4 та сестринських доменів.
     """
@@ -309,9 +403,8 @@ def detect_agency_credits_from_html_and_gtm(
     brand_root: str = '',
 ) -> Optional[str]:
     """
-    v24.1.1 Competitive Agency Intelligence:
     Виявляє веб-студію, розробника або performance-агенцію у футері сайту чи GTM-контейнері.
-    Використовує лише точні маркери агенцій (без загального підрядка 'dept', який збігається з department).
+    Використовує лише точні маркери агенцій (без загального підрядка 'dept').
     """
     b_low = (brand_root or '').lower().strip()
     if html:
@@ -353,9 +446,6 @@ def detect_agency_credits_from_html_and_gtm(
 
 
 def detect_ats_from_html_or_dns(html: str, dns_ats_provider: str | None = None) -> tuple[str | None, str | None]:
-    """
-    Повертає (ats_provider, company_slug) з DNS CNAME або посилань на кар'єрній сторінці.
-    """
     if html:
         for provider, rx in ATS_HTML_PATTERNS:
             m = rx.search(html)
@@ -393,10 +483,10 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.1.1 Enterprise MarTech & Account Intelligence:
+    v24.2 Enterprise MarTech & Account Intelligence:
     Розділяє джерела сигналів на 3 рівні підтвердження:
-      - `runtime_verified` (мережевий запит Playwright `pw_net_req` або першосторонні кукі `FPID`/`_ga`/`_fbp`);
-      - `configured_in_code` (HTML-код сторінки або внутрішній код розпакованого `gtm.js`);
+      - `runtime_verified` (мережевий запит Playwright `pw_net_req`, першосторонній sGTM-запит або кукі `FPID`/`_ga`/`_fbp`);
+      - `configured_in_code` (HTML-код сторінки, першосторонній sGTM-піддомен або код розпакованого `gtm.js`);
       - `allowlisted_in_csp` (лише список дозволених доменів у заголовку `Content-Security-Policy`).
     """
     html_str = html or ''
@@ -455,6 +545,11 @@ def detect_tech_with_evidence(
             consent_mode_signals.add(f'gcs={gcs_m}')
         for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(n_url):
             consent_mode_signals.add(f'gcd={gcd_m}')
+
+    # v24.2: Покращена детекція першосторонніх sGTM-піддоменів (metrics., analytics., sgtm., transport_url)
+    for fp_tier, fp_ev in detect_first_party_sgtm_endpoints(html_clean_body, gtm_str, net_urls, page_url):
+        src_lbl = 'runtime_network' if fp_tier == 'runtime_verified' else 'html_or_gtm'
+        _record_tech('Server-Side GTM (sGTM)', fp_tier, src_lbl, fp_ev)
 
     valid_gtms = sorted({g.upper() for g in (gtm_ids or []) if is_valid_gtm_id(g)})
     if valid_gtms:
@@ -678,10 +773,6 @@ async def fetch_google_ads_transparency_intel_v23_1(
     etld_func: Callable[[str], tuple[str, str]],
     infra_denylist: tuple[str, ...] = (),
 ) -> Dict[str, Any]:
-    """
-    Виправлено (v24.1): При таймауті або HTTP-помилці RPC повертає `ads_active_last_30d: None`
-    (а не хибне `False`), а при активній рекламі розпізнає конкретні формати оголошень.
-    """
     out: Dict[str, Any] = {
         'ads_rpc_status': 'not_checked',
         'ads_active_last_30d': None,
@@ -751,11 +842,6 @@ async def fetch_public_ats_hiring_intel(
     ats_provider: str | None,
     brand_slug: str,
 ) -> Dict[str, Any]:
-    """
-    v24.1 Multi-Platform ATS Hiring Parser:
-    Підтримує Greenhouse, Lever, Workable, SmartRecruiters та Personio.
-    Якщо ATS не виявлено або не підтримується — повертає `open_positions_total: None` (не 0).
-    """
     out: Dict[str, Any] = {
         'ats_provider': ats_provider,
         'open_positions_total': None,
