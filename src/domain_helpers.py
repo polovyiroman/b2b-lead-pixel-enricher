@@ -263,10 +263,6 @@ def derive_gdpr_jurisdiction(
     country_hint: str = '',
     html_sample: str = '',
 ) -> str:
-    """
-    Розпізнає українську кирилицю [іїєґІЇЄҐ] на .net/.com доменах (напр. netpeak.net) як UA_PDP,
-    а європейські ціни/VAT на .com як EU_EEA_GDPR.
-    """
     dom_low = (canonical_domain or '').lower().strip()
     if dom_low in KNOWN_JURISDICTION_HINTS:
         return KNOWN_JURISDICTION_HINTS[dom_low]
@@ -336,10 +332,6 @@ def derive_legal_basis_for_processing(
     has_personal_data: bool = False,
     gdpr_jurisdiction: str | None = None,
 ) -> str:
-    """
-    Виправлено (v24.1.2): Приймає вже обчислене значення `gdpr_jurisdiction`, щоб уникнути
-    конфлікту між `EU_EEA_GDPR` (визначеним із HTML/EUR) та `US_CAN_SPAM` на `.com` доменах (preply.com).
-    """
     jur = (gdpr_jurisdiction or '').strip().upper() or derive_gdpr_jurisdiction(
         canonical_domain, None, country_hint, ''
     )
@@ -429,6 +421,10 @@ def derive_sales_actionability_class(sales_readiness_verdict: str | None, compan
         return 'partner_agency'
     if 'disqualified' in v or 'unqualified' in v or 'unverified' in v:
         return 'unqualified'
+    if 'linkedin / warm-intro only' in v:
+        return 'linkedin_warm_intro_only'
+    if 'escalation-ready via ceo' in v:
+        return 'escalation_via_ceo'
     if 'sales-ready' in v:
         return 'sales_ready'
     if 'partnership-ready' in v:
@@ -688,9 +684,13 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'cached_snapshot_age_days': None,
         'error_message': 'Domain processing exceeded run time budget',
         'data_quality_score': 0,
-        'account_opportunity_score': 0,
-        'contactability_level': 'unreached',
+        'account_fit_score': 0,
+        'technical_opportunity_score': 0,
+        'sales_actionability_score': 0,
         'actionable_priority_score': 0,
+        'contactability_level': 'unreached',
+        'dm_buyer_fit_status': 'no_dm_found',
+        'outreach_compliance_block': 'none',
         'sales_readiness_verdict': 'Unverified (Run Time Budget Exceeded)',
         'sales_actionability_class': 'unqualified',
         'company_category': 'General Business / Corporate',
@@ -786,11 +786,8 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'all_ga4_ids_count': None,
         'detected_technologies': None,
         'detected_payment_gateways': [],
-        'martech_maturity_tier': 'Unverified / Minimal',
-        'min_estimated_saas_spend_usd': 0,
-        'estimated_saas_spend_min_usd': 0,
-        'estimated_saas_spend_max_usd': 0,
-        'spend_estimation_basis': [],
+        'martech_stack_tier': 'Unverified / Minimal',
+        'martech_stack_tier_basis': [],
         'estimated_markets_count': 1,
         'detected_market_locales': [],
         'catalog_estimated_skus': None,
