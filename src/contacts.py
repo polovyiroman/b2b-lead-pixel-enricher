@@ -72,6 +72,16 @@ _DNS_DOMAIN_LOCKS: dict[str, asyncio.Lock] = {}
 _STANDALONE_NAME_FINDER = re.compile(rf'\b{NAME_REGEX_PART}\b', re.UNICODE)
 _COMPILED_ROLES_RE = re.compile(rf'\b({ROLES_REGEX_PART})\b', re.IGNORECASE | re.UNICODE)
 
+# v24.5 Крок 3 P0: Жорсткий перелік корпоративних ролей CEO / Founder / Owner,
+# які НІКОЛИ не вважаються операційним покупцем MarTech (`direct_marketing_buyer`).
+CEO_FOUNDER_OWNER_RE = re.compile(
+    r'\b(?:ceo|chief\s+executive|founder|co-?founder|owner|managing\s+director|'
+    r'geschäftsführer(?:in)?|vorstand|president|chairman|chairwoman|general\s+manager|'
+    r'supervisory\s+board|aufsichtsrat|власник|власниця|засновник|засновниця|'
+    r'співзасновник|генеральний\s+директор)\b',
+    re.IGNORECASE | re.UNICODE,
+)
+
 _PRESS_MKT_ROLES_PART = (
     r'CMO|Chief Marketing Officer|VP of Marketing|VP Marketing|SVP Marketing|SVP of Marketing|'
     r'Head of Marketing|Marketing Director|Director of Marketing|Head of Digital Marketing|'
@@ -210,19 +220,56 @@ EXTRA_MARKETING_ROLE_MAP: Dict[str, str] = {
 
 
 # ==============================================================================
-# v24.4 Complete: OSINT Керівників, WP 6.8+ Кракер та Порт-443 Каскад
+# v24.5 Mandatory LinkedIn People URL & Operational Marketing Buyer Gate
 # ==============================================================================
+
+def build_company_linkedin_people_url(
+    linkedin_url: str | None,
+    canonical_domain: str = '',
+) -> str | None:
+    """
+    v24.5 (Крок 3 P0): Завжди формує пряме посилання на вкладку People -> marketing
+    сторінки компанії в LinkedIn (`https://www.linkedin.com/company/<slug>/people/?keywords=marketing`).
+    Якщо посилання на LinkedIn-сторінку компанії не знайдено на сайті, детерміновано
+    будує шлях на основі брендового slug домену (напр., `adidas.com` -> `/company/adidas/people/?keywords=marketing`).
+    """
+    if linkedin_url and 'linkedin.com/company/' in linkedin_url.lower():
+        clean_base = linkedin_url.split('?')[0].rstrip('/')
+        return f'{clean_base}/people/?keywords=marketing'
+    dom = (canonical_domain or '').lower().strip().removeprefix('www.').rstrip('.')
+    if dom:
+        slug = re.sub(r'[^a-z0-9-]', '', dom.split('.')[0])
+        if len(slug) >= 2:
+            return f'https://www.linkedin.com/company/{slug}/people/?keywords=marketing'
+    return None
+
+
+def build_marketing_department_escalation_note(
+    dm_name: str | None,
+    dm_role: str | None,
+    company_linkedin_people_url: str | None,
+) -> str:
+    """
+    Єдине формулювання для випадків, коли на сайті знайдено лише CEO/Founder або ЛПР не знайдено:
+    `"Head of Marketing not found on site. Check marketing department via LinkedIn: <url>"`
+    """
+    li_target = company_linkedin_people_url or 'LinkedIn company People tab (keywords=marketing)'
+    if dm_name:
+        return (
+            f'Head of Marketing not found on site (only {dm_role or "CEO/Founder"} {dm_name} listed). '
+            f'Check marketing department via LinkedIn: {li_target}'
+        )
+    return f'Head of Marketing not found on site. Check marketing department via LinkedIn: {li_target}'
+
+
+def is_ceo_or_founder_role(role_str: str | None) -> bool:
+    return bool(role_str and CEO_FOUNDER_OWNER_RE.search(role_str))
+
 
 def is_server_verified_email_confidence(
     best_email_confidence: str | None,
     deliverability_check: str | None = None,
 ) -> bool:
-    """
-    Повертає True лише тоді, коли email підтверджено поштовим сервером:
-    `M365_AD_VERIFIED` або `SMTP_API_VERIFIED` (Reoon / MillionVerifier) за наявності
-    сконфігурованих MX-записів (`domain_mail_configured`).
-    Профільні збіги (`GRAVATAR_OR_PGP_MATCH`) НЕ вважаються серверною верифікацією скриньки.
-    """
     conf = (best_email_confidence or '').strip().upper()
     deliv = (deliverability_check or '').lower()
     if conf in ('M365_AD_VERIFIED', 'SMTP_API_VERIFIED'):
@@ -375,7 +422,7 @@ async def query_wikidata_holding_and_ceo(
     sparql = build_wikidata_holding_sparql_v23_1(domain, extra_san_domains)
     headers = {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "ApifyB2BLeadEnricherBot/24.4 (https://apify.com; support@apify.com)",
+        "User-Agent": "ApifyB2BLeadEnricherBot/24.5 (https://apify.com; support@apify.com)",
     }
     async with WIKIDATA_SEMAPHORE:
         try:
@@ -1593,7 +1640,14 @@ def classify_dm_source_type(source_url: str | None) -> str | None:
 
 
 def is_marketing_or_digital_role(role_str: str | None) -> bool:
-    r_low = (role_str or '').lower()
+    """
+    v24.5 (Крок 3 P0): Будь-яка роль, що містить CEO / Founder / Owner / President /
+    Managing Director, примусово повертає False — операційним покупцем є ЛИШЕ профільний
+    керівник маркетингу, digital, e-commerce, growth, CRO або аналітики.
+    """
+    if not role_str or is_ceo_or_founder_role(role_str):
+        return False
+    r_low = role_str.lower()
     return any(
         k in r_low for k in (
             'cmo', 'marketing', 'e-commerce', 'ecommerce', 'growth',
@@ -1605,31 +1659,39 @@ def is_marketing_or_digital_role(role_str: str | None) -> bool:
     )
 
 
-def classify_dm_buyer_fit(dm_name: str | None, dm_role: str | None) -> str:
+def classify_dm_buyer_fit(
+    dm_name: str | None,
+    dm_role: str | None,
+    account_scale_tier: str | None = None,
+) -> str:
+    """
+    v24.5: Посади CEO / Founder / Owner / President (напр., John Collison / Stripe,
+    Kim Kardashian / Skims) НІКОЛИ не отримують `direct_marketing_buyer` — суворо
+    `escalation_needed_via_ceo`.
+    """
     if not dm_name:
         return 'no_dm_found'
+    if is_ceo_or_founder_role(dm_role):
+        return 'escalation_needed_via_ceo'
     if is_marketing_or_digital_role(dm_role):
         return 'direct_marketing_buyer'
     return 'escalation_needed_via_ceo'
 
 
 def _dm_role_priority_weight(role_str: str | None) -> int:
-    """
-    v24.4: Пріоритет №1 — операційні керівники маркетингу, digital, e-commerce, growth, analytics.
-    """
     r_low = (role_str or '').lower()
     if 'supervisory' in r_low or 'aufsichtsrat' in r_low:
         return -30
-    if any(
-        k in r_low for k in (
-            'cmo', 'chief marketing', 'vp of marketing', 'vp marketing', 'svp of marketing',
-            'head of marketing', 'marketing director', 'head of e-commerce', 'e-commerce director',
-            'head of digital', 'head of growth', 'performance marketing', 'head of analytics',
-            'head of cro', 'head of crm',
-        )
-    ):
-        return 90
     if is_marketing_or_digital_role(role_str):
+        if any(
+            k in r_low for k in (
+                'cmo', 'chief marketing', 'vp of marketing', 'vp marketing', 'svp of marketing',
+                'head of marketing', 'marketing director', 'head of e-commerce', 'e-commerce director',
+                'head of digital', 'head of growth', 'performance marketing', 'head of analytics',
+                'head of cro', 'head of crm',
+            )
+        ):
+            return 90
         return 75
     if any(k in r_low for k in ('commercial director',)):
         return 26
@@ -1746,7 +1808,6 @@ def extract_decision_maker_deep(
                     if clean_li and clean_li not in personal_linkedin_urls:
                         personal_linkedin_urls.append(clean_li)
 
-            # 1. Структуровані HTML-картки команди (/team, /leadership, /about) із вкладеними LinkedIn-посиланнями
             for card in soup.find_all(['div', 'li', 'article', 'figure']):
                 if card.find_all(['section', 'main', 'header', 'footer', 'nav']):
                     continue
@@ -1781,7 +1842,6 @@ def extract_decision_maker_deep(
                 sc = _dm_role_priority_weight(norm_r) + page_bonus + 16
                 _register_candidate(cand_name, norm_r, page_url, is_legal_doc, src_type, sc, direct_li=card_li)
 
-            # 2. JSON-LD структуровані дані (@type: Person + employee/member/director/founder)
             for ld_script in soup.find_all('script', type=re.compile(r'ld\+json', re.I)):
                 try:
                     data = json.loads(ld_script.string or '')
@@ -1832,7 +1892,6 @@ def extract_decision_maker_deep(
                 except Exception:
                     pass
 
-        # 3. Прес-цитати та новини (виключно операційні маркетингові/digital/e-commerce ролі)
         for pm in PRESS_QUOTE_MARKETING_PATTERN.finditer(page_text):
             start_w = max(0, pm.start() - 100)
             end_w = min(len(page_text), pm.end() + 100)
@@ -1914,7 +1973,6 @@ def extract_decision_maker_deep(
         if c_info['li_url']:
             c_info['score'] += 25
 
-    # Жорсткий пріоритет операційного покупця маркетингу/digital/e-commerce над CEO/Founder
     sorted_cands = sorted(
         candidates.values(),
         key=lambda item: (
