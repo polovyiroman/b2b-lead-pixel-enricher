@@ -30,6 +30,20 @@ from .config import (
 
 HTTP_HEADERS_COMMENT_RE = re.compile(r'<!--\s*http_headers_json:\s*(\{.*?\})\s*-->', re.DOTALL)
 PW_NET_REQ_COMMENT_RE = re.compile(r'<!--\s*pw_net_req:\s*(https?://[^\s>]+)\s*-->', re.IGNORECASE)
+PW_XHR_REQ_COMMENT_RE = re.compile(
+    r'<!--\s*pw_xhr_req:\s*([a-zA-Z0-9_-]+)\s+(https?://[^\s>]+)\s*-->',
+    re.IGNORECASE,
+)
+PW_RUNTIME_SUMMARY_RE = re.compile(
+    r'<!--\s*pw_runtime_summary:\s*(\{.*?\})\s*-->',
+    re.DOTALL,
+)
+
+NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE = re.compile(
+    r'(?:/g/collect|/j/collect|/r/collect|/collect(?:/|$|\?)|/sgtm/|/sst/|/gtm\.js|/gtag/js|'
+    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi)',
+    re.IGNORECASE,
+)
 
 SHOPIFY_SHOP_DOMAIN_RE = re.compile(
     r'(?:Shopify\.shop\s*=\s*["\']|["\']shop["\']\s*:\s*["\'])([a-z0-9-]+\.myshopify\.com)["\']',
@@ -104,6 +118,12 @@ COOKIE_TECH_SIGNATURES: Dict[str, str] = {
     '_hjsessionuser': 'Hotjar',
     'hubspotutk': 'HubSpot',
     '__kla_id': 'Klaviyo',
+    'ajs_anonymous_id': 'Segment',
+    'ajs_user_id': 'Segment',
+    'amcv_': 'Adobe Analytics',
+    'utag_main': 'Tealium',
+    'amp_': 'Amplitude',
+    'mp_': 'Mixpanel',
 }
 
 RUNTIME_NET_SIGNATURES: Dict[str, tuple[str, ...]] = {
@@ -119,6 +139,15 @@ RUNTIME_NET_SIGNATURES: Dict[str, tuple[str, ...]] = {
     'HubSpot': ('js.hs-scripts.com', 'js.hs-analytics.net'),
     'Klaviyo': ('static.klaviyo.com', 'a.klaviyo.com'),
     'Shopify': ('cdn.shopify.com',),
+    'Adobe Analytics': ('assets.adobedtm.com', 'omtrdc.net', '/b/ss/'),
+    'Segment': ('cdn.segment.com', 'api.segment.io', 'cdn.segment.io'),
+    'Tealium': ('tags.tiqcdn.com', 'collect.tealiumiq.com'),
+    'Amplitude': ('cdn.amplitude.com', 'api2.amplitude.com', 'api.eu.amplitude.com'),
+    'Mixpanel': ('cdn.mxpnl.com', 'api-js.mixpanel.com', 'api-eu.mixpanel.com'),
+    'Braze': ('js.appboycdn.com', 'sdk.iad-', 'sdk.fra-'),
+    'Dynamic Yield': ('cdn.dynamicyield.com', 'cdn-eu.dynamicyield.com'),
+    'Optimizely': ('cdn.optimizely.com', 'logx.optimizely.com'),
+    'Salesforce Marketing Cloud': ('exacttarget.com', 'collect.igodigital.com'),
 }
 
 PAYMENT_GATEWAY_NAMES: Set[str] = {
@@ -148,6 +177,66 @@ def _extract_reg_domain_for_sgtm(page_url: str) -> str:
     return last_two
 
 
+def analyze_xhr_fetch_tracking_signals(html_str: str, page_url: str) -> Dict[str, Any]:
+    """
+    v24.3 XHR/Fetch/Ping Runtime Traffic Analyzer:
+    Аналізує перехоплені Playwright XHR/Fetch/Beacon запити (`pw_xhr_req`, `pw_runtime_summary`),
+    виявляє server-side tracking на нестандартних першосторонніх піддоменах (напр. `x99.domain.com/collect`,
+    `fp.domain.com/g/collect`) та first-party проксі-шляхах (`/sgtm/collect`, `/capi/`, `/mp/collect`).
+    """
+    reg_dom = _extract_reg_domain_for_sgtm(page_url)
+    summary: Dict[str, Any] = {}
+    m_sum = PW_RUNTIME_SUMMARY_RE.search(html_str or '')
+    if m_sum:
+        try:
+            parsed = json.loads(m_sum.group(1))
+            if isinstance(parsed, dict):
+                summary = parsed
+        except Exception:
+            summary = {}
+
+    xhr_entries = PW_XHR_REQ_COMMENT_RE.findall(html_str or '')
+    first_party_hits: List[str] = []
+    seen: Set[str] = set()
+
+    for res_type, u in xhr_entries:
+        p = urlparse(u)
+        nh = (p.hostname or '').lower().strip('.')
+        path_q = f'{p.path}?{p.query}'
+        path_q_low = path_q.lower()
+        is_first_party = bool(reg_dom and (nh == reg_dom or nh.endswith(f'.{reg_dom}')))
+        is_non_www_sub = bool(reg_dom and nh.endswith(f'.{reg_dom}') and nh != f'www.{reg_dom}')
+
+        if is_first_party and NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE.search(path_q):
+            ev = f'XHR/{res_type.upper()} 1st-party collect hit: {nh}{p.path[:60]}'
+            if ev not in seen:
+                seen.add(ev)
+                first_party_hits.append(ev)
+        elif is_non_www_sub and any(
+            tok in path_q_low
+            for tok in ('tid=g-', 'v=2&', 'en=page_view', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=')
+        ):
+            ev = f'XHR/{res_type.upper()} non-standard 1st-party tracking subdomain: {nh}{p.path[:60]}'
+            if ev not in seen:
+                seen.add(ev)
+                first_party_hits.append(ev)
+
+    for extra_u in (summary.get('first_party_collect_hits') or []):
+        ev = f'XHR/Fetch 1st-party endpoint: {str(extra_u)[:120]}'
+        if ev not in seen:
+            seen.add(ev)
+            first_party_hits.append(ev)
+
+    total_inspected = max(len(xhr_entries), int(summary.get('total_xhr_fetch_count') or 0))
+    analyzed = bool(summary.get('xhr_fetch_analyzed') or len(xhr_entries) > 0)
+    return {
+        'xhr_fetch_traffic_analyzed': analyzed,
+        'xhr_fetch_requests_inspected': total_inspected,
+        'xhr_first_party_collect_endpoints': first_party_hits[:10],
+        'xhr_urls': [u for _, u in xhr_entries],
+    }
+
+
 def detect_first_party_sgtm_endpoints(
     html_clean: str,
     gtm_str: str,
@@ -155,7 +244,6 @@ def detect_first_party_sgtm_endpoints(
     page_url: str,
 ) -> list[tuple[str, str]]:
     """
-    v24.2 First-Party sGTM Subdomain Detector:
     Виявляє серверний трекінг (sGTM / CAPI / First-Party Collector) на першосторонніх піддоменах
     (metrics.<domain>, analytics.<domain>, sgtm.<domain>, sst.<domain>, tag.<domain>, track.<domain> тощо)
     у мережевих запитах Playwright, параметрах transport_url/server_container_url та коді HTML/GTM.
@@ -167,7 +255,6 @@ def detect_first_party_sgtm_endpoints(
     hits: list[tuple[str, str]] = []
     seen_ev: Set[str] = set()
 
-    # 1. Мережеві запити Playwright на першосторонні трекінг-піддомени (runtime_verified)
     for n_url in (net_urls or []):
         parsed = urlparse(n_url)
         nh = (parsed.hostname or '').lower().strip('.')
@@ -182,10 +269,15 @@ def detect_first_party_sgtm_endpoints(
                 if ev not in seen_ev:
                     seen_ev.add(ev)
                     hits.append(('runtime_verified', ev))
+        elif nh == reg_dom or nh == f'www.{reg_dom}':
+            if NON_STANDARD_FIRST_PARTY_TRACKING_PATH_RE.search(f'{parsed.path}?{parsed.query}'):
+                ev = f'1st-party sGTM path proxy request: {nh}{parsed.path[:60]}'
+                if ev not in seen_ev:
+                    seen_ev.add(ev)
+                    hits.append(('runtime_verified', ev))
 
     combined = f'{html_clean or ""}\n{gtm_str or ""}'
 
-    # 2. Явна конфігурація transport_url / server_container_url у HTML або GTM
     for m_url in SGTM_TRANSPORT_URL_RE.findall(combined):
         m_low = m_url.lower()
         if not any(g in m_low for g in ('google-analytics.com', 'googletagmanager.com', 'doubleclick.net')):
@@ -194,7 +286,6 @@ def detect_first_party_sgtm_endpoints(
                 seen_ev.add(ev)
                 hits.append(('configured_in_code', ev))
 
-    # 3. Посилання на першосторонні трекінг-піддомени в HTML/GTM (metrics.domain.com, analytics.domain.com тощо)
     sub_alt = '|'.join(re.escape(p) for p in SGTM_SUBDOMAIN_PREFIXES)
     fp_sub_re = re.compile(
         rf'https?://((?:{sub_alt})\.{re.escape(reg_dom)})(?:/[^\s"\'<>]*)?',
@@ -278,6 +369,12 @@ def extract_embedded_headers_and_ssr_signals_v23_1(html: str) -> Dict[str, Any]:
             out['cookie_techs'][t_name] = f'HTTP Set-Cookie runtime cookie: {c_name}'
         elif c_name.startswith('_ga_'):
             out['cookie_techs']['Google Analytics (GA4)'] = f'HTTP Set-Cookie runtime cookie: {c_name}'
+        elif c_name.startswith('amcv_'):
+            out['cookie_techs']['Adobe Analytics'] = f'HTTP Set-Cookie runtime cookie: {c_name}'
+        elif c_name.startswith('amp_'):
+            out['cookie_techs']['Amplitude'] = f'HTTP Set-Cookie runtime cookie: {c_name}'
+        elif c_name.startswith('mp_'):
+            out['cookie_techs']['Mixpanel'] = f'HTTP Set-Cookie runtime cookie: {c_name}'
 
     if hdrs.get('x-shopid') or hdrs.get('x-shopify-stage'):
         out['ssr_cms'] = 'Shopify'
@@ -368,10 +465,6 @@ def extract_account_scale_signals(
     ga4_ids_count: int | None = None,
     advertiser_sister_domains: list[str] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Визначає географічний масштаб бізнесу (estimated_markets_count, detected_market_locales)
-    на основі <link rel="alternate" hreflang="...">, мульти-властивостей GA4 та сестринських доменів.
-    """
     locales: Set[str] = set()
     if html:
         for g1, g2 in HREFLANG_LINK_RE.findall(html[:120000]):
@@ -402,10 +495,6 @@ def detect_agency_credits_from_html_and_gtm(
     gtm_js: str = '',
     brand_root: str = '',
 ) -> Optional[str]:
-    """
-    Виявляє веб-студію, розробника або performance-агенцію у футері сайту чи GTM-контейнері.
-    Використовує лише точні маркери агенцій (без загального підрядка 'dept').
-    """
     b_low = (brand_root or '').lower().strip()
     if html:
         tail = html[-35000:] if len(html) > 35000 else html
@@ -483,15 +572,21 @@ def detect_tech_with_evidence(
     scan_completeness: str = 'full',
 ) -> dict:
     """
-    v24.2 Enterprise MarTech & Account Intelligence:
-    Розділяє джерела сигналів на 3 рівні підтвердження:
-      - `runtime_verified` (мережевий запит Playwright `pw_net_req`, першосторонній sGTM-запит або кукі `FPID`/`_ga`/`_fbp`);
-      - `configured_in_code` (HTML-код сторінки, першосторонній sGTM-піддомен або код розпакованого `gtm.js`);
-      - `allowlisted_in_csp` (лише список дозволених доменів у заголовку `Content-Security-Policy`).
+    v24.3 Enterprise MarTech & Runtime XHR/Fetch Traffic Analyzer:
+    1. Аналізує XHR/Fetch/Ping трафік із Playwright (`pw_xhr_req`, `pw_runtime_summary`) для виявлення
+       server-side tracking навіть на нестандартних першосторонніх піддоменах та `/collect`.
+    2. Розділяє джерела сигналів на 3 рівні підтвердження:
+       `runtime_verified`, `configured_in_code`, `allowlisted_in_csp`.
     """
     html_str = html or ''
     gtm_str = gtm_js or ''
-    html_clean_body = PW_NET_REQ_COMMENT_RE.sub('', HTTP_HEADERS_COMMENT_RE.sub('', html_str))
+    html_clean_body = PW_RUNTIME_SUMMARY_RE.sub(
+        '',
+        PW_XHR_REQ_COMMENT_RE.sub(
+            '',
+            PW_NET_REQ_COMMENT_RE.sub('', HTTP_HEADERS_COMMENT_RE.sub('', html_str)),
+        ),
+    )
     html_low = html_clean_body.lower()
     gtm_low = gtm_str.lower()
 
@@ -517,7 +612,11 @@ def detect_tech_with_evidence(
     for tech_name, ck_ev in hdr_info['cookie_techs'].items():
         _record_tech(tech_name, 'runtime_verified', 'runtime_cookie', ck_ev)
 
-    net_urls = PW_NET_REQ_COMMENT_RE.findall(html_str)
+    xhr_info = analyze_xhr_fetch_tracking_signals(html_str, page_url)
+    for xhr_ev in xhr_info['xhr_first_party_collect_endpoints']:
+        _record_tech('Server-Side GTM (sGTM)', 'runtime_verified', 'runtime_xhr_fetch', xhr_ev)
+
+    net_urls = list(dict.fromkeys(PW_NET_REQ_COMMENT_RE.findall(html_str) + xhr_info['xhr_urls']))
     runtime_ga4_hit_counts: Counter = Counter()
     consent_mode_signals: Set[str] = set()
     sgtm_hosts: Set[str] = set()
@@ -546,7 +645,6 @@ def detect_tech_with_evidence(
         for gcd_m in CONSENT_MODE_V2_GCD_REGEX.findall(n_url):
             consent_mode_signals.add(f'gcd={gcd_m}')
 
-    # v24.2: Покращена детекція першосторонніх sGTM-піддоменів (metrics., analytics., sgtm., transport_url)
     for fp_tier, fp_ev in detect_first_party_sgtm_endpoints(html_clean_body, gtm_str, net_urls, page_url):
         src_lbl = 'runtime_network' if fp_tier == 'runtime_verified' else 'html_or_gtm'
         _record_tech('Server-Side GTM (sGTM)', fp_tier, src_lbl, fp_ev)
@@ -661,6 +759,16 @@ def detect_tech_with_evidence(
         t: info['verification_tier'] for t, info in evidence_map.items()
     }
 
+    sgtm_tier = tech_verification_tiers.get('Server-Side GTM (sGTM)')
+    if sgtm_tier == 'runtime_verified':
+        sgtm_assessment = 'runtime_verified_sgtm'
+    elif sgtm_tier == 'configured_in_code':
+        sgtm_assessment = 'configured_in_code_sgtm'
+    elif xhr_info['xhr_fetch_traffic_analyzed']:
+        sgtm_assessment = 'not_detected_in_xhr_traffic'
+    else:
+        sgtm_assessment = 'not_detected_in_static_html'
+
     evidence_lines = [
         f"{t} [{info['verification_tier']}]: {info['evidence']}"
         for t, info in sorted(evidence_map.items())
@@ -692,6 +800,10 @@ def detect_tech_with_evidence(
         'has_cookie_banner': has_cookie_banner,
         'has_consent_mode_v2_signals': bool(consent_mode_signals),
         'consent_mode_v2_signals': sorted(consent_mode_signals),
+        'xhr_fetch_traffic_analyzed': xhr_info['xhr_fetch_traffic_analyzed'],
+        'xhr_fetch_requests_inspected': xhr_info['xhr_fetch_requests_inspected'],
+        'xhr_first_party_collect_endpoints': xhr_info['xhr_first_party_collect_endpoints'],
+        'server_side_tracking_assessment': sgtm_assessment,
         'detected_cms_list': detected_cms_list,
         'detected_cms': '; '.join(detected_cms_list) if detected_cms_list else None,
         'payment_gateways': sorted(payment_gateways),
