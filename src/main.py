@@ -219,7 +219,7 @@ AGENCY_NAME_MARKERS = (
 
 
 # ==============================================================================
-# v24.1.1 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
+# v24.1.2 Enterprise MarTech & Account Intelligence: OSINT Runner, Dedup & Schema
 # ==============================================================================
 
 async def run_osint_tasks_with_time_budget(
@@ -323,15 +323,34 @@ def _build_company_linkedin_people_url(linkedin_url: str | None) -> str | None:
     return f"{clean_base}/people/?keywords=marketing"
 
 
+def _normalize_inverted_dm_name(raw_dm_name: str | None) -> tuple[str | None, str | None, str | None]:
+    """
+    Використовує `split_clean_executive_name` для розбиття ПІБ та синхронізує
+    `decision_maker_name`, якщо спрацювала автоінверсія слов'янського формату
+    `Прізвище Ім'я` -> `Ім'я Прізвище` (напр. `Бойчук Людмила` -> `Людмила Бойчук`).
+    """
+    if not raw_dm_name:
+        return None, None, None
+    dm_sp = split_clean_executive_name(raw_dm_name)
+    fn = dm_sp['dm_first_name'] or None
+    ln = dm_sp['dm_last_name'] or None
+    clean_full = dm_sp['dm_clean_full_name'] or raw_dm_name
+    raw_toks = [t for t in raw_dm_name.strip().split() if t]
+    if len(raw_toks) == 2 and fn and ln and fn == raw_toks[1] and ln == raw_toks[0]:
+        return clean_full, fn, ln
+    return raw_dm_name, fn, ln
+
+
 def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: str = 'US') -> dict:
     """
-    Гарантує 100% паритет усіх 143 ключів схеми v24.1.1 та повну гідратацію
-    кешованих записів (відновлення best_email_confidence, dm_predicted_email з email_source_note,
-    а також primary_sales_gap / sales_gap_confidence).
+    Гарантує 100% паритет усіх 143 ключів схеми v24.1.2 та повну гідратацію
+    кешованих записів (включно з узгодженням `gdpr_jurisdiction` та `legal_basis_for_processing`).
     """
-    dm_sp = split_clean_executive_name(rec.get('decision_maker_name') or '')
-    rec.setdefault('dm_first_name', dm_sp['dm_first_name'] or None)
-    rec.setdefault('dm_last_name', dm_sp['dm_last_name'] or None)
+    norm_dm, norm_fn, norm_ln = _normalize_inverted_dm_name(rec.get('decision_maker_name'))
+    if norm_dm:
+        rec['decision_maker_name'] = norm_dm
+    rec['dm_first_name'] = norm_fn
+    rec['dm_last_name'] = norm_ln
     rec.setdefault('decision_maker_scope', 'target_entity' if rec.get('decision_maker_name') else 'none')
     rec.setdefault('company_linkedin_people_url', _build_company_linkedin_people_url(rec.get('linkedin_url')))
 
@@ -415,7 +434,17 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         '',
     )
     jur_str = rec.get('gdpr_jurisdiction') or derive_gdpr_jurisdiction(canonical_domain, rec.get('primary_phone'), c_hint, '')
+    is_eu_cached = jur_str in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
     rec['gdpr_jurisdiction'] = jur_str
+    rec['gdpr_eu_domain'] = is_eu_cached
+    if rec.get('legal_basis_for_processing'):
+        rec['legal_basis_for_processing'] = derive_legal_basis_for_processing(
+            canonical_domain,
+            c_hint,
+            bool(best_em or rec.get('decision_maker_name') or rec.get('primary_phone')),
+            gdpr_jurisdiction=jur_str,
+        )
+    rec['compliance_note'] = build_compliance_note(canonical_domain, c_hint, gdpr_jurisdiction=jur_str)
     rec.setdefault(
         'data_source_sensitivity',
         derive_data_source_sensitivity(rec.get('decision_maker_source_type'), rec.get('email_source_type'), jur_str),
@@ -428,6 +457,7 @@ def _ensure_full_v24_schema(rec: dict, canonical_domain: str, default_region: st
         '',
         page_title=str(rec.get('page_title') or ''),
         gdpr_jurisdiction=jur_str,
+        is_eu_gdpr=is_eu_cached,
     )
     rec.setdefault('prospect_iana_timezone', tz_info['prospect_iana_timezone'])
     rec.setdefault('recommended_outreach_lang', tz_info['recommended_outreach_lang'])
@@ -677,7 +707,9 @@ def _build_early_abort_record(
     c_hint = detect_country_hint(canonical_domain, '', '', None, '')
     blocked_jur = derive_gdpr_jurisdiction(canonical_domain, None, c_hint, '')
     blocked_is_eu = blocked_jur in ('EU_EEA_GDPR', 'UK_GDPR', 'CH_FADP')
-    tz_info = resolve_prospect_timezone_and_locale_v23(canonical_domain, None, c_hint, '', gdpr_jurisdiction=blocked_jur)
+    tz_info = resolve_prospect_timezone_and_locale_v23(
+        canonical_domain, None, c_hint, '', gdpr_jurisdiction=blocked_jur, is_eu_gdpr=blocked_is_eu
+    )
     verdict = (
         'Disqualified (SSRF / Non-Public Target Blocked)'
         if fail_status == 'ssrf_blocked'
@@ -720,7 +752,7 @@ def _build_early_abort_record(
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': f'none ({fail_status})',
-        'compliance_note': build_compliance_note(canonical_domain, c_hint),
+        'compliance_note': build_compliance_note(canonical_domain, c_hint, gdpr_jurisdiction=blocked_jur),
         'playwright_available': is_playwright_available(),
         'playwright_used': False,
         'playwright_status': pw_status_str,
@@ -1615,9 +1647,8 @@ async def process_domain(
     elif decision_maker_scope == 'none':
         decision_maker_scope = 'target_entity'
 
-    dm_split = split_clean_executive_name(dm_name or '')
-    dm_first_name = dm_split['dm_first_name'] or None
-    dm_last_name = dm_split['dm_last_name'] or None
+    # v24.1.2: Автоінверсія слов'янських ПІБ (Бойчук Людмила -> Людмила Бойчук)
+    dm_name, dm_first_name, dm_last_name = _normalize_inverted_dm_name(dm_name)
 
     decision_makers_json_str = build_decision_makers_json_from_summary(
         decision_makers_found_str, dm_linkedin_url, dm_fallback_url
@@ -1837,6 +1868,7 @@ async def process_domain(
         canonical_domain,
         country_hint,
         bool(best_email or dm_name or primary_phone),
+        gdpr_jurisdiction=gdpr_jurisdiction,
     )
     data_sensitivity = derive_data_source_sensitivity(dm_source_type, email_source_type, gdpr_jurisdiction)
     pii_fields_str = derive_pii_fields(best_email, best_email_type, dm_name, primary_phone, dm_linkedin_url)
@@ -1895,6 +1927,7 @@ async def process_domain(
         html_lang_m.group(1) if html_lang_m else '',
         page_title=page_title or '',
         gdpr_jurisdiction=gdpr_jurisdiction,
+        is_eu_gdpr=is_eu_gdpr,
     )
 
     lifecycle_info = detect_ma_rebrand_and_insolvency_v23(
@@ -1962,7 +1995,7 @@ async def process_domain(
         'data_subject_can_request_deletion': True,
         'data_retention_policy_days': 365,
         'personal_data_fields_in_record': pii_fields_str,
-        'compliance_note': build_compliance_note(canonical_domain, country_hint),
+        'compliance_note': build_compliance_note(canonical_domain, country_hint, gdpr_jurisdiction=gdpr_jurisdiction),
         'playwright_available': is_playwright_available(),
         'playwright_used': pw_used_flag,
         'playwright_status': pw_status_str,
