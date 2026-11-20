@@ -34,6 +34,7 @@ from .contacts import (
 from .domain_helpers import (
     derive_data_source_sensitivity,
     derive_gdpr_jurisdiction,
+    derive_legal_basis_for_processing,
     derive_sales_actionability_class,
     detect_country_hint,
 )
@@ -52,6 +53,7 @@ from .qualifier import (
     resolve_prospect_timezone_and_locale_v23,
 )
 from .scraper import (
+    _build_pw_proxy_attempt_plan,
     _extract_etld_local,
     append_safe_headers_comment_v23_1,
     deobfuscate_cfemails_in_html,
@@ -157,7 +159,8 @@ def run_startup_regression_gate(
     resolve_cache_comp_fn: Callable[..., Any] | None = None,
 ) -> None:
     """
-    Виконує 36 вбудованих юніт- та інтеграційних тестів під час старту контейнера (Startup Regression Gate v24.1.1).
+    Виконує 41 вбудований юніт- та інтеграційний тест під час старту контейнера
+    (Startup Regression Gate v24.1.2 / Build 0.0.309).
     """
     # 1. Domain preparation & canonicalization
     prep = prepare_domains(['https://www.Intertop.ua/ua/', 'modnakasta.ua'])
@@ -315,7 +318,7 @@ def run_startup_regression_gate(
     )
     assert ma_liq['corporate_lifecycle_status'] == 'IN_LIQUIDATION_OR_INSOLVENCY'
 
-    # 18. SaaS Spend Estimator (v24.1: виключає allowlisted_in_csp та BIMI VMC Seal)
+    # 18. SaaS Spend Estimator (виключає allowlisted_in_csp та BIMI VMC Seal)
     sp_est = calculate_saas_spend_range_usd(
         {'Shopify Plus', 'Klaviyo', 'Dynamic Yield'},
         has_enterprise_cdn=True,
@@ -476,5 +479,50 @@ def run_startup_regression_gate(
     )
     assert 'company_linkedin_people_url' in nba_has_li
 
+    # 28. Build 0.0.309 Blind-Web Hardening Checks (v24.1.2)
+    # 28a. UI-фантоми демо-екранів та німецькі юридичні займенники
+    assert is_valid_person_name('Direct Message', 'airslate') is False
+    assert is_valid_person_name('Maiden Voyage', 'pipedrive') is False
+    assert is_valid_person_name('Sofern Sie', 'breuninger') is False
+    assert is_valid_person_name('Stammkarte Mitglied', 'breuninger') is False
+
+    # 28b. Автоінверсія українських ПІБ (vovk.com: Бойчук Людмила -> Людмила Бойчук)
+    sp_vovk = split_clean_executive_name('Бойчук Людмила')
+    assert sp_vovk['dm_first_name'] == 'Людмила'
+    assert sp_vovk['dm_last_name'] == 'Бойчук'
+    assert sp_vovk['dm_clean_full_name'] == 'Людмила Бойчук'
+
+    sp_normal_ua = split_clean_executive_name('Владислав Чечоткін')
+    assert sp_normal_ua['dm_first_name'] == 'Владислав'
+    assert sp_normal_ua['dm_last_name'] == 'Чечоткін'
+
+    # 28c. Синхронізація gdpr_jurisdiction для legal_basis та таймзони (preply.com)
+    lb_preply = derive_legal_basis_for_processing('preply.com', 'US', True, gdpr_jurisdiction='EU_EEA_GDPR')
+    assert 'gdpr_art_6_1_f' in lb_preply
+    assert 'us_can_spam' not in lb_preply
+    tz_preply = resolve_prospect_timezone_and_locale_v23(
+        'preply.com', None, 'US', 'en', gdpr_jurisdiction='EU_EEA_GDPR', is_eu_gdpr=True
+    )
+    assert tz_preply['prospect_iana_timezone'] == 'Europe/Berlin'
+
+    # 28d. Пріоритет SaaS над евристикою spa_ecom_markers (pipedrive.com)
+    cat_pipe, _ = classify_company_category(
+        'pipedrive.com',
+        'Pipedrive — Sales CRM & Pipeline Management',
+        'Easy-to-use sales CRM software for growing teams',
+        [],
+        '<script>window.__DATA__ = {"product": "crm", "cart": []};</script>',
+    )
+    assert cat_pipe == 'SaaS / Marketplace / Tech Platform'
+
+    # 28e. Фолбек проксі Playwright при start_residential=True (ніколи не повертає 0 спроб)
+    plan_no_res = _build_pw_proxy_attempt_plan(True, None, 'http://std-proxy:8000', max_attempts=1)
+    assert len(plan_no_res) == 1 and plan_no_res[0][1] == 'http://std-proxy:8000'
+
+    plan_with_res = _build_pw_proxy_attempt_plan(True, 'http://res-proxy:8000', 'http://std-proxy:8000', max_attempts=1)
+    assert len(plan_with_res) == 2
+    assert plan_with_res[0] == ('residential', 'http://res-proxy:8000')
+    assert plan_with_res[1] == ('standard_pool_fallback', 'http://std-proxy:8000')
+
     if log_fn is not None:
-        log_fn('STARTUP REGRESSION GATE PASSED: 36/36 unit & integration tests green (v24.1.1 Store Release).')
+        log_fn('STARTUP REGRESSION GATE PASSED: 41/41 unit & integration tests green (v24.1.2 / Build 0.0.309 Store Release).')
