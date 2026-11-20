@@ -147,6 +147,18 @@ PW_TRACKED_NET_KEYWORDS = (
     'cdn.shopify.com',
     'stape.io',
     'stape.net',
+    'adobedtm.com',
+    'omtrdc.net',
+    'cdn.segment.com',
+    'api.segment.io',
+    'tiqcdn.com',
+    'amplitude.com',
+    'mixpanel.com',
+    'mxpnl.com',
+    'dynamicyield.com',
+    'optimizely.com',
+    'braze.com',
+    'exacttarget.com',
 )
 
 PW_FIRST_PARTY_SGTM_SUBS: Set[str] = {
@@ -154,6 +166,25 @@ PW_FIRST_PARTY_SGTM_SUBS: Set[str] = {
     'track', 'tracking', 'collect', 'data', 'stats', 'measure',
     'measurement', 'events', 'server-side', 'ss', 'stape', 'telemetry',
 }
+
+PW_NON_STANDARD_COLLECT_PATH_RE = re.compile(
+    r'(?:/g/collect|/j/collect|/r/collect|/collect(?:/|$|\?)|/sgtm/|/sst/|/gtm\.js|/gtag/js|'
+    r'/mp/collect|/metrics/collect|/events/collect|/analytics/collect|/t/collect|/capi/|/fb-capi)',
+    re.IGNORECASE,
+)
+
+PW_TRACKING_QUERY_MARKERS = (
+    'tid=g-', 'v=2&', 'en=page_view', 'dl=http', '_fbp', 'fbp=', 'ttclid', 'gclid', 'cid=',
+)
+
+PW_STATIC_SUB_PREFIXES = ('cdn.', 'static.', 'assets.', 'img.', 'images.', 'media.', 'fonts.')
+
+EXTRA_LEADERSHIP_PATH_KEYWORDS = (
+    'team', 'our-team', 'leadership', 'management', 'executive', 'executives',
+    'founders', 'people', 'who-we-are', 'company', 'career', 'careers', 'jobs',
+    'karriere', 'vorstand', 'geschaeftsfuehrung', 'unsere-fuehrung',
+    'komanda', 'kerivnytstvo', 'equipe', 'equipo', 'zespol',
+)
 
 REGION_TO_PW_LOCALE: Dict[str, str] = {
     'UA': 'uk-UA',
@@ -504,10 +535,7 @@ def extract_semantic_contact_links_from_html(html: str, base_url: str) -> list[s
     links: List[str] = []
     seen: Set[str] = set()
 
-    extra_leadership_keywords = (
-        'team', 'leadership', 'management', 'founders', 'career', 'careers', 'jobs', 'karriere', 'vorstand'
-    )
-    all_path_keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + extra_leadership_keywords
+    all_path_keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + EXTRA_LEADERSHIP_PATH_KEYWORDS
 
     for a in soup.find_all('a', href=True):
         href = str(a.get('href') or '').strip()
@@ -529,7 +557,7 @@ def extract_semantic_contact_links_from_html(html: str, base_url: str) -> list[s
             if norm_u not in seen:
                 seen.add(norm_u)
                 links.append(norm_u)
-    return links[:15]
+    return links[:18]
 
 
 def parse_html_sync(
@@ -562,10 +590,7 @@ def parse_html_sync(
     base_host = (urlparse(page_url).hostname or '').lower().removeprefix('www.')
     brand_root = base_host.split('.')[0] if base_host else ''
 
-    extra_leadership_keywords = (
-        'team', 'leadership', 'management', 'founders', 'career', 'careers', 'jobs', 'karriere', 'vorstand'
-    )
-    all_path_keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + extra_leadership_keywords
+    all_path_keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + EXTRA_LEADERSHIP_PATH_KEYWORDS
     contact_links: List[str] = []
     seen_links: Set[str] = set()
 
@@ -660,7 +685,7 @@ def parse_html_sync(
         email_sources,
         phones_with_source,
         socials_with_source,
-        contact_links[:15],
+        contact_links[:18],
     )
 
 
@@ -731,7 +756,7 @@ def is_allowed_by_robots(url: str, disallowed_paths: list[str]) -> bool:
 
 async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> list[str]:
     found: List[str] = []
-    keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + ('team', 'leadership', 'careers')
+    keywords = PRIMARY_CONTACT_KEYWORDS + SECONDARY_CONTACT_KEYWORDS + EXTRA_LEADERSHIP_PATH_KEYWORDS
     try:
         resp = await client.get(f'{base_root.rstrip("/")}/sitemap.xml', timeout=3.5)
         if resp.status_code == 200 and resp.text:
@@ -740,7 +765,7 @@ async def discover_links_from_sitemap(client: AsyncSession, base_root: str) -> l
                 if any(k in p_low for k in keywords):
                     if loc not in found:
                         found.append(loc)
-                    if len(found) >= 8:
+                    if len(found) >= 10:
                         break
     except Exception:
         pass
@@ -946,7 +971,7 @@ async def fetch_waf_bypass_or_wayback_legal(
             rows = r.json()
             if isinstance(rows, list) and len(rows) > 1:
                 best_row = next(
-                    (row for row in rows[1:] if any(k in str(row[1]).lower() for k in ('impressum', 'contact', 'about'))),
+                    (row for row in rows[1:] if any(k in str(row[1]).lower() for k in ('impressum', 'contact', 'about', 'team'))),
                     rows[1],
                 )
                 wb_url = f'https://web.archive.org/web/{best_row[0]}id_/{best_row[1]}'
@@ -960,7 +985,7 @@ async def fetch_waf_bypass_or_wayback_legal(
 
 
 # ==============================================================================
-# Playwright Shared Browser Pool & v24.2 Resilient Proxy + sGTM Capture Engine
+# Playwright Shared Browser Pool & v24.3 XHR/Fetch + sGTM Traffic Capture Engine
 # ==============================================================================
 
 def is_playwright_available() -> bool:
@@ -1043,13 +1068,6 @@ def _build_pw_proxy_attempt_plan(
     std_proxy_url: Optional[str],
     max_attempts: int = 1,
 ) -> List[Tuple[str, Optional[str]]]:
-    """
-    Гарантує, що при `start_residential=True` Playwright НІКОЛИ не виходить мовчки
-    з `playwright_attempts_count: 0`:
-      1. Якщо RESIDENTIAL проксі не видався (`None`) — одразу робить спробу через стандартний пул проксі.
-      2. Якщо спроба через RESIDENTIAL провалилась — автоматично виконує ще 1 резервну спробу
-         через стандартний пул проксі (`std_proxy_url`).
-    """
     plan: List[Tuple[str, Optional[str]]] = []
     if start_residential:
         if res_proxy_url:
@@ -1072,12 +1090,50 @@ def _should_capture_pw_request(req_url: str, target_reg_dom: str) -> bool:
     if any(k in r_low for k in PW_TRACKED_NET_KEYWORDS):
         return True
     if target_reg_dom:
-        req_host = (urlparse(req_url).hostname or '').lower().strip('.')
+        p = urlparse(req_url)
+        req_host = (p.hostname or '').lower().strip('.')
         if req_host.endswith(f'.{target_reg_dom}') and req_host != f'www.{target_reg_dom}':
             sub_label = req_host[:-(len(target_reg_dom) + 1)].split('.')[0]
             if sub_label in PW_FIRST_PARTY_SGTM_SUBS:
                 return True
+        if req_host == target_reg_dom or req_host.endswith(f'.{target_reg_dom}'):
+            if PW_NON_STANDARD_COLLECT_PATH_RE.search(f'{p.path}?{p.query}'):
+                return True
     return False
+
+
+def _should_capture_pw_xhr(
+    req_url: str,
+    resource_type: str,
+    target_reg_dom: str,
+) -> Tuple[bool, bool]:
+    """
+    v24.3 XHR/Fetch/Ping Traffic Filter:
+    Повертає кортеж (should_capture, is_first_party_collect_hit).
+    Перехоплює нестандартні першосторонні піддомени (напр. `x99.brand.de/collect`,
+    `fp-edge.brand.de/ev?tid=G-...`) та проксі-шляхи (`/sgtm/collect`, `/capi/`).
+    """
+    rt = (resource_type or '').lower().strip()
+    if rt not in ('xhr', 'fetch', 'ping', 'beacon'):
+        return False, False
+    p = urlparse(req_url or '')
+    nh = (p.hostname or '').lower().strip('.')
+    path_q = f'{p.path}?{p.query}'
+    path_q_low = path_q.lower()
+    r_low = (req_url or '').lower()
+
+    is_first_party = bool(target_reg_dom and (nh == target_reg_dom or nh.endswith(f'.{target_reg_dom}')))
+    is_non_www_sub = bool(target_reg_dom and nh.endswith(f'.{target_reg_dom}') and nh != f'www.{target_reg_dom}')
+
+    if is_first_party and PW_NON_STANDARD_COLLECT_PATH_RE.search(path_q):
+        return True, True
+    if is_non_www_sub and any(mk in path_q_low for mk in PW_TRACKING_QUERY_MARKERS):
+        return True, True
+    if is_non_www_sub and not any(nh.startswith(pref) for pref in PW_STATIC_SUB_PREFIXES):
+        return True, False
+    if any(k in r_low for k in PW_TRACKED_NET_KEYWORDS):
+        return True, False
+    return False, False
 
 
 async def fetch_html_playwright_fallback(
@@ -1088,9 +1144,9 @@ async def fetch_html_playwright_fallback(
     start_residential: bool = False,
 ) -> tuple[str, str, str, bool, int]:
     """
-    Виконує рендеринг сторінки у Playwright із кліком по CMP-банеру згоди, перехопленням
-    мережевих запитів трекінгу й першосторонніх sGTM-піддоменів (`pw_net_req`), а також
-    резервним фолбеком проксі при `start_residential=True`.
+    Рендерить сторінку у Playwright із кліком по CMP-банеру згоди, перехопленням
+    мережевих запитів трекінгу (`pw_net_req`) та XHR/Fetch/Ping трафіку (`pw_xhr_req`,
+    `pw_runtime_summary`), а також резервним фолбеком проксі при `start_residential=True`.
     Повертає: (html, final_url, status_str, incomplete_flag, attempts_made).
     """
     if not _PLAYWRIGHT_AVAILABLE:
@@ -1129,6 +1185,9 @@ async def fetch_html_playwright_fallback(
             context = None
             page = None
             captured_net_urls: List[str] = []
+            captured_xhr_entries: List[Tuple[str, str]] = []
+            first_party_collect_hits: List[str] = []
+            xhr_counter = {'total': 0}
             resp_headers_obj: Any = None
 
             try:
@@ -1155,6 +1214,18 @@ async def fetch_html_playwright_fallback(
                 def _on_request(req: Any) -> None:
                     try:
                         r_url = str(req.url or '')
+                        r_type = str(getattr(req, 'resource_type', '') or '').lower()
+                        if r_type in ('xhr', 'fetch', 'ping', 'beacon'):
+                            xhr_counter['total'] += 1
+                            cap_xhr, is_fp_collect = _should_capture_pw_xhr(r_url, r_type, target_reg_dom)
+                            if cap_xhr and len(captured_xhr_entries) < 60:
+                                entry = (r_type, r_url)
+                                if entry not in captured_xhr_entries:
+                                    captured_xhr_entries.append(entry)
+                            if is_fp_collect and len(first_party_collect_hits) < 15:
+                                if r_url not in first_party_collect_hits:
+                                    first_party_collect_hits.append(r_url[:160])
+
                         if len(captured_net_urls) < 70 and _should_capture_pw_request(r_url, target_reg_dom):
                             if r_url not in captured_net_urls:
                                 captured_net_urls.append(r_url)
@@ -1178,7 +1249,6 @@ async def fetch_html_playwright_fallback(
                 if nav_resp is not None:
                     resp_headers_obj = nav_resp.headers
 
-                # Клік по банеру згоди на cookie для активації GA4/Consent Mode v2 та sGTM тегів
                 for sel in CMP_ACCEPT_SELECTORS:
                     try:
                         loc = page.locator(sel).first
@@ -1223,6 +1293,20 @@ async def fetch_html_playwright_fallback(
                 if captured_net_urls:
                     net_comments = '\n'.join(f'<!-- pw_net_req: {u} -->' for u in captured_net_urls[:60])
                     enriched_html = f'{enriched_html}\n{net_comments}'
+                if captured_xhr_entries:
+                    xhr_comments = '\n'.join(
+                        f'<!-- pw_xhr_req: {rt} {u} -->' for rt, u in captured_xhr_entries[:50]
+                    )
+                    enriched_html = f'{enriched_html}\n{xhr_comments}'
+
+                runtime_summary = {
+                    'xhr_fetch_analyzed': True,
+                    'total_xhr_fetch_count': xhr_counter['total'],
+                    'first_party_collect_hits': first_party_collect_hits[:10],
+                }
+                enriched_html = (
+                    f'{enriched_html}\n<!-- pw_runtime_summary: {json.dumps(runtime_summary, ensure_ascii=False)} -->'
+                )
 
                 return enriched_html, fin_u, 'rendered', incomplete_flag, attempts_made
 
