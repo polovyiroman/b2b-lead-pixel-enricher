@@ -71,6 +71,8 @@ EU_VAT_BODY_RE = re.compile(
     r'\b(?:ATU|BE0?|DE|FR[A-Z0-9]{2}|NL|PL|CZ|IT|ES|SE|DK|FI|IE|PT)\d{8,12}\b'
 )
 
+UA_SPECIFIC_CYRILLIC_RE = re.compile(r'[іїєґІЇЄҐ]')
+
 
 def remaining_run_seconds() -> float | None:
     raw_timeout = os.environ.get('ACTOR_TIMEOUT_AT') or os.environ.get('APIFY_TIMEOUT_AT')
@@ -200,7 +202,7 @@ def resolve_effective_phone_region(canonical_domain: str, default_region: str, h
         return tld_reg
     if html:
         sample = html[:25000]
-        if '+380' in sample or 'ukraine' in sample.lower() or 'україна' in sample.lower():
+        if '+380' in sample or 'ukraine' in sample.lower() or 'україна' in sample.lower() or UA_SPECIFIC_CYRILLIC_RE.search(sample):
             return 'UA'
         if '+49' in sample or 'impressum' in sample.lower():
             return 'DE'
@@ -240,12 +242,18 @@ def detect_country_hint(
         if p_clean.startswith('+1'):
             return 'US'
     text_mix = f'{page_title} {meta_desc}'.lower()
-    if any(w in text_mix for w in ('україн', 'київ', 'львів', 'доставка по україні')):
+    if UA_SPECIFIC_CYRILLIC_RE.search(f'{page_title} {meta_desc}') or any(
+        w in text_mix for w in ('україн', 'київ', 'львів', 'доставка по україні', 'медіа про інтернет-маркетинг')
+    ):
         return 'UA'
     if any(w in text_mix for w in ('versandkostenfrei', 'warenkorb', 'impressum', 'gmbh')):
         return 'DE'
-    if html_sample and EU_VAT_BODY_RE.search(html_sample[:30000]):
-        return 'DE'
+    if html_sample:
+        head_sample = html_sample[:30000]
+        if UA_SPECIFIC_CYRILLIC_RE.search(head_sample):
+            return 'UA'
+        if EU_VAT_BODY_RE.search(head_sample):
+            return 'DE'
     return 'US'
 
 
@@ -256,8 +264,8 @@ def derive_gdpr_jurisdiction(
     html_sample: str = '',
 ) -> str:
     """
-    Виправлено (v24.0): Розширено детекцію EU_EEA_GDPR та UK_GDPR для глобальних .com-доменів,
-    якщо на сайті є європейські телефони, ціни в EUR/GBP або європейські VAT-ідентифікатори.
+    Виправлено (v24.1.1): Розпізнає українську кирилицю [іїєґІЇЄҐ] на .net/.com доменах
+    (напр. netpeak.net) як UA_PDP, а європейські ціни/VAT на .com як EU_EEA_GDPR.
     """
     dom_low = (canonical_domain or '').lower().strip()
     if dom_low in KNOWN_JURISDICTION_HINTS:
@@ -294,6 +302,8 @@ def derive_gdpr_jurisdiction(
 
     if html_sample:
         head_sample = html_sample[:35000]
+        if UA_SPECIFIC_CYRILLIC_RE.search(head_sample):
+            return 'UA_PDP'
         if EU_VAT_BODY_RE.search(head_sample) or '€' in head_sample or '"EUR"' in head_sample:
             return 'EU_EEA_GDPR'
         if '£' in head_sample or '"GBP"' in head_sample:
@@ -307,10 +317,6 @@ def derive_data_source_sensitivity(
     email_source_type: str | None,
     gdpr_jurisdiction: str,
 ) -> str:
-    """
-    Нове поле v24.0: Маркує чутливість джерела персональних даних згідно з європейським правом
-    (зокрема позицією DSK щодо використання обов'язкових реквізитів німецького Impressum).
-    """
     dm_src = (dm_source_type or '').lower()
     em_src = (email_source_type or '').lower()
     if 'impressum' in dm_src or 'impressum' in em_src:
@@ -329,10 +335,6 @@ def derive_legal_basis_for_processing(
     country_hint: str = '',
     has_personal_data: bool = False,
 ) -> str:
-    """
-    Виправлено (v24.0): Прибрано некоректне формулювання 'presumed consent for B2B relevance' для Німеччини.
-    Чітко відображає жорсткі обмеження §7 UWG та позицію DSK щодо холодного маркетингу в DACH/ЄС.
-    """
     jur = derive_gdpr_jurisdiction(canonical_domain, None, country_hint, '')
     dom_low = (canonical_domain or '').lower()
     if dom_low.endswith(('.de', '.at')) or (country_hint or '').upper() in ('DE', 'AT'):
@@ -351,10 +353,6 @@ def derive_legal_basis_for_processing(
 
 
 def build_compliance_note(canonical_domain: str, country_hint: str = '') -> str:
-    """
-    Виправлено (v24.0): Нейтральна, юридично точна довідка для ретеншну та DACH-комплаєнсу
-    без небезпечних порад щодо холодного аутрічу.
-    """
     dom_low = (canonical_domain or '').lower()
     if dom_low.endswith(('.de', '.at')) or (country_hint or '').upper() in ('DE', 'AT'):
         return (
@@ -470,11 +468,6 @@ def compute_google_ads_confidence(
 
 
 def normalize_tech_info_booleans(tech_info: dict) -> None:
-    """
-    Виправлено (v24.0): Додано 'partial_csp_headers' до is_hard_partial.
-    Якщо сайт сканований лише через заголовки CSP (як flaconi.de), непідтверджені
-    технології мають значення None (null у JSON — unknown), а не False.
-    """
     comp = str(tech_info.get('tech_scan_completeness') or 'full')
     tech_list = tech_info.get('detected_technologies_list') or []
     is_hard_partial = (
@@ -679,6 +672,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'data_quality_score': 0,
         'account_opportunity_score': 0,
         'contactability_level': 'unreached',
+        'actionable_priority_score': 0,
         'sales_readiness_verdict': 'Unverified (Run Time Budget Exceeded)',
         'sales_actionability_class': 'unqualified',
         'company_category': 'General Business / Corporate',
@@ -738,6 +732,7 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'decision_makers_found': None,
         'decision_makers_json': None,
         'decision_maker_linkedin_url': None,
+        'company_linkedin_people_url': None,
         'decision_maker_search_query': None,
         'linkedin_url': None,
         'instagram_url': None,
@@ -754,6 +749,8 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'sales_hook': None,
         'sales_opportunity': 'Timeout reached before stack analysis completed',
         'next_best_action': 'Re-run domain in a smaller batch',
+        'primary_sales_gap': None,
+        'sales_gap_confidence': None,
         'technology_evidence_summary': None,
         'technology_evidence': None,
         'technology_evidence_json': None,
@@ -771,18 +768,25 @@ def build_timeout_stub(domain_key: str, aliases: list[str]) -> dict:
         'all_ga4_ids_count': None,
         'detected_technologies': None,
         'detected_payment_gateways': [],
+        'martech_maturity_tier': 'Unverified / Minimal',
         'min_estimated_saas_spend_usd': 0,
         'estimated_saas_spend_min_usd': 0,
         'estimated_saas_spend_max_usd': 0,
         'spend_estimation_basis': [],
-        'primary_sales_gap': None,
+        'estimated_markets_count': 1,
+        'detected_market_locales': [],
+        'catalog_estimated_skus': None,
+        'ecom_avg_price': None,
+        'ecom_currency': None,
+        'logistics_and_returns_stack': [],
         'ads_rpc_status': 'not_checked',
         'ads_active_last_30d': None,
         'active_ad_formats': [],
         'advertiser_sister_domains': [],
         'detected_marketing_agency': None,
-        'open_positions_total': 0,
+        'open_positions_total': None,
         'hiring_departments': [],
+        'hiring_marketing_or_data_roles': None,
         'dmarc_policy': None,
         'email_security_gateway': None,
         'plain_text_outreach_required': False,
